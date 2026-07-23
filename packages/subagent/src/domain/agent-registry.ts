@@ -105,21 +105,18 @@ async function readPackageAgentDirs(packageRoot: string, warn: (message: string)
   }
 
   if (!manifest || typeof manifest !== "object" || Array.isArray(manifest)) return [];
-  const record = manifest as Record<string, unknown>;
-  const declarations = [record["pi-subagents"], objectValue(record.pi)?.subagents];
+  const agents = objectValue((manifest as Record<string, unknown>).pi)?.agents;
+  if (!Array.isArray(agents)) return [];
+
   const dirs: string[] = [];
-  for (const declaration of declarations) {
-    const agents = objectValue(declaration)?.agents;
-    if (!Array.isArray(agents)) continue;
-    for (const entry of agents) {
-      if (typeof entry !== "string" || !entry.trim()) continue;
-      try {
-        const dir = resolve(packageRoot, entry);
-        if (statSync(dir, { throwIfNoEntry: false })?.isDirectory()) dirs.push(dir);
-        else warn(`Invalid package subagent path ${dir}; expected a directory.`);
-      } catch (error) {
-        warn(`Invalid package subagent path ${entry}: ${error instanceof Error ? error.message : String(error)}`);
-      }
+  for (const entry of agents) {
+    if (typeof entry !== "string" || !entry.trim()) continue;
+    try {
+      const dir = resolve(packageRoot, entry);
+      if (statSync(dir, { throwIfNoEntry: false })?.isDirectory()) dirs.push(dir);
+      else warn(`Invalid package subagent path ${dir}; expected a directory.`);
+    } catch (error) {
+      warn(`Invalid package subagent path ${entry}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
   return [...new Set(dirs)];

@@ -80,24 +80,36 @@ test("registry loads markdown files from ctx cwd project dir and keys by frontma
 });
 
 
-test("registry discovers package agents from both supported manifest shapes recursively", async () => {
+test("registry discovers package agents from the standard pi.agents manifest recursively", async () => {
   const root = await mkdtemp(join(tmpdir(), "subagent-registry-packages-"));
-  const legacyPackage = join(root, "legacy-package");
-  const piPackage = join(root, "pi-package");
-  await mkdir(join(legacyPackage, "agents", "nested"), { recursive: true });
-  await mkdir(join(piPackage, "defs", "nested"), { recursive: true });
-  await writeFile(join(legacyPackage, "package.json"), JSON.stringify({ "pi-subagents": { agents: ["./agents"] } }));
-  await writeFile(join(piPackage, "package.json"), JSON.stringify({ pi: { subagents: { agents: ["./defs"] } } }));
-  await writeFile(join(legacyPackage, "agents", "nested", "package-agent.md"), "---\nname: package-agent\ndescription: Package agent\n---\nPackage prompt");
-  await writeFile(join(piPackage, "defs", "nested", "pi-agent.md"), "---\nname: pi-agent\ndescription: Pi package agent\n---\nPi prompt");
-  await writeFile(join(piPackage, "defs", "ignored.chain.md"), "---\nname: chain\ndescription: Not an agent\n---\nChain");
+  const packageRoot = join(root, "pi-package");
+  await mkdir(join(packageRoot, "agents", "nested"), { recursive: true });
+  await writeFile(join(packageRoot, "package.json"), JSON.stringify({ pi: { agents: ["./agents"] } }));
+  await writeFile(join(packageRoot, "agents", "nested", "package-agent.md"), "---\nname: package-agent\ndescription: Package agent\n---\nPackage prompt");
+  await writeFile(join(packageRoot, "agents", "ignored.chain.md"), "---\nname: chain\ndescription: Not an agent\n---\nChain");
 
   const registry = new AgentRegistry();
-  await registry.reload(root, { packageRoots: [legacyPackage, piPackage], discovery: { includeUserAgents: false } });
+  await registry.reload(root, { packageRoots: [packageRoot], discovery: { includeUserAgents: false } });
 
   assert.equal(registry.agents.get("package-agent")?.source, "package");
-  assert.equal(registry.agents.get("pi-agent")?.source, "package");
   assert.equal(registry.agents.has("chain"), false);
+});
+
+test("registry ignores nonstandard package agent manifest fields", async () => {
+  const root = await mkdtemp(join(tmpdir(), "subagent-registry-nonstandard-packages-"));
+  const legacyPackage = join(root, "legacy-package");
+  const nestedPackage = join(root, "nested-package");
+  for (const packageRoot of [legacyPackage, nestedPackage]) {
+    await mkdir(join(packageRoot, "agents"), { recursive: true });
+    await writeFile(join(packageRoot, "agents", "ignored.md"), "---\nname: ignored\ndescription: Ignored\n---\nIgnored");
+  }
+  await writeFile(join(legacyPackage, "package.json"), JSON.stringify({ "pi-subagents": { agents: ["./agents"] } }));
+  await writeFile(join(nestedPackage, "package.json"), JSON.stringify({ pi: { subagents: { agents: ["./agents"] } } }));
+
+  const registry = new AgentRegistry();
+  await registry.reload(root, { packageRoots: [legacyPackage, nestedPackage], discovery: { includeUserAgents: false } });
+
+  assert.equal(registry.agents.has("ignored"), false);
 });
 
 test("registry skips uninspectable package paths without hiding valid agents", async () => {
@@ -105,7 +117,7 @@ test("registry skips uninspectable package paths without hiding valid agents", a
   const packageRoot = join(root, "package");
   await mkdir(join(packageRoot, "agents"), { recursive: true });
   await writeFile(join(packageRoot, "package.json"), JSON.stringify({
-    "pi-subagents": { agents: ["invalid\0path", "./agents"] },
+    pi: { agents: ["invalid\0path", "./agents"] },
   }));
   await writeFile(join(packageRoot, "agents", "valid.md"), "---\nname: valid\ndescription: Valid\n---\nValid");
 
@@ -128,8 +140,7 @@ test("registry ignores invalid package declarations and preserves higher-precede
   await mkdir(join(packageRoot, "agents"), { recursive: true });
   await mkdir(projectAgents, { recursive: true });
   await writeFile(join(packageRoot, "package.json"), JSON.stringify({
-    "pi-subagents": { agents: ["./missing", 4] },
-    pi: { subagents: { agents: ["./agents"] } },
+    pi: { agents: ["./missing", 4, "./agents"] },
   }));
   await writeFile(join(packageRoot, "agents", "same.md"), "---\nname: same\ndescription: Package\n---\nPackage");
   await writeFile(join(projectAgents, "same.md"), "---\nname: same\ndescription: Project\n---\nProject");
@@ -152,7 +163,7 @@ test("registry skips an uninspectable project directory without hiding package a
   const root = await mkdtemp(join(tmpdir(), "subagent-registry-directory-error-"));
   const packageRoot = join(root, "package");
   await mkdir(join(packageRoot, "agents"), { recursive: true });
-  await writeFile(join(packageRoot, "package.json"), JSON.stringify({ "pi-subagents": { agents: ["./agents"] } }));
+  await writeFile(join(packageRoot, "package.json"), JSON.stringify({ pi: { agents: ["./agents"] } }));
   await writeFile(join(packageRoot, "agents", "valid.md"), "---\nname: valid\ndescription: Valid\n---\nValid");
 
   const warnings: string[] = [];
