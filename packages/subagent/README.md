@@ -55,7 +55,19 @@ subagent({
 
 ## Define agents
 
-Agent markdown is discovered from the user `${PI_AGENT_DIR ?? ~/.pi/agent}/agents` directory and the nearest project `.pi/agents`. Project definitions override same-named user definitions by default.
+Agent markdown is discovered from installed Pi packages, the user `${PI_AGENT_DIR ?? ~/.pi/agent}/agents` directory, and the nearest project `.pi/agents`. Package definitions are loaded first, then user/project definitions; effective precedence is project > user > package by default.
+
+Installed packages may declare agent directories with either supported manifest shape:
+
+```json
+{ "pi-subagents": { "agents": ["./agents"] } }
+```
+
+```json
+{ "pi": { "subagents": { "agents": ["./agents"] } } }
+```
+
+Each path is resolved relative to the package root. Declared package directories are scanned recursively for agent Markdown; `*.chain.md` files are excluded. Invalid manifests, declarations, and missing paths are ignored so other definitions can still load.
 
 | Frontmatter | Required | Meaning |
 | --- | --- | --- |

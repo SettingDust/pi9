@@ -6,11 +6,20 @@ import { DefaultPackageManager, SettingsManager } from "@earendil-works/pi-codin
 
 const ownExtensionPath = fileURLToPath(new URL("../index.ts", import.meta.url));
 
-export async function discoverInheritedExtensionPaths(cwd: string, agentDir: string): Promise<string[]> {
+async function createPackageManager(cwd: string, agentDir: string): Promise<DefaultPackageManager> {
   const settingsManager = SettingsManager.create(cwd, agentDir);
   await settingsManager.reload();
+  return new DefaultPackageManager({ cwd, agentDir, settingsManager });
+}
 
-  const packageManager = new DefaultPackageManager({ cwd, agentDir, settingsManager });
+export async function discoverInstalledPackageRoots(cwd: string, agentDir: string): Promise<string[]> {
+  const packageManager = await createPackageManager(cwd, agentDir);
+  await packageManager.resolve();
+  return [...new Set(packageManager.listConfiguredPackages().flatMap(entry => entry.installedPath ?? []))];
+}
+
+export async function discoverInheritedExtensionPaths(cwd: string, agentDir: string): Promise<string[]> {
+  const packageManager = await createPackageManager(cwd, agentDir);
   const resolved = await packageManager.resolve();
   const ownCanonicalPath = await canonicalPath(ownExtensionPath);
   const seen = new Set<string>();

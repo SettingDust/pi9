@@ -15,10 +15,10 @@ function fakeManager() {
 }
 
 function fakeRegistry() {
-  const calls: Array<{ cwd: string; discovery?: unknown; defaultRetainConversation?: boolean; onWarning?: (msg: string) => void }> = [];
+  const calls: Array<{ cwd: string; discovery?: unknown; defaultRetainConversation?: boolean; packageRoots?: string[]; onWarning?: (msg: string) => void }> = [];
   return {
     calls,
-    async reload(cwd: string, options: { discovery?: unknown; defaultRetainConversation?: boolean; onWarning?: (msg: string) => void } = {}) {
+    async reload(cwd: string, options: { discovery?: unknown; defaultRetainConversation?: boolean; packageRoots?: string[]; onWarning?: (msg: string) => void } = {}) {
       calls.push({ cwd, ...options });
     },
   };
@@ -66,6 +66,7 @@ test("prepareSubagentRuntime reloads the registry with discovery, defaultRetainC
     }),
     agentManager: fakeManager(),
     agentRegistry: registry,
+    discoverPackageRoots: async () => ["/installed/package"],
   });
 
   assert.equal(registry.calls.length, 1);
@@ -73,10 +74,29 @@ test("prepareSubagentRuntime reloads the registry with discovery, defaultRetainC
   assert.equal(call.cwd, "/work/repo");
   assert.equal(call.defaultRetainConversation, true);
   assert.equal((call.discovery as any).includeUserAgents, false);
+  assert.deepEqual(call.packageRoots, ["/installed/package"]);
 
   // Warning callback should route through ctx.ui.notify with level "warning".
   call.onWarning?.("bad agent");
   assert.deepEqual(notifications, [{ message: "bad agent", level: "warning" }]);
+});
+
+test("prepareSubagentRuntime reloads user and project agents when package-root discovery fails", async () => {
+  const registry = fakeRegistry();
+  const notifications: Array<{ message: string; level?: string }> = [];
+  const ctx = { cwd: "/work/repo", hasUI: true, ui: { notify: (message: string, level?: string) => notifications.push({ message, level }) } };
+
+  await prepareSubagentRuntime({
+    ctx,
+    settingsStore: fakeStore(),
+    agentManager: fakeManager(),
+    agentRegistry: registry,
+    discoverPackageRoots: async () => { throw new Error("broken package"); },
+  });
+
+  assert.equal(registry.calls.length, 1);
+  assert.deepEqual(registry.calls[0]!.packageRoots, []);
+  assert.deepEqual(notifications, [{ message: "Failed to discover installed package agents: broken package", level: "warning" }]);
 });
 
 test("prepareSubagentRuntime skips registry reload when none is provided", async () => {

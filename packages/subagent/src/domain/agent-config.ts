@@ -3,7 +3,7 @@ import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 
 import { isModelThinkingLevel, MODEL_THINKING_LEVELS } from "./model-thinking-level.js";
 
-export type AgentSource = "user" | "project";
+export type AgentSource = "package" | "user" | "project";
 
 export interface AgentConfig {
   name: string;
