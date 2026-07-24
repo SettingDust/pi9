@@ -4,6 +4,31 @@ This changelog starts with version `v0.2.1`.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-07-23
+
+### Changed
+
+- Redesign the subagent widget around a default retained-conversation summary and an opt-in active-run progress mode. Legacy `widgetLayout` values migrate to `widgetMode` on load.
+
+### Documentation
+
+- Refresh the README with current screenshots for the complete tool lifecycle, parallel progress, and recursive delegation, and focus setup guidance on defining agents rather than model-facing tool calls.
+
+## [0.7.0] - 2026-07-23
+
+### Breaking
+
+- Replace the prior dispatch and retrieval lifecycle with five actions: `agents`, pure output-free `list`, always-asynchronous `run`, exact-run blocking `join`, and explicit batched conversation `remove`.
+- Give every spawned conversation a process-local adjective-noun `conversationId` and every attempt a verb-adverb `runId`; `join` has no timeout, and cancelling it stops only the wait rather than the underlying run.
+- Keep every conversation until explicit removal. Allow follow-ups only after completed runs or interrupted runs that preserved conversation context.
+- Add a `maxConversations` runtime limit, defaulting to 100, which rejects new spawns at capacity until conversations are removed.
+- Define completion notifications in terms of unacknowledged runs; inventory remains side-effect free and does not acknowledge completion.
+- Remove the previous dispatch modes, nonblocking retrieval action, session identifier, and opt-in conversation-retention contract without compatibility aliases.
+
+### Documentation
+
+- Rewrite the README around conversations and exact runs, including action semantics, capacity, cleanup, notifications, migration guidance, and the runtime-local lifetime of child context.
+
 ## [0.6.0] - 2026-07-17
 
 ### Breaking
@@ -137,7 +162,9 @@ This changelog starts with version `v0.2.1`.
 - Add coverage for native inherited extension loading, canonical self-exclusion, SDK child tools, and recursive shared-manager behavior.
 - Add coverage for lifecycle events, session metadata persistence, session guards, command completions, background completion rendering, and resume message rendering.
 
-[Unreleased]: https://github.com/Chase-C/pi9/compare/subagent-v0.6.0...HEAD
+[Unreleased]: https://github.com/Chase-C/pi9/compare/subagent-v0.7.1...HEAD
+[0.7.1]: https://github.com/Chase-C/pi9/compare/subagent-v0.7.0...subagent-v0.7.1
+[0.7.0]: https://github.com/Chase-C/pi9/compare/subagent-v0.6.0...subagent-v0.7.0
 [0.6.0]: https://github.com/Chase-C/pi9/compare/subagent-v0.5.1...subagent-v0.6.0
 [0.5.1]: https://github.com/Chase-C/pi9/compare/subagent-v0.5.0...subagent-v0.5.1
 [0.5.0]: https://github.com/Chase-C/pi9/compare/subagent-v0.4.0...subagent-v0.5.0
