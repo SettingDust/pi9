@@ -16,11 +16,11 @@ import {
 import type { SubagentSettings } from "../../config/settings.js";
 import type { AgentConfig } from "../../domain/agent-config.js";
 import type { AgentSnapshot } from "../../domain/agent-snapshot.js";
-import { effectiveStatus } from "../../domain/agent-decisions.js";
+import { effectiveStatus, getCompletedAt, getStartedAt } from "../../domain/agent-decisions.js";
 import type { AgentManager, SessionConversationMessage } from "../../runtime/agent-manager.js";
-import { expandedRunSections, formatUsage, plural, rowElapsed } from "../../view/format-helpers.js";
+import { expandedRunSections, formatTimestamp, formatUsage, plural, rowElapsed } from "../../view/format-helpers.js";
 import { SubagentTextComponent, type DisplayLine, type DisplaySegment } from "../../view/text-component.js";
-import { clamp, isCancelKey, isDownKey, isEnterKey, isUpKey, type SubagentKeybindings } from "../input.js";
+import { clamp, isCancelKey, isDownKey, isEnterKey, isPageDownKey, isPageUpKey, isUpKey, type SubagentKeybindings } from "../input.js";
 import { filterAgents, projectSessions, type SessionLayoutMode, type SessionRow } from "../overlay-view-model.js";
 import { SubagentSettingsComponent, type SubagentSettingsChange } from "./settings.js";
 
@@ -66,7 +66,16 @@ export class SubagentOverlayComponent implements Component, Focusable {
   private readonly settingsComponent: SubagentSettingsComponent;
   private actionError = "";
   private currentSettings: SubagentSettings;
-  private readonly browserHeight: number;
+  private get browserHeight(): number {
+    const rows = this.tui.terminal?.rows;
+    return rows === undefined
+      ? DEFAULT_BROWSER_HEIGHT
+      : Math.max(8, Math.floor(rows * OVERLAY_HEIGHT_RATIO) - OVERLAY_CHROME_HEIGHT);
+  }
+  private sessionInspectorOffset = 0;
+  private inspectorSessionId?: string;
+  private inspectorSessionSnapshot?: string;
+  private lastRenderWidth = 80;
 
   constructor(
     private readonly manager: AgentManager,
@@ -78,9 +87,6 @@ export class SubagentOverlayComponent implements Component, Focusable {
   ) {
     this.page = options.initialPage;
     this.currentSettings = options.settings;
-    this.browserHeight = tui.terminal
-      ? Math.max(8, Math.floor(tui.terminal.rows * OVERLAY_HEIGHT_RATIO) - OVERLAY_CHROME_HEIGHT)
-      : DEFAULT_BROWSER_HEIGHT;
     this.settingsComponent = new SubagentSettingsComponent(
       options.settings,
       theme,
@@ -102,6 +108,9 @@ export class SubagentOverlayComponent implements Component, Focusable {
     this.agentPrompt.onSubmit = value => this.submitAgentPrompt(value);
     this.unsubscribe = typeof (manager as any).onAgentUpdate === "function"
       ? manager.onAgentUpdate(() => {
+          const selected = this.sessionRows[this.selected.sessions]?.session;
+          const snapshot = selected ? this.sessionInspectorSnapshotFor(selected) : undefined;
+          if (snapshot !== undefined && snapshot !== this.inspectorSessionSnapshot) this.sessionInspectorOffset = 0;
           this.refreshConversation();
           this.requestRender();
         })
@@ -132,6 +141,7 @@ export class SubagentOverlayComponent implements Component, Focusable {
       input.handleInput(data);
       if (before !== input.getValue()) {
         this.selected[this.page] = 0;
+        if (this.page === "sessions") this.sessionInspectorOffset = 0;
         if (this.page === "agents") this.clearAgentPrompt();
       }
       this.requestRender();
@@ -167,6 +177,9 @@ export class SubagentOverlayComponent implements Component, Focusable {
       this.settingsComponent.handleInput(data);
       return;
     }
+    // Local session controls win over configured page keys when users assign the
+    // same raw key to both; standard page keys remain configurable otherwise.
+    if (this.page === "sessions" && !isLocalSessionControl(data) && this.handleSessionScrollInput(data)) return;
     if (isUpKey(data, this.keybindings)) {
       this.moveSelection(-1);
       return;
@@ -180,6 +193,7 @@ export class SubagentOverlayComponent implements Component, Focusable {
   }
 
   render(width: number): string[] {
+    this.lastRenderWidth = width;
     const innerWidth = Math.max(1, width - 2);
     const lines: string[] = [];
     lines.push(`${this.border("╭")}${this.conversationSession ? this.renderConversationTitle(innerWidth) : this.renderTabs(innerWidth)}${this.border("╮")}`);
@@ -290,7 +304,9 @@ export class SubagentOverlayComponent implements Component, Focusable {
       const list = fitBodyHeight(left, Math.max(1, listHeight - 1));
       const inspectorContentHeight = Math.max(1, inspectorHeight - 1);
       const right = this.renderInspector(rightContentWidth, inspectorContentHeight);
-      const inspector = fitBodyHeight(compactViewport(right, inspectorContentHeight, Math.min(4, inspectorContentHeight - 1)), inspectorContentHeight);
+      const inspector = fitBodyHeight(this.page === "sessions"
+        ? this.sessionViewport(right, inspectorContentHeight)
+        : compactViewport(right, inspectorContentHeight, Math.min(4, inspectorContentHeight - 1)), inspectorContentHeight);
       return [
         "",
         ...list.map(line => ` ${line}`),
@@ -303,7 +319,9 @@ export class SubagentOverlayComponent implements Component, Focusable {
     const visibleLeft = left;
     const inspectorHeight = Math.max(1, this.browserHeight - 1);
     const right = this.renderInspector(rightContentWidth, inspectorHeight);
-    const visibleRight = compactViewport(right, inspectorHeight, 5);
+    const visibleRight = this.page === "sessions"
+      ? this.sessionViewport(right, inspectorHeight)
+      : compactViewport(right, inspectorHeight, 5);
     const lines: string[] = [];
     for (let index = 0; index < this.browserHeight; index++) {
       const leftLine = index === 0
@@ -391,6 +409,12 @@ export class SubagentOverlayComponent implements Component, Focusable {
     }
     const session = this.sessionRows[this.selected.sessions]?.session;
     if (!session) return [];
+    const snapshot = this.sessionInspectorSnapshotFor(session);
+    if (session.id !== this.inspectorSessionId || snapshot !== this.inspectorSessionSnapshot) {
+      this.inspectorSessionId = session.id;
+      this.inspectorSessionSnapshot = snapshot;
+      this.sessionInspectorOffset = 0;
+    }
     return this.renderSessionInspector(session, width, Date.now());
   }
 
@@ -427,7 +451,11 @@ export class SubagentOverlayComponent implements Component, Focusable {
     const details = unindentDisplayLines(sections.details, 4);
     const sessionMetadata = [
       ...(session.label ? [`Label: ${session.label}`] : []),
-      `Status: ${effectiveStatus(session.status)}${session.conversation.policy === "retain" ? " · retained" : ""}${session.capabilities.canResume ? " · resumable" : ""}`,
+      `Status: ${effectiveStatus(session.status)}${session.capabilities.canResume ? " · resumable" : ""}`,
+      `Conversation: ${session.conversation.policy === "retain" ? "retained" : "released"} · ${session.conversation.available ? "available" : "unavailable"}`,
+      `Created: ${formatTimestamp(session.createdAt)}`,
+      ...(getStartedAt(session.status) !== undefined ? [`Started: ${formatTimestamp(getStartedAt(session.status)!)}`] : []),
+      ...(getCompletedAt(session.status) !== undefined ? [`Completed: ${formatTimestamp(getCompletedAt(session.status)!)}`] : []),
       ...(session.config.source ? [`Source: ${session.config.source}`] : []),
       `Attempt: ${session.attempt.kind} · dispatch:${session.attempt.dispatch}`,
       ...(session.config.model || session.config.thinking
@@ -464,6 +492,7 @@ export class SubagentOverlayComponent implements Component, Focusable {
     if ((data === "t" || data === "T")) {
       this.sessionMode = this.sessionMode === "flat" ? "tree" : "flat";
       this.selected.sessions = 0;
+      this.sessionInspectorOffset = 0;
       this.requestRender();
     } else if (isEnterKey(data, this.keybindings) && row && (row.session.status.kind === "running" || row.session.capabilities.canResume)) {
       this.openConversation(row.session);
@@ -477,6 +506,19 @@ export class SubagentOverlayComponent implements Component, Focusable {
       );
       this.requestRender();
     }
+  }
+
+  private handleSessionScrollInput(data: string): boolean {
+    const height = this.sessionInspectorHeight();
+    let next = this.sessionInspectorOffset;
+    if (isPageUpKey(data, this.keybindings)) next -= height;
+    else if (isPageDownKey(data, this.keybindings)) next += height;
+    else if (matchesKey(data, "home")) next = 0;
+    else if (matchesKey(data, "end")) next = Number.MAX_SAFE_INTEGER;
+    else return false;
+    this.sessionInspectorOffset = Math.max(0, next);
+    this.requestRender();
+    return true;
   }
 
   private handleAgentsInput(data: string): void {
@@ -542,12 +584,14 @@ export class SubagentOverlayComponent implements Component, Focusable {
     const previous = this.selected[this.page];
     this.selected[this.page] = clamp(previous + delta, 0, Math.max(0, count - 1));
     if (this.page === "agents" && this.selected.agents !== previous) this.clearAgentPrompt();
+    if (this.page === "sessions" && this.selected.sessions !== previous) this.sessionInspectorOffset = 0;
     this.requestRender();
   }
 
   private switchPage(delta: number): void {
     const index = PAGES.indexOf(this.page);
     this.page = PAGES[(index + delta + PAGES.length) % PAGES.length];
+    this.sessionInspectorOffset = 0;
     this.setFocus("list");
   }
 
@@ -626,6 +670,37 @@ export class SubagentOverlayComponent implements Component, Focusable {
     return filterAgents(this.options.agents, this.filters.agents.getValue());
   }
 
+  private sessionInspectorSnapshotFor(session: AgentSnapshot): string {
+    return JSON.stringify({
+      id: session.id,
+      label: session.label,
+      prompt: session.prompt,
+      createdAt: session.createdAt,
+      config: session.config,
+      attempt: session.attempt,
+      conversation: session.conversation,
+      status: session.status,
+      activity: session.activity,
+      usage: session.usage,
+      previousRuns: session.previousRuns,
+      subagents: session.subagents,
+      capabilities: session.capabilities,
+    });
+  }
+
+  private sessionViewport(lines: string[], height: number): string[] {
+    this.sessionInspectorOffset = clamp(this.sessionInspectorOffset, 0, Math.max(0, lines.length - height));
+    return lines.slice(this.sessionInspectorOffset, this.sessionInspectorOffset + height);
+  }
+
+  private sessionInspectorHeight(): number {
+    if (this.lastRenderWidth < 80) {
+      const available = Math.max(4, this.browserHeight - 2);
+      return Math.max(1, available - Math.floor(available / 2) - 1);
+    }
+    return Math.max(1, this.browserHeight - 1);
+  }
+
   private listLineBudget(narrow: boolean): number {
     const hasFilter = this.page === "sessions" || this.page === "agents";
     if (!narrow) return Math.max(1, this.browserHeight - 1 - (hasFilter ? 1 : 0));
@@ -645,7 +720,7 @@ export class SubagentOverlayComponent implements Component, Focusable {
 
   private helpText(): string {
     if (this.conversationSession) return "enter send · esc back to sessions";
-    if (this.page === "sessions") return "↑↓ select · enter conversation · / filter · t flat/tree · x stop · c remove · tab pages · esc close";
+    if (this.page === "sessions") return "↑↓ select · PgUp/PgDn/Home/End details · enter conversation · / filter · t flat/tree · x stop · c remove · tab pages · esc close";
     if (this.page === "agents") return "↑↓ select · / filter · enter/s start · tab pages · esc close";
     return "↑↓ select · enter change · tab pages · esc close";
   }
@@ -782,6 +857,11 @@ function listViewport(count: number, selected: number, lineBudget: number): { st
   const size = Math.max(1, Math.floor(lineBudget / 4));
   const start = clamp(selected - Math.floor(size / 2), 0, Math.max(0, count - size));
   return { start, end: Math.min(count, start + size) };
+}
+
+function isLocalSessionControl(data: string): boolean {
+  return data === "j" || data === "J" || data === "k" || data === "K"
+    || data === "x" || data === "X" || data === "c" || data === "C" || data === "t" || data === "T";
 }
 
 function isActive(session: AgentSnapshot): boolean {

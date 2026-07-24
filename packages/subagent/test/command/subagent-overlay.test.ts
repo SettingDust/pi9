@@ -1,6 +1,6 @@
 import { test } from "vitest";
 import assert from "node:assert/strict";
-import { CURSOR_MARKER, visibleWidth } from "@earendil-works/pi-tui";
+import { CURSOR_MARKER, KeybindingsManager, TUI, TUI_KEYBINDINGS, visibleWidth } from "@earendil-works/pi-tui";
 
 import { DEFAULT_SUBAGENT_SETTINGS } from "../../src/config/settings.js";
 import { SubagentOverlayComponent } from "../../src/command/components/overlay.js";
@@ -11,7 +11,12 @@ const theme = {
   bold: (text: string) => text,
 };
 
-function overlay(manager: any, initialPage: "sessions" | "agents" | "settings" = "sessions", terminalRows?: number) {
+function overlay(
+  manager: any,
+  initialPage: "sessions" | "agents" | "settings" = "sessions",
+  terminalRows?: number,
+  keybindings?: any,
+) {
   let renders = 0;
   let closed = false;
   const component = new SubagentOverlayComponent(
@@ -21,7 +26,7 @@ function overlay(manager: any, initialPage: "sessions" | "agents" | "settings" =
       ...(terminalRows === undefined ? {} : { terminal: { rows: terminalRows } }),
     } as any,
     theme as any,
-    undefined,
+    keybindings,
     () => { closed = true; },
     {
       initialPage,
@@ -325,6 +330,294 @@ test("session inspector combines concise metadata with expanded result sections"
   assert.match(text, /┌ Answer/);
   assert.match(text, /Found one refresh race/);
   assert.doesNotMatch(text, /Redundant description|Redundant message|\/repo\/agent\.md|Tools: read, bash/);
+});
+
+test("completed known sessions expose terminal metadata without requiring resume", () => {
+  const session = fakeAgent({
+    id: "completed-session",
+    prompt: "Audit authentication",
+    createdAt: Date.parse("2026-03-27T10:00:00.000Z"),
+    status: {
+      kind: "done",
+      outcome: "error",
+      startedAt: Date.parse("2026-03-27T10:01:00.000Z"),
+      completedAt: Date.parse("2026-03-27T10:02:00.000Z"),
+      error: "Refresh token race",
+    },
+    turns: 4,
+    toolUses: 2,
+    conversation: { policy: "retain", available: true },
+    capabilities: { canResume: false, canRemove: true },
+  });
+  const manager = { listSessions: () => [session], onAgentUpdate: () => () => {} };
+
+  const text = overlay(manager, "sessions", 60).component.render(160).join("\n");
+
+  assert.match(text, /completed-session/);
+  assert.match(text, /Status: error/);
+  assert.match(text, /Conversation: retained · available/);
+  assert.match(text, /Created: 2026-03-27T10:00:00\.000Z/);
+  assert.match(text, /Started: 2026-03-27T10:01:00\.000Z/);
+  assert.match(text, /Completed: 2026-03-27T10:02:00\.000Z/);
+  assert.match(text, /4 turns · 2 tool uses/);
+  assert.match(text, /Refresh token race/);
+});
+
+test("session inspector scrolls, clamps, and resets when selection changes", () => {
+  const long = fakeAgent({
+    id: "long",
+    prompt: Array.from({ length: 30 }, (_, index) => `task-line-${index}`).join("\n"),
+    status: { kind: "completed", response: "bottom-result" },
+  });
+  const short = fakeAgent({ id: "short", prompt: "short-task", status: { kind: "running" } });
+  const manager = { listSessions: () => [long, short], onAgentUpdate: () => () => {} };
+  const { component } = overlay(manager, "sessions", 30);
+
+  assert.match(component.render(120).join("\n"), /task-line-0/);
+  assert.doesNotMatch(component.render(120).join("\n"), /bottom-result/);
+
+  component.handleInput("\x1b[6~");
+  const paged = component.render(120).join("\n");
+  assert.doesNotMatch(paged, /│ task-line-0\s+│/);
+  assert.match(paged, /│ task-line-10\s+│/);
+
+  component.handleInput("\x1b[F");
+  assert.match(component.render(120).join("\n"), /bottom-result/);
+  component.handleInput("\x1b[6~");
+  assert.match(component.render(120).join("\n"), /bottom-result/);
+
+  component.handleInput("\x1b[B");
+  const selectedShort = component.render(120).join("\n");
+  assert.match(selectedShort, /┌ Task[\s\S]*short-task/);
+  assert.doesNotMatch(selectedShort, /bottom-result/);
+
+  component.handleInput("\x1b[A");
+  assert.match(component.render(120).join("\n"), /│ task-line-0\s+│/);
+});
+
+test("session inspector resets only when the selected session changes", () => {
+  let sessions = [
+    fakeAgent({
+      id: "selected",
+      prompt: Array.from({ length: 30 }, (_, index) => `selected-line-${index}`).join("\n"),
+      status: { kind: "completed", response: "selected-bottom" },
+    }),
+    fakeAgent({ id: "unrelated", prompt: "unrelated", status: { kind: "running" } }),
+  ];
+  let update = () => {};
+  const manager = {
+    listSessions: () => sessions,
+    onAgentUpdate: (listener: () => void) => { update = listener; return () => {}; },
+  };
+  const { component } = overlay(manager, "sessions", 30);
+
+  component.render(120);
+  component.handleInput("\x1b[F");
+  assert.match(component.render(120).join("\n"), /selected-bottom/);
+
+  sessions = [sessions[0]!, fakeAgent({ id: "unrelated", prompt: "updated elsewhere", status: { kind: "running" } })];
+  update();
+  assert.match(component.render(120).join("\n"), /selected-bottom/);
+
+  sessions = [fakeAgent({
+    id: "selected",
+    prompt: Array.from({ length: 30 }, (_, index) => `changed-line-${index}`).join("\n"),
+    status: { kind: "completed", response: "selected-bottom" },
+  }), sessions[1]!];
+  update();
+  const reset = component.render(120).join("\n");
+  assert.match(reset, /changed-line-0/);
+  assert.doesNotMatch(reset, /selected-bottom/);
+});
+
+test("live TUI dispatch scrolls ended-session details in wide and narrow layouts", () => {
+  for (const width of [120, 60]) {
+    const session = fakeAgent({
+      id: `live-${width}`,
+      prompt: Array.from({ length: 30 }, (_, index) => `live-${width}-line-${index}`).join("\n"),
+      status: { kind: "completed", response: `live-${width}-bottom` },
+    });
+    const manager = { listSessions: () => [session], onAgentUpdate: () => () => {} };
+    const terminal = { rows: 30, columns: width };
+    const tui = new TUI(terminal as any);
+    tui.requestRender = () => {};
+    const component = new SubagentOverlayComponent(
+      manager as any,
+      tui,
+      theme as any,
+      new KeybindingsManager(TUI_KEYBINDINGS),
+      () => {},
+      {
+        initialPage: "sessions",
+        agents: [],
+        settings: DEFAULT_SUBAGENT_SETTINGS,
+        onSettingsChange() {},
+        onResume() {},
+        onStart() { return undefined; },
+        notify() {},
+      },
+    );
+    tui.setFocus(component);
+
+    const before = component.render(width).join("\n");
+    assert.doesNotMatch(before, new RegExp(`live-${width}-bottom`));
+    (tui as any).handleInput("\x1b[6~");
+    const paged = component.render(width).join("\n");
+    assert.notEqual(paged, before);
+    assert.match(paged, new RegExp(`live-${width}-line-`));
+    (tui as any).handleInput("\x1b[F");
+    assert.match(component.render(width).join("\n"), new RegExp(`live-${width}-bottom`));
+    (tui as any).handleInput("\x1b[H");
+    assert.match(component.render(width).join("\n"), new RegExp(`live-${width}-line-0`));
+  }
+});
+
+test("session inspector honors page keybindings and ignores plain u/d", () => {
+  const session = fakeAgent({
+    id: "custom-scroll",
+    prompt: Array.from({ length: 30 }, (_, index) => `custom-line-${index}`).join("\n"),
+    status: { kind: "completed", response: "custom-bottom" },
+  });
+  const manager = { listSessions: () => [session], onAgentUpdate: () => () => {} };
+  const keybindings = {
+    matches: (data: string, action: string) =>
+      (data === "custom-up" && action === "tui.select.pageUp")
+      || (data === "custom-down" && action === "tui.select.pageDown"),
+  };
+  const { component } = overlay(manager, "sessions", 30, keybindings);
+
+  component.render(120);
+  component.handleInput("d");
+  component.handleInput("u");
+  assert.match(component.render(120).join("\n"), /custom-line-0/);
+
+  component.handleInput("custom-down");
+  assert.match(component.render(120).join("\n"), /custom-line-10/);
+  component.handleInput("custom-up");
+  assert.match(component.render(120).join("\n"), /custom-line-0/);
+
+  component.handleInput("\x1b[6~");
+  assert.match(component.render(120).join("\n"), /custom-line-10/);
+  component.handleInput("\x1b[5~");
+  assert.match(component.render(120).join("\n"), /custom-line-0/);
+});
+
+test("configured page keys never shadow local session controls", () => {
+  const session = fakeAgent({
+    id: "collision",
+    prompt: Array.from({ length: 30 }, (_, index) => `collision-line-${index}`).join("\n"),
+    status: { kind: "completed", response: "collision-bottom" },
+  });
+  const terminal = { rows: 30, columns: 120 };
+  const tui = new TUI(terminal as any);
+  tui.requestRender = () => {};
+  const keybindings = new KeybindingsManager(TUI_KEYBINDINGS, {
+    "tui.select.pageUp": "k",
+    "tui.select.pageDown": ["d", "j", "x", "c", "t"],
+  } as any);
+  const component = new SubagentOverlayComponent(
+    {
+      listSessions: () => [session],
+      stopSession: async () => {},
+      remove: async () => ({ removed: 1 }),
+      onAgentUpdate: () => () => {},
+    } as any,
+    tui,
+    theme as any,
+    keybindings,
+    () => {},
+    {
+      initialPage: "sessions",
+      agents: [],
+      settings: DEFAULT_SUBAGENT_SETTINGS,
+      onSettingsChange() {},
+      onResume() {},
+      onStart() { return undefined; },
+      notify() {},
+    },
+  );
+  tui.setFocus(component);
+  component.render(120);
+
+  (tui as any).handleInput("d");
+  assert.doesNotMatch(component.render(120).join("\n"), /│ collision-line-0\s+│/);
+  (tui as any).handleInput("\x1b[H");
+  (tui as any).handleInput("j");
+  assert.match(component.render(120).join("\n"), /collision-line-0/);
+  (tui as any).handleInput("x");
+  (tui as any).handleInput("c");
+  (tui as any).handleInput("t");
+  assert.match(component.render(120).join("\n"), /\[ Sessions \]/);
+  (tui as any).handleInput("k");
+  assert.match(component.render(120).join("\n"), /collision-line-0/);
+});
+
+test("composed overlay recalculates viewport after terminal resize", () => {
+  const session = fakeAgent({
+    id: "resize",
+    prompt: Array.from({ length: 40 }, (_, index) => `resize-line-${index}`).join("\n"),
+    status: { kind: "completed", response: "resize-bottom" },
+  });
+  const terminal = { rows: 50, columns: 120, hideCursor() {} };
+  const tui = new TUI(terminal as any);
+  tui.requestRender = () => {};
+  const component = new SubagentOverlayComponent(
+    { listSessions: () => [session], onAgentUpdate: () => () => {} } as any,
+    tui,
+    theme as any,
+    new KeybindingsManager(TUI_KEYBINDINGS),
+    () => {},
+    {
+      initialPage: "sessions",
+      agents: [],
+      settings: DEFAULT_SUBAGENT_SETTINGS,
+      onSettingsChange() {},
+      onResume() { },
+      onStart() { return undefined; },
+      notify() {},
+    },
+  );
+  tui.showOverlay(component, { width: 120, maxHeight: "80%" });
+  const composed = () => (tui as any).compositeOverlays([], terminal.columns, terminal.rows);
+  const initial = composed();
+  assert.equal(initial.length, terminal.rows);
+  assert.match(initial.join("\n"), /resize-line-0/);
+  assert.match(initial.join("\n"), /PgUp\/PgDn/);
+  assert.ok(initial.some((line: string) => line.includes("╰")));
+
+  terminal.rows = 20;
+  const shrunk = composed();
+  assert.equal(shrunk.length, terminal.rows);
+  assert.match(shrunk.join("\n"), /PgUp\/PgDn/);
+  assert.ok(shrunk.some((line: string) => line.includes("╰")));
+  assert.ok(shrunk.some((line: string) => /resize-line-\d+/.test(line)));
+  assert.ok(shrunk.every((line: string) => visibleWidth(line) <= terminal.columns));
+  (tui as any).handleInput("\x1b[F");
+  assert.match(composed().join("\n"), /resize-bottom/);
+
+  terminal.rows = 50;
+  const expanded = composed();
+  assert.equal(expanded.length, terminal.rows);
+  assert.match(expanded.join("\n"), /resize-bottom/);
+  assert.match(expanded.join("\n"), /PgUp\/PgDn/);
+  (tui as any).handleInput("\x1b[H");
+  assert.match(composed().join("\n"), /resize-line-0/);
+});
+
+test("narrow session inspector uses the same scroll viewport", () => {
+  const session = fakeAgent({
+    id: "narrow-long",
+    prompt: Array.from({ length: 20 }, (_, index) => `narrow-line-${index}`).join("\n"),
+    status: { kind: "completed", response: "narrow-bottom" },
+  });
+  const manager = { listSessions: () => [session], onAgentUpdate: () => () => {} };
+  const { component } = overlay(manager, "sessions", 30);
+
+  assert.doesNotMatch(component.render(60).join("\n"), /narrow-bottom/);
+  component.handleInput("\x1b[F");
+  assert.match(component.render(60).join("\n"), /narrow-bottom/);
+  component.handleInput("\x1b[H");
+  assert.match(component.render(60).join("\n"), /narrow-line-0/);
 });
 
 test("session rows show bold agent names followed by session IDs", () => {

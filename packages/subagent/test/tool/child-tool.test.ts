@@ -33,6 +33,7 @@ test("makeChildSubagentTool returns a 'subagent' tool", () => {
   });
 
   assert.equal(tool.name, "subagent");
+  assert.match(tool.description, /Every call MUST include top-level `action`: one of `agents`, `list`, `run`, `results`, or `remove`\./);
   assert.equal(typeof tool.execute, "function");
 });
 

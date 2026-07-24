@@ -44,14 +44,14 @@ test("active retain-policy attempts cannot resume or be removed", () => {
   assert.deepEqual(view(running).capabilities, { canResume: false, canRemove: false });
 });
 
-test("release-policy foreground attempts have no terminal capabilities", () => {
+test("release-policy foreground attempts become removable but not resumable when terminal", () => {
   const queued = new Agent("id1", baseConfig, { kind: "spawn", agent: "helper", prompt: "p" }, noop);
   assert.deepEqual(view(queued).capabilities, { canResume: false, canRemove: false });
 
   const completed = new Agent("id2", baseConfig, { kind: "spawn", agent: "helper", prompt: "p" }, noop);
   completed.bindSession(fakeSession());
   completedRun(completed, "done");
-  assert.deepEqual(view(completed).capabilities, { canResume: false, canRemove: false });
+  assert.deepEqual(view(completed).capabilities, { canResume: false, canRemove: true });
 });
 
 test("a completed background result releases its conversation and cannot regain resume capability", () => {
@@ -65,7 +65,7 @@ test("a completed background result releases its conversation and cannot regain 
 
 });
 
-test("terminal removal follows persistent catalog membership across outcomes", () => {
+test("all terminal inventory records are removable across outcomes", () => {
   const outcomes = ["completed", "error", "interrupted", "aborted", "skipped"] as const;
   for (const outcome of outcomes) {
     const persistentForeground = new Agent(`fg-${outcome}`, retainConversationConfig, { kind: "spawn", agent: "helper", prompt: "p" }, noop);
@@ -81,7 +81,7 @@ test("terminal removal follows persistent catalog membership across outcomes", (
     const transientForeground = new Agent(`transient-${outcome}`, baseConfig, { kind: "spawn", agent: "helper", prompt: "p" }, noop);
     transientForeground.bindSession(fakeSession());
     transientForeground.settle(outcome === "completed" ? { status: outcome, output: "done" } : { status: outcome, error: outcome });
-    assert.equal(view(transientForeground).capabilities.canRemove, false, `transient foreground ${outcome}`);
+    assert.equal(view(transientForeground).capabilities.canRemove, true, `transient foreground ${outcome}`);
   }
 });
 

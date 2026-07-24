@@ -67,6 +67,7 @@ export function defineSubagentTool(deps: SubagentToolDeps) {
     label: "Subagent",
     description: [
       "Delegate work to context-isolated subagent sessions. Subagents share the working filesystem.",
+      "Every call MUST include top-level `action`: one of `agents`, `list`, `run`, `results`, or `remove`.",
       "Actions:",
       "  `agents` lists available agent definitions",
       "  `list` returns lightweight session status, optionally filtered by `status`",

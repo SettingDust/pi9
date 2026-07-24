@@ -34,7 +34,7 @@ function matrixAgent(status: "queued" | "running" | "completed" | "error", backg
   return agent;
 }
 
-test("catalog retention matrix preserves inventory and post-run cleanup behavior", async () => {
+test("catalog retention matrix preserves retention metadata independently from Sessions inventory", () => {
   const statuses = ["queued", "running", "completed", "error"] as const;
   const dispatches = [false, true] as const;
   const states = ["enabled", "disabled", "retained"] as const;
@@ -44,41 +44,13 @@ test("catalog retention matrix preserves inventory and post-run cleanup behavior
       for (const state of states) {
         const agent = matrixAgent(status, background, state, `${status}-${background}-${state}`);
         const manager = makeManager({ agents: new Map() } as any);
-        // Inject a prepared lifecycle row so all matrix arms can exercise public inventory
-        // without adding a second production construction path.
         (manager as any)._agents = [agent];
 
         const active = status === "queued" || status === "running";
         const persistent = background || state !== "disabled" && (active || state === "retained");
-        const expectedListed = active || persistent;
-        assert.equal(agent.retentionDecision.cataloged, expectedListed, `${status}/${background}/${state}`);
+        assert.equal(agent.retentionDecision.cataloged, active || persistent, `${status}/${background}/${state}`);
         assert.equal(agent.snapshot().retention.catalog, persistent ? "persistent" : "transient", `${status}/${background}/${state} retention`);
-        assert.equal(manager.listSessions().length, expectedListed ? 1 : 0, `${status}/${background}/${state} list`);
-
-        if (!active) {
-          // Exercise the real post-run cleanup path for every terminal matrix arm as well as the
-          // direct owner projection above.
-          const cleanupManager = makeManager({
-            agents: new Map([[
-              "matrix",
-              { name: "matrix", description: "", systemPrompt: "", source: "project", retainConversation: state !== "disabled" },
-            ]]),
-          } as any, 1, async (_ctx: any, cleanupAgent: any) => {
-            if (state === "retained") cleanupAgent.bindSession(makeSession());
-            return status === "completed"
-              ? completedRun(cleanupAgent, "done")
-              : errorRun(cleanupAgent, "failed");
-          });
-          const cleanupBatch = cleanupManager.startRun(
-            baseCtx(),
-            undefined,
-            [{ kind: "spawn", agent: "matrix", prompt: "terminal" }],
-            undefined,
-            { dispatch: background ? "background" : "foreground" },
-          );
-          await cleanupBatch.resultsPromise;
-          assert.equal(cleanupManager.listSessions().length, expectedListed ? 1 : 0, `${status}/${background}/${state} cleanup`);
-        }
+        assert.equal(manager.listSessions().length, 1, `${status}/${background}/${state} list`);
       }
     }
   }
@@ -165,7 +137,7 @@ test("AgentManager.listSessions returns all retained sessions when called with n
   assert.equal(all[0].attempt.dispatch, "foreground");
 });
 
-test("AgentManager does not expose skipped retainConversation tasks as sessions", async () => {
+test("AgentManager keeps skipped tasks visible but non-resumable", async () => {
   let finishFirst: () => void;
   const firstCanFinish = new Promise<void>(resolve => { finishFirst = resolve; });
   const runner = async (_ctx: any, agent: any) => {
@@ -194,7 +166,7 @@ test("AgentManager does not expose skipped retainConversation tasks as sessions"
   assert.equal(results[1].status, "skipped");
   assert.equal(results[1].canResume, false);
   assert.equal(Object.prototype.hasOwnProperty.call(results[1], "sessionId"), false);
-  assert.deepEqual(manager.listSessions(), []);
+  assert.deepEqual(manager.listSessions().map(session => session.status.kind === "done" && session.status.outcome), ["completed", "skipped"]);
 });
 
 test("steering a running session delegates directly", async () => {
@@ -316,7 +288,7 @@ test("AgentManager.stopSession aborts a running session", async () => {
   assert.equal(abortCalls, 1);
 });
 
-test("AgentManager does not expose or resume non-retainConversation completed sessions", async () => {
+test("AgentManager lists but does not resume non-retainConversation completed sessions", async () => {
   const runner = async (_ctx: any, agent: any) => {
     agent.bindSession(makeSession());
     return completedRun(agent, "done");
@@ -332,7 +304,9 @@ test("AgentManager does not expose or resume non-retainConversation completed se
 
   assert.equal(results[0].status, "completed");
   assert.equal(Object.prototype.hasOwnProperty.call(results[0], "sessionId"), false);
-  assert.deepEqual(manager.listSessions(), []);
+  const [listed] = manager.listSessions();
+  assert.equal(listed.status.kind === "done" && listed.status.outcome, "completed");
+  assert.equal(listed.capabilities.canResume, false);
   const [retried] = await run(manager, baseCtx(), undefined, [
     { kind: "resume", sessionId: "anything", prompt: "follow up" },
   ]);
@@ -361,7 +335,7 @@ test("AgentManager honors a spawn-side retainConversation override", async () =>
   assert.equal(manager.listSessions()[0].conversation.policy, "retain");
 });
 
-test("AgentManager retains only retainConversation interrupted sessions, clearing only after parent cancellation settles", async () => {
+test("AgentManager lists interrupted sessions without changing retainConversation semantics", async () => {
   const runner = async (_ctx: any, agent: any, _attempt: any, signal: AbortSignal) => {
     agent.bindSession(makeSession());
     await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
@@ -389,9 +363,10 @@ test("AgentManager retains only retainConversation interrupted sessions, clearin
   assert.ok(results[1].sessionId);
 
   const sessions = manager.listSessions();
-  assert.deepEqual(sessions.map(session => session.config.name), ["chatty"]);
-  assert.equal(sessions[0].status.kind, "done");
+  assert.deepEqual(sessions.map(session => session.config.name), ["oneshot", "chatty"]);
   assert.equal(sessions[0].status.kind === "done" && sessions[0].status.outcome, "interrupted");
+  assert.equal(sessions[0].capabilities.canResume, false);
+  assert.equal(sessions[1].status.kind === "done" && sessions[1].status.outcome, "interrupted");
 
   const [retried] = await run(manager, baseCtx(), undefined, [
     { kind: "resume", sessionId: results[1].sessionId!, prompt: "follow up" },
@@ -400,7 +375,7 @@ test("AgentManager retains only retainConversation interrupted sessions, clearin
   assert.equal(retried.kind, "resume");
   assert.match(retried.error ?? "", /while it is interrupted/);
   assert.deepEqual(await manager.remove({ sessionIds: [results[1].sessionId!] }), { removed: 1, aborted: 0, sessionIds: [results[1].sessionId!], errors: [] });
-  assert.deepEqual(manager.listSessions(), []);
+  assert.deepEqual(manager.listSessions().map(session => session.config.name), ["oneshot"]);
 });
 
 test("AgentManager retains a completed session when a task overrides retainConversation to true", async () => {
@@ -536,6 +511,43 @@ test("AgentManager retains, resumes, lists, and clears completed retainConversat
   assert.deepEqual(manager.listSessions(), []);
 });
 
+test("AgentManager does not resume a retained session while explicit removal is in flight", async () => {
+  let resumeCalls = 0;
+  const runner = async (_ctx: any, agent: any) => {
+    agent.bindSession(makeSession());
+    return completedRun(agent, "done");
+  };
+  const resumeRunner = async (_ctx: any, agent: any) => {
+    resumeCalls += 1;
+    agent.bindSession(agent.retainedSession()!);
+    return completedRun(agent, "resumed");
+  };
+  const registry = {
+    agents: new Map([["chatty", { name: "chatty", description: "d", systemPrompt: "s", source: "project", retainConversation: true }]]),
+  };
+  const manager = makeManager(registry as any, 1, mergeRunners(runner, resumeRunner));
+  const [seed] = await run(manager, baseCtx(), undefined, [
+    { kind: "spawn", agent: "chatty", prompt: "seed" },
+  ]);
+  const retained = (manager as any)._agents[0] as Agent;
+  let releaseRemoval!: () => void;
+  const removalPaused = new Promise<void>(resolve => { releaseRemoval = resolve; });
+  (retained as any).abort = () => removalPaused;
+
+  const removal = manager.remove({ sessionIds: [seed.sessionId!] });
+  const [resume] = await run(manager, baseCtx(), undefined, [
+    { kind: "resume", sessionId: seed.sessionId!, prompt: "too late" },
+  ]);
+
+  assert.equal(resume.status, "error");
+  assert.equal(resume.kind, "resume");
+  assert.match(resume.error ?? "", /Unknown retained subagent session/);
+  assert.equal(resumeCalls, 0);
+
+  releaseRemoval();
+  assert.equal((await removal).removed, 1);
+});
+
 test("AgentManager.remove with an unknown sessionId returns the unknown-id error and no removals", async () => {
   const registry = { agents: new Map() };
   const manager = makeManager(registry as any, 1, async () => ({ status: "completed" }) as any);
@@ -582,7 +594,7 @@ test("AgentManager.remove with a queued sessionId prevents the queued spawn from
 
   assert.deepEqual(runnerPrompts, ["block"]);
   assert.equal(results[1].status, "skipped");
-  assert.deepEqual(manager.listSessions(), []);
+  assert.deepEqual(manager.listSessions().map(session => session.prompt), ["block"]);
 });
 
 test("AgentManager.remove with a queued resume sessionId prevents the queued resume runner from starting", async () => {
@@ -626,7 +638,7 @@ test("AgentManager.remove with a queued resume sessionId prevents the queued res
   assert.equal(resumeCalls, 0);
   assert.equal(results[1].status, "skipped");
   assert.equal(results[1].kind, "resume");
-  assert.deepEqual(manager.listSessions(), []);
+  assert.deepEqual(manager.listSessions().map(session => session.prompt), ["block"]);
 });
 
 test("AgentManager.remove on a second pass of the same sessionId returns the unknown-id error", async () => {
@@ -689,6 +701,53 @@ test("AgentManager.remove with a running sessionId aborts the underlying session
   assert.equal(result.aborted, 1);
   assert.deepEqual(result.sessionIds, [runningId]);
   assert.equal(abortCalls, 1);
+  assert.deepEqual(manager.listSessions(), []);
+});
+
+test("AgentManager keeps terminal release-policy sessions in Sessions inventory until explicit removal", async () => {
+  const cases = [
+    { expected: "completed", runner: async (_ctx: any, agent: any) => completedRun(agent, "done") },
+    { expected: "error", runner: async () => { throw new Error("failed"); } },
+    { expected: "interrupted", runner: async (_ctx: any, agent: any) => interruptedRun(agent, "interrupted") },
+  ] as const;
+
+  for (const { expected, runner } of cases) {
+    const registry = {
+      agents: new Map([["oneshot", { name: "oneshot", description: "d", systemPrompt: "s", source: "project", retainConversation: false }]]),
+    };
+    const manager = makeManager(registry as any, 1, runner as any);
+    const batch = manager.startRun(baseCtx(), undefined, [
+      { kind: "spawn", agent: "oneshot", prompt: expected },
+    ], undefined, { dispatch: "foreground" });
+    const [terminal] = await batch.resultsPromise;
+
+    const [listed] = manager.listSessions();
+    assert.equal(listed?.id, terminal.id, expected);
+    assert.equal(listed?.status.kind, "done", expected);
+    assert.equal(listed?.status.kind === "done" && listed.status.outcome, expected);
+    assert.equal(listed?.capabilities.canResume, false, expected);
+    assert.equal(listed?.capabilities.canRemove, true, expected);
+    assert.equal(listed?.status.kind === "done" && (listed.status.output ?? listed.status.error), expected === "completed" ? "done" : expected === "error" ? "failed" : "interrupted");
+
+    assert.equal((await manager.remove({ sessionIds: [terminal.id] })).removed, 1);
+    assert.deepEqual(manager.listSessions(), []);
+  }
+
+  const registry = {
+    agents: new Map([["oneshot", { name: "oneshot", description: "d", systemPrompt: "s", source: "project", retainConversation: false }]]),
+  };
+  const manager = makeManager(registry as any);
+  const controller = new AbortController();
+  controller.abort();
+  const batch = manager.startRun(baseCtx(), controller.signal, [
+    { kind: "spawn", agent: "oneshot", prompt: "skipped" },
+  ], undefined, { dispatch: "foreground" });
+  const [terminal] = await batch.resultsPromise;
+  const [listed] = manager.listSessions();
+  assert.equal(listed?.id, terminal.id);
+  assert.equal(listed?.status.kind === "done" && listed.status.outcome, "skipped");
+  assert.equal(listed?.capabilities.canResume, false);
+  assert.equal((await manager.remove({ sessionIds: [terminal.id] })).removed, 1);
   assert.deepEqual(manager.listSessions(), []);
 });
 

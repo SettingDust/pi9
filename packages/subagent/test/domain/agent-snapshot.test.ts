@@ -88,7 +88,7 @@ test("a completed release-policy foreground spawn is transient despite its bound
 
   assert.deepEqual(snapshot.conversation, { policy: "release", available: false });
   assert.deepEqual(snapshot.retention, { catalog: "transient", reasons: [] });
-  assert.deepEqual(snapshot.capabilities, { canResume: false, canRemove: false });
+  assert.deepEqual(snapshot.capabilities, { canResume: false, canRemove: true });
 });
 
 test("snapshot attempt kind and previous runs identify spawn and resume without aliases", () => {

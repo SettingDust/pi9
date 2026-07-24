@@ -27,7 +27,7 @@ test("AttemptRunner marks runner rejections before start as terminal error in gr
   assert.equal(final.sessions[0].status.kind, "done");
   assert.equal(final.sessions[0].status.outcome, "error");
   assert.match(final.sessions[0].status.error, /setup failed before start/);
-  assert.deepEqual(manager.listSessions(), []);
+  assert.deepEqual(manager.listSessions().map(session => session.status.kind === "done" && session.status.outcome), ["error"]);
 });
 
 test("AttemptRunner returns skipped result and final group row for queued task whose signal aborted before it can start", async () => {
@@ -71,7 +71,7 @@ test("AttemptRunner returns skipped result and final group row for queued task w
     final.sessions.map((s: any) => s.status.kind === "done" ? s.status.outcome : s.status.kind),
     ["completed", "skipped"],
   );
-  assert.deepEqual(manager.listSessions(), []);
+  assert.deepEqual(manager.listSessions().map(session => session.status.kind === "done" && session.status.outcome), ["completed", "skipped"]);
 });
 
 test("AttemptRunner reports resume setup failure as the follow-up prompt error without returning prior completion", async () => {
@@ -205,12 +205,13 @@ test("AttemptRunner reports queued cancelled resume as skipped follow-up and kee
   assert.equal(finalResumeView.conversation.policy, "retain");
 
   const list = manager.listSessions();
-  assert.equal(list.length, 1);
-  assert.equal(list[0].id, first.sessionId);
-  assert.equal(list[0].status.kind, "done");
-  assert.equal(list[0].status.kind === "done" && list[0].status.outcome, "skipped");
-  assert.equal(list[0].status.kind === "done" && list[0].status.error, "Agent skipped.");
-  assert.equal(list[0].conversation.policy, "retain");
+  assert.equal(list.length, 2);
+  const retained = list.find(session => session.id === first.sessionId)!;
+  const blocker = list.find(session => session.prompt === "blocker prompt")!;
+  assert.equal(retained.status.kind === "done" && retained.status.outcome, "skipped");
+  assert.equal(retained.status.kind === "done" && retained.status.error, "Agent skipped.");
+  assert.equal(retained.conversation.policy, "retain");
+  assert.equal(blocker.status.kind === "done" && blocker.status.outcome, "completed");
 
   const [retried] = await run(manager,baseCtx(), undefined, [
     { kind: "resume", sessionId: first.sessionId!, prompt: "retry prompt" },

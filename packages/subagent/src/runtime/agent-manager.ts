@@ -72,8 +72,7 @@ export class AgentManager {
 
   listSessions(filter?: { status?: SessionStatus[] }): AgentSnapshot[] {
     const listed = this._agents
-      .filter(agent => !this._removingSessionIds.has(agent.id))
-      .filter(agent => agent.retentionDecision.cataloged);
+      .filter(agent => !this._removingSessionIds.has(agent.id));
     const views = listed.map(agent => agent.snapshot());
     if (!filter || filter.status === undefined) return views;
     const allowed = new Set(filter.status);
@@ -222,13 +221,15 @@ export class AgentManager {
 
     // Background runs deliberately decouple from the caller's cancellation signal.
     const childSignal = options.dispatch === "background" ? undefined : signal;
-    const touched = new Set<string>();
 
     const { dispatch, parentId } = options;
     const results = tasks.map((task, inputIndex) => {
       const result = resolveTask({
         task, dispatch, groupId, inputIndex, parentId, registry: this.registry,
-        findAgent: id => this._agents.find(a => a.id === id),
+        findAgent: id => {
+          const lookup = this._resolveSession(id);
+          return "agent" in lookup ? lookup.agent : undefined;
+        },
         allocateSessionId: () => this._sessionIdAllocator.allocate(),
         listener: (agent, update) => this._agentUpdate(agent, update),
       });
@@ -246,7 +247,6 @@ export class AgentManager {
 
       group.addAgent(result.agent, inputIndex);
       this._descendantsByAncestor.delete(result.agent.id);
-      touched.add(result.agent.id);
       return this._runner.run(ctx, childSignal, result.agent, result.agent.requireCurrentAttempt());
     });
 
@@ -256,10 +256,6 @@ export class AgentManager {
     const initialSessions = group.rootSessions();
     const resultsPromise = Promise.all(results)
       .finally(() => {
-        this._agents = this._agents.filter(
-          agent => !touched.has(agent.id) || agent.retentionDecision.cataloged
-        );
-
         group.flush();
         group.dispose();
         this._groups.delete(groupId);

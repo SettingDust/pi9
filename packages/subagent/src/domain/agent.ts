@@ -179,7 +179,7 @@ export class Agent {
       keepConversation,
       conversationAvailable,
       canResume,
-      canRemove: !active && cataloged,
+      canRemove: !active,
       reasons,
     };
   }
