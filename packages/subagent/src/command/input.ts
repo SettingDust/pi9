@@ -56,3 +56,7 @@ export function isPageUpKey(data: string, keybindings?: SubagentKeybindings) {
 export function isPageDownKey(data: string, keybindings?: SubagentKeybindings) {
   return keybindingsMatch(keybindings, data, "tui.select.pageDown") || matchesKey(data, "pageDown");
 }
+
+export function isShiftTabKey(data: string) {
+  return matchesKey(data, "shift+tab") || data === "\x1b[Z";
+}
