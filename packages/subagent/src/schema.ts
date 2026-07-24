@@ -1,40 +1,48 @@
 import { StringEnum, type ModelThinkingLevel } from "@earendil-works/pi-ai";
-import { Type, type Static } from "typebox";
+import { Type, type Static, type TSchema } from "typebox";
 import { isModelThinkingLevel, MODEL_THINKING_LEVELS } from "./agents.js";
 import { isConversationId, type ConversationId } from "./identifiers.js";
 import { isRunId, type RunId } from "./identifiers.js";
 
 export { isModelThinkingLevel, MODEL_THINKING_LEVELS } from "./agents.js";
 
-const NonBlankString = (description: string) =>
-  Type.String({ minLength: 1, description });
-
-export const TaskSchema = Type.Object({
-  agent: Type.Optional(Type.String({ description: "Agent definition to `Spawn`." })),
-  conversationId: Type.Optional(Type.String({ description: "Conversation to `Resume`." })),
-  prompt: NonBlankString("The subagent's complete instructions."),
-  label: Type.Optional(NonBlankString("3–5 plain words describing the task, for display; not an identifier.")),
-  skills: Type.Optional(Type.Array(Type.String(), { description: "Skills override." })),
-  model: Type.Optional(Type.String({ description: "Model override." })),
-  thinking: Type.Optional(StringEnum(MODEL_THINKING_LEVELS)),
-  cwd: Type.Optional(Type.String({ description: "Working directory override." })),
-}, { additionalProperties: false });
+// Task parsing is intentionally per-input so one malformed task never prevents valid siblings.
+export const TaskSchema = Type.Any();
 
 export const SUBAGENT_ACTIONS = ["agents", "list", "run", "join", "remove"] as const;
 export const RUN_STATUSES = [
   "queued", "running", "completed", "error", "aborted", "interrupted", "skipped",
 ] as const;
 
+const Nullable = <T extends TSchema>(schema: T) => Type.Union([schema, Type.Null()]);
+
+/**
+ * Strict providers require an object root, every property required, and optional
+ * values represented as nullable. `prepareSubagentInvocationArguments` supplies
+ * null for omitted action branches before host validation.
+ */
 export const SubagentParams = Type.Object({
   action: StringEnum(SUBAGENT_ACTIONS),
-  status: Type.Optional(Type.Array(StringEnum(RUN_STATUSES), { minItems: 1 })),
-  tasks: Type.Optional(Type.Array(TaskSchema, { minItems: 1 })),
-  runIds: Type.Optional(Type.Array(Type.String(), { minItems: 1 })),
-  conversationIds: Type.Optional(Type.Array(Type.String(), { minItems: 1 })),
+  status: Nullable(Type.Array(StringEnum(RUN_STATUSES), { minItems: 1 })),
+  tasks: Nullable(Type.Array(TaskSchema, { minItems: 1 })),
+  runIds: Nullable(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
+  conversationIds: Nullable(Type.Array(Type.String({ minLength: 1 }), { minItems: 1 })),
 }, { additionalProperties: false });
 
 export type SubagentParams = Static<typeof SubagentParams>;
 export type SubagentAction = (typeof SUBAGENT_ACTIONS)[number];
+
+export function prepareSubagentInvocationArguments(raw: unknown): SubagentParams {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw as SubagentParams;
+  const params = raw as Record<string, unknown>;
+  return {
+    ...params,
+    status: params.status ?? null,
+    tasks: params.tasks ?? null,
+    runIds: params.runIds ?? null,
+    conversationIds: params.conversationIds ?? null,
+  } as SubagentParams;
+}
 export type RunStatus = (typeof RUN_STATUSES)[number];
 
 export const isRunStatus = (value: unknown): value is RunStatus =>
@@ -95,7 +103,7 @@ export function parseSubagentInvocation(
   options: ParseSubagentInvocationOptions = {},
 ): ParsedSubagentInvocation {
   const params = raw && typeof raw === "object" && !Array.isArray(raw)
-    ? raw as Record<string, unknown>
+    ? Object.fromEntries(Object.entries(raw as Record<string, unknown>).filter(([, value]) => value !== null))
     : {};
   const action = params.action;
 

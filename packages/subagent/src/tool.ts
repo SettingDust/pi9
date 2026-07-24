@@ -3,7 +3,7 @@ import type { Conversation, ConversationSnapshot, NestedJoinAttemptSnapshot, Run
 import { listAgentDefinitions, type AgentRegistry } from "./agents.js";
 import type { ConversationId, RunId } from "./identifiers.js";
 import type { JoinBinding, NestedJoinBinding, OrderedStartOutcome, SubagentRuntime } from "./runtime.js";
-import { parseSubagentInvocation, SubagentParams, type RunStatus, type SubagentAction, type SubagentInvocation, type SubagentInvocationParseError, type TaskRequest } from "./schema.js";
+import { parseSubagentInvocation, prepareSubagentInvocationArguments, SubagentParams, type RunStatus, type SubagentAction, type SubagentInvocation, type SubagentInvocationParseError, type TaskRequest } from "./schema.js";
 import type { SubagentSettings } from "./settings.js";
 import {
   renderSubagentCall,
@@ -341,6 +341,8 @@ export function defineSubagentTool(deps: SubagentToolDeps) {
       //"Call subagent action=agents before choosing an agent unless the user named one explicitly or definitions were already listed.",
     ],
     parameters: SubagentParams,
+    prepareArguments: prepareSubagentInvocationArguments,
+    constrainedSampling: { type: "json_schema", strict: "prefer" },
     renderCall(args, theme) {
       return renderSubagentCall(args, theme);
     },

@@ -1,21 +1,24 @@
 import { test } from "vitest";
 import assert from "node:assert/strict";
 import { Check } from "typebox/value";
-import { SubagentParams, TaskSchema, parseSubagentInvocation, parseTask, SUBAGENT_ACTIONS } from "../src/schema.js";
+import { SubagentParams, TaskSchema, parseSubagentInvocation, parseTask, prepareSubagentInvocationArguments, SUBAGENT_ACTIONS } from "../src/schema.js";
 
 const conversationId = "amber-acorn";
 const runId = "adapt-ably";
 
-test("public schema is flat and validates task structure", () => {
+test("strict public schema constrains top-level fields while keeping task diagnostics recoverable", () => {
   assert.deepEqual(SUBAGENT_ACTIONS, ["agents", "list", "run", "join", "remove"]);
-  assert.doesNotMatch(JSON.stringify(SubagentParams), /"anyOf"/);
-  assert.equal(Check(SubagentParams, { action: "agents" }), true);
-  assert.equal(Check(SubagentParams, { action: "unknown" }), false);
-  assert.equal(Check(SubagentParams, { action: "run", tasks: [] }), false);
-  assert.equal(Check(SubagentParams, { action: "run", tasks: {} }), false);
-  assert.equal(Check(SubagentParams, { action: "run", tasks: [{ agent: "helper", prompt: "work" }] }), true);
-  assert.equal(Check(SubagentParams, { action: "run", tasks: [{ agent: 42, prompt: true }, null] }), false);
+  assert.equal(SubagentParams.type, "object");
+  assert.deepEqual(SubagentParams.required, ["action", "status", "tasks", "runIds", "conversationIds"]);
+  assert.equal(Check(SubagentParams, prepareSubagentInvocationArguments({ action: "agents" })), true);
+  assert.equal(Check(SubagentParams, prepareSubagentInvocationArguments({ action: "unknown" })), false);
+  assert.equal(Check(SubagentParams, prepareSubagentInvocationArguments({ action: "run", tasks: [] })), false);
+  assert.equal(Check(SubagentParams, prepareSubagentInvocationArguments({ action: "run", tasks: {} })), false);
+  assert.equal(Check(SubagentParams, prepareSubagentInvocationArguments({ action: "run", tasks: [{ agent: 42, prompt: true }, null] })), true);
+  assert.equal(Check(TaskSchema, { agent: "helper", prompt: "work" }), true);
   assert.equal(Check(TaskSchema, { conversationId, prompt: "continue" }), true);
+  assert.equal(Check(TaskSchema, { agent: "helper", conversationId, prompt: "continue" }), true);
+  assert.equal(Check(TaskSchema, { prompt: "continue" }), true);
 });
 
 test("spawn fields are optional where agreed and preserved", () => {
@@ -117,13 +120,13 @@ test("join and remove ID diagnostics distinguish ID kinds from invalid formats",
   assert.doesNotMatch(malformedRemove.error, /run ID is not accepted/);
 });
 
-test("flat schema admits action fields while the parser enforces their associations", () => {
+test("schema rejects cross-action fields and mixed task kinds before parsing", () => {
   for (const raw of [
     { action: "agents", status: ["running"] },
     { action: "list", tasks: [{ agent: "a", prompt: "x" }] },
     { action: "join", runIds: [runId], conversationIds: [conversationId] },
   ]) {
-    assert.equal(Check(SubagentParams, raw), true);
+    assert.equal(Check(SubagentParams, raw), false);
     assert.ok("error" in parseSubagentInvocation(raw));
   }
 
@@ -134,11 +137,11 @@ test("flat schema admits action fields while the parser enforces their associati
 
 test("schema and parser reject unknown properties", () => {
   const invocation = { action: "remove", conversationIds: [conversationId], extra: true };
-  assert.equal(Check(SubagentParams, invocation), false);
+  assert.equal(Check(SubagentParams, prepareSubagentInvocationArguments(invocation)), false);
   assert.ok("error" in parseSubagentInvocation(invocation));
 
   const task = { agent: "a", prompt: "x", extra: true };
-  assert.equal(Check(TaskSchema, task), false);
+  assert.equal(Check(TaskSchema, task), true);
   assert.ok("error" in parseTask(task));
 });
 
