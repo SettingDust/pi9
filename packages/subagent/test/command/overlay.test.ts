@@ -8,6 +8,7 @@ function overlay(conversations: any[], overrides: Partial<OverlayOptions> = {}, 
   let listener: (() => void) | undefined;
   const unsubscribe = vi.fn();
   const requestRender = vi.fn();
+  const done = vi.fn();
   const callbacks = {
     notify: vi.fn(),
     onStart: vi.fn(),
@@ -24,7 +25,7 @@ function overlay(conversations: any[], overrides: Partial<OverlayOptions> = {}, 
     { requestRender, ...(terminalConfig ? { terminal: terminalConfig } : {}) } as any,
     theme,
     undefined,
-    vi.fn(),
+    done,
     {
       initialPage: "conversations",
       agents: [{ name: "worker", description: "Works", source: "project" } as any],
@@ -34,7 +35,7 @@ function overlay(conversations: any[], overrides: Partial<OverlayOptions> = {}, 
     },
   );
   component.focused = true;
-  return { component, callbacks, requestRender, unsubscribe, update: () => listener?.() };
+  return { component, callbacks, done, requestRender, unsubscribe, update: () => listener?.() };
 }
 
 describe("subagent overlay behavior", () => {
@@ -128,6 +129,25 @@ describe("subagent overlay behavior", () => {
     const { component } = overlay([fakeAgent()]);
     expect(() => component.render(120)).not.toThrow();
     expect(() => component.render(56)).not.toThrow();
+  });
+
+  it("cancels numeric settings editing before closing the overlay", () => {
+    const settings = { ...DEFAULT_SUBAGENT_SETTINGS, widgetMode: "progress" as const };
+    const { component, callbacks, done } = overlay([], { initialPage: "settings", settings });
+
+    component.handleInput("\x1b[B");
+    component.handleInput("\x1b[B");
+    component.handleInput("\r");
+    expect(component.render(120).join("\n")).toContain("enter save · esc cancel");
+
+    component.handleInput("\x15");
+    component.handleInput("13");
+    component.handleInput("\x1b");
+
+    expect(done).not.toHaveBeenCalled();
+    expect(callbacks.onSettingsChange).not.toHaveBeenCalled();
+    expect(component.render(120).join("\n")).toContain("Progress rows");
+    expect(component.render(120).join("\n")).toContain("enter/space change");
   });
 
   it("pins the filter to the bottom of the list pane on both browser pages", () => {
