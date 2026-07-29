@@ -28,6 +28,26 @@ test("definition enables strict-preferred constrained sampling for every typed a
   assert.equal(converted.strict, true);
   assert.equal(converted.parameters.additionalProperties, false);
   assert.deepEqual([...converted.parameters.required].sort(), Object.keys(converted.parameters.properties).sort());
+  const assertStrictObjects = (schema: any): void => {
+    if (!schema || typeof schema !== "object") return;
+    if (schema.type === "object") {
+      assert.equal(schema.additionalProperties, false);
+      assert.deepEqual([...(schema.required ?? [])].sort(), Object.keys(schema.properties ?? {}).sort());
+    }
+    for (const value of Object.values(schema)) {
+      if (Array.isArray(value)) value.forEach(assertStrictObjects);
+      else assertStrictObjects(value);
+    }
+  };
+  assertStrictObjects(converted.parameters);
+  for (const property of ["spawns", "resumes", "messages"]) {
+    const array = converted.parameters.properties[property].anyOf.find((branch: any) => branch.type === "array");
+    assert.equal(array.items.type, "object");
+  }
+  assert.throws(
+    () => validateToolArguments(tool, toolCall(prepareSubagentInvocationArguments({ action: "spawn", spawns: ["not-an-object"] }))),
+    /Validation failed/,
+  );
 });
 
 test("root and child tools share constrained sampling and input preparation", () => {
@@ -90,7 +110,7 @@ test("malformed batch items remain isolated so valid siblings still start", asyn
   const raw = {
     action: "spawn",
     spawns: [
-      { agent: "helper", prompt: "malformed", extra: true },
+      { agent: "helper", prompt: "" },
       { agent: "helper", prompt: "valid" },
     ],
   };

@@ -57,7 +57,7 @@ export interface ExecuteRunDependencies {
   ResourceLoader: typeof DefaultResourceLoader;
   getAgentDir: typeof getAgentDir;
   createAgentSession: typeof createAgentSession;
-  sessionManager: typeof SessionManager.inMemory;
+  sessionManager: typeof SessionManager.create;
   settingsManager: typeof SettingsManager.create;
   readSkillFile: typeof readFileSync;
   loadExtensionPaths: (cwd: string, agentDir: string) => Promise<string[]>;
@@ -69,7 +69,7 @@ export const DEFAULT_EXECUTE_RUN_DEPENDENCIES: ExecuteRunDependencies = {
   ResourceLoader: DefaultResourceLoader,
   getAgentDir,
   createAgentSession,
-  sessionManager: SessionManager.inMemory,
+  sessionManager: SessionManager.create,
   settingsManager: SettingsManager.create,
   readSkillFile: readFileSync,
   loadExtensionPaths: discoverInheritedExtensionPaths,
@@ -202,7 +202,15 @@ export async function executeRun(
   if (signal?.aborted) return skippedRun(agent, run.runId);
 
   const requestedThinking = requestedConfig.thinking;
-  const sessionManager = dependencies.sessionManager(cwd);
+  const parentSession = ctx.sessionManager?.getSessionFile();
+  const childSessionDir = parentSession
+    ? path.join(path.dirname(parentSession), path.basename(parentSession, path.extname(parentSession)))
+    : undefined;
+  const sessionManager = dependencies.sessionManager(
+    cwd,
+    childSessionDir,
+    parentSession ? { parentSession } : undefined,
+  );
   let session: AgentSession | undefined;
   try {
     ({ session } = await timingAsync("runAgent.createAgentSession", { ...runData, cwd, model: selectedModel ? `${selectedModel.provider}/${selectedModel.id}` : undefined }, () => dependencies.createAgentSession({

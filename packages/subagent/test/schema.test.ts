@@ -24,11 +24,11 @@ test("public schema exposes strict-provider-compatible typed actions", () => {
   assert.equal(Check(SubagentParams, prepareSubagentInvocationArguments({ action: "resume", resumes: [{ conversationId, prompt: "continue" }] })), true);
   assert.equal(Check(SubagentParams, prepareSubagentInvocationArguments({ action: "steer", messages: [{ runId, message: "redirect" }] })), true);
   assert.equal(Check(SubagentParams, prepareSubagentInvocationArguments({ action: "cancel", runIds: [runId] })), true);
-  const malformedSteer = prepareSubagentInvocationArguments({ action: "steer", messages: [{ runId, prompt: "old field" }] });
+  const malformedSteer = prepareSubagentInvocationArguments({ action: "steer", messages: [{ runId, message: "" }] });
   assert.equal(Check(SubagentParams, malformedSteer), true);
   assert.deepEqual(parseSubagentInvocation(malformedSteer), {
     action: "steer",
-    messages: [{ runId, error: "Steer message property prompt is not allowed." }],
+    messages: [{ runId, error: "Steer message must be a non-empty string." }],
   });
   assert.equal(Check(ResumeTaskSchema, { conversationId, prompt: "continue" }), true);
   assert.equal(Check(SteerMessageSchema, { runId, message: "redirect" }), true);
@@ -182,7 +182,7 @@ test("schema and parser reject unknown properties", () => {
   const invocation = { action: "remove", conversationIds: [conversationId], extra: true };
   assert.equal(Check(SubagentParams, invocation), false);
   assert.ok("error" in parseSubagentInvocation(invocation));
-  assert.equal(Check(SpawnTaskSchema, { agent: "a", prompt: "x", extra: true }), true);
+  assert.equal(Check(SpawnTaskSchema, { agent: "a", prompt: "x", extra: true }), false);
   assert.ok("error" in parseSpawnTask({ agent: "a", prompt: "x", extra: true }));
 });
 

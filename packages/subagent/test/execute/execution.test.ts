@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { afterEach, expect, test, vi } from "vitest";
-import { DefaultResourceLoader, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { DefaultResourceLoader, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { Conversation } from "../../src/conversation.js";
 import { completedRun } from "../../src/conversation.js";
 import { DEFAULT_EXECUTE_RUN_DEPENDENCIES, resolveModel, resolveTaskCwd, executeRun } from "../../src/execute.js";
@@ -72,6 +72,23 @@ test("child session lifecycle observers span finalized tool execution events", a
   expect(listeners).toHaveLength(0);
 });
 
+test("stores child sessions beneath the parent session file", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "pi9-subagent-parent-"));
+  const parentSession = path.join(root, "2026-07-18T04-14-22-620Z_019f736e-b39c-7fc0-a34e-6ef57fecec5c.jsonl");
+  const childDir = parentSession.slice(0, -".jsonl".length);
+  const manager = DEFAULT_EXECUTE_RUN_DEPENDENCIES.sessionManager(process.cwd(), childDir, { parentSession });
+  const sessionFile = manager.getSessionFile();
+
+  try {
+    expect(manager).toBeInstanceOf(SessionManager);
+    expect(manager.isPersisted()).toBe(true);
+    expect(path.dirname(sessionFile!)).toBe(childDir);
+    expect(manager.getHeader()?.parentSession).toBe(parentSession);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("discovers requested skills through Pi ResourceLoader instead of the low-level scanner", async () => {
   const skill = { name: "resource-only", filePath: "/skills/resource-only/SKILL.md", baseDir: "/skills/resource-only" };
   let loaderOptions: any;
@@ -89,20 +106,31 @@ test("discovers requested skills through Pi ResourceLoader instead of the low-le
   }
   const session = finishedSession();
   let resourceLoader: any;
+  const parentSession = path.join("C:", "Users", "WINDOWS", ".pi", "agent", "sessions", "--E--Projects-pi-dust-harness--", "2026-07-18T04-14-22-620Z_019f736e-b39c-7fc0-a34e-6ef57fecec5c.jsonl");
+  const createSessionManager = vi.fn(() => ({}));
   const agent = spawning(["resource-only"]);
 
-  const result = await executeRun({ cwd: process.cwd(), modelRegistry: registry() } as any, agent, agent.requireCurrentRun(), undefined, {
+  const result = await executeRun({
+    cwd: process.cwd(),
+    modelRegistry: registry(),
+    sessionManager: { getSessionFile: () => parentSession },
+  } as any, agent, agent.requireCurrentRun(), undefined, {
     ...DEFAULT_EXECUTE_RUN_DEPENDENCIES,
     ResourceLoader: ResourceLoader as any,
     getAgentDir: () => "/tmp/pi-agent",
     settingsManager: (() => ({ setProjectTrusted() {} })) as any,
-    sessionManager: (() => ({})) as any,
+    sessionManager: createSessionManager as any,
     loadExtensionPaths: async () => [],
     readSkillFile: (() => "---\nname: resource-only\ndescription: test\n---\n\nRESOURCE BODY") as any,
     createAgentSession: (async (options: any) => { resourceLoader = options.resourceLoader; return { session }; }) as any,
   });
 
   expect(result.status).toMatchObject({ kind: "done", outcome: "completed" });
+  expect(createSessionManager).toHaveBeenCalledWith(
+    process.cwd(),
+    parentSession.slice(0, -".jsonl".length),
+    { parentSession },
+  );
   expect(resourceLoader.getSystemPrompt()).toContain("RESOURCE BODY");
   expect(resourceLoader.getSkills().skills).toEqual([]);
   expect(session.bindExtensions).not.toHaveBeenCalled();

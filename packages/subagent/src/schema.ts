@@ -6,13 +6,40 @@ import { isRunId, type RunId } from "./identifiers.js";
 
 export { isModelThinkingLevel, MODEL_THINKING_LEVELS } from "./agents.js";
 
-const Nullable = <T extends TSchema>(schema: T) => Type.Union([schema, Type.Null()]);
+const Nullable = <T extends TSchema>(schema: T) => Type.Union([Type.Null(), schema]);
 
-// Batch items stay unconstrained here so one malformed item cannot prevent valid siblings.
-// The per-action parsers below validate each item and preserve ordered failures.
-export const SpawnTaskSchema = Type.Any({ description: "Spawn item: { agent: non-empty string, prompt: non-empty string, label?: string, skills?: string[], model?: string, thinking?: off|minimal|low|medium|high|xhigh|max, cwd?: string }." });
-export const ResumeTaskSchema = Type.Any({ description: "Resume item: { conversationId: adjective-noun conversation ID, prompt: non-empty string }." });
-export const SteerMessageSchema = Type.Any({ description: "Steer item: { runId: verb-adverb run ID, message: non-empty string }." });
+const SpawnTaskFields = {
+  agent: Nullable(Type.String()),
+  prompt: Nullable(Type.String()),
+  label: Nullable(Type.String()),
+  skills: Nullable(Type.Array(Type.String())),
+  model: Nullable(Type.String()),
+  thinking: Nullable(StringEnum(MODEL_THINKING_LEVELS)),
+  cwd: Nullable(Type.String()),
+};
+const ResumeTaskFields = {
+  conversationId: Nullable(Type.String()),
+  prompt: Nullable(Type.String()),
+};
+const SteerMessageFields = {
+  runId: Nullable(Type.String()),
+  message: Nullable(Type.String()),
+};
+
+// All fields are required-but-nullable for provider strict mode. The parser removes
+// nulls and keeps semantic failures isolated to their batch item.
+export const SpawnTaskSchema = Type.Object(SpawnTaskFields, {
+  additionalProperties: false,
+  description: "Spawn item: { agent, prompt, label?, skills?, model?, thinking?, cwd? }.",
+});
+export const ResumeTaskSchema = Type.Object(ResumeTaskFields, {
+  additionalProperties: false,
+  description: "Resume item: { conversationId, prompt }.",
+});
+export const SteerMessageSchema = Type.Object(SteerMessageFields, {
+  additionalProperties: false,
+  description: "Steer item: { runId, message }.",
+});
 
 export const SUBAGENT_ACTIONS = ["agents", "list", "spawn", "resume", "steer", "cancel", "inspect", "join", "remove"] as const;
 export const RUN_STATUSES = [
@@ -32,12 +59,17 @@ export const SubagentParams = Type.Object({
 export function prepareSubagentInvocationArguments(raw: unknown): SubagentParams {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw as SubagentParams;
   const params = raw as Record<string, unknown>;
+  const prepareItems = (value: unknown, keys: readonly string[]): unknown => Array.isArray(value)
+    ? value.map(item => item && typeof item === "object" && !Array.isArray(item)
+      ? Object.assign(Object.fromEntries(keys.map(key => [key, null])), item)
+      : item)
+    : value ?? null;
   return {
     ...params,
     status: params.status ?? null,
-    spawns: params.spawns ?? null,
-    resumes: params.resumes ?? null,
-    messages: params.messages ?? null,
+    spawns: prepareItems(params.spawns, Object.keys(SpawnTaskFields)),
+    resumes: prepareItems(params.resumes, Object.keys(ResumeTaskFields)),
+    messages: prepareItems(params.messages, Object.keys(SteerMessageFields)),
     runIds: params.runIds ?? null,
     conversationIds: params.conversationIds ?? null,
   } as SubagentParams;
