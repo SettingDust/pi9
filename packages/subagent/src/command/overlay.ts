@@ -13,6 +13,7 @@ import {
 } from "@earendil-works/pi-tui";
 import type { AgentConfig } from "../agents.js";
 import { effectiveStatus, type ConversationSnapshot, type RunSnapshot } from "../conversation.js";
+import { formatElapsed, formatTokens, runElapsedMs } from "../run-format.js";
 import type { SubagentRuntime } from "../runtime.js";
 import { DEFAULT_SUBAGENT_SETTINGS, type SubagentSettings } from "../settings.js";
 import { clamp, isCancelKey, isDownKey, isEnterKey, isPageDownKey, isPageUpKey, isShiftTabKey, isUpKey, type SubagentKeybindings } from "./input.js";
@@ -36,6 +37,7 @@ export interface OverlayOptions {
   onSettingsChange(change: SubagentSettingsChange): SubagentSettings | void;
   onStart(agent: string, prompt: string): string | undefined;
   onResume(conversationId: string, prompt: string): void;
+  onCancel?(runId: string): void;
   onRemove?(conversationId: string): void;
 }
 
@@ -108,12 +110,14 @@ export class SubagentOverlayComponent implements Component, Focusable {
       return;
     }
     if (this.detail) {
-      if (this.handleChronologyScroll(data)) return;
-      if (isUpKey(data, this.keybindings)) { this.moveDetailRun(-1); return; }
-      if (isDownKey(data, this.keybindings)) { this.moveDetailRun(1); return; }
+      const command = data.toLowerCase();
       if (isCancelKey(data, this.keybindings)) this.detail = undefined;
-      else if (data.toLowerCase() === "r") this.openResumePrompt(this.detail.conversationId);
-      else if (data.toLowerCase() === "x" || data.toLowerCase() === "c") this.removeConversation(this.detail.conversationId);
+      else if (command === "r") this.openResumePrompt(this.detail.conversationId);
+      else if (command === "c") this.cancelRun(this.detail.conversationId, this.detail.runId);
+      else if (command === "x") this.removeConversation(this.detail.conversationId);
+      else if (this.handleChronologyScroll(data)) return;
+      else if (isUpKey(data, this.keybindings)) { this.moveDetailRun(-1); return; }
+      else if (isDownKey(data, this.keybindings)) { this.moveDetailRun(1); return; }
       this.requestRender();
       return;
     }
@@ -123,7 +127,7 @@ export class SubagentOverlayComponent implements Component, Focusable {
     if (isShiftTabKey(data)) { this.switchPage(-1); return; }
     if ((this.page === "conversations" || this.page === "agents") && data === "/") { this.setFocus("filter"); return; }
     if (this.page === "settings") { this.settings.handleInput(data); return; }
-    if (this.page === "conversations" && this.handleChronologyScroll(data)) return;
+    if (this.page === "conversations" && !["t", "c", "r", "x"].includes(data.toLowerCase()) && this.handleChronologyScroll(data)) return;
     if (isUpKey(data, this.keybindings)) { this.moveSelection(-1); return; }
     if (isDownKey(data, this.keybindings)) { this.moveSelection(1); return; }
     if (this.page === "agents") this.handleAgentAction(data);
@@ -336,7 +340,7 @@ export class SubagentOverlayComponent implements Component, Focusable {
     }
 
     lines.push(
-      `${this.muted("◆")} ${this.accent(run === conversation.currentRun ? "Current prompt" : "Prompt")}`,
+      `${this.muted("◆")} ${this.accent("Current prompt")}`,
       ...wrapTextWithAnsi(run.prompt, Math.max(1, width - 2)).map(line => `  ${line}`),
       this.muted("│"),
       `${this.statusAccent(run, "●")} ${this.accent("Activity")}`,
@@ -359,7 +363,7 @@ export class SubagentOverlayComponent implements Component, Focusable {
       }
     }
 
-    lines.push("", this.muted(`enter inspect${this.canResumeConversation(conversation) ? " · r resume" : ""} · x remove`));
+    lines.push("", this.muted(`enter inspect${run.status.kind === "queued" || run.status.kind === "running" ? " · c cancel" : ""}${this.canResumeConversation(conversation) ? " · r resume" : ""} · x remove`));
     if (this.promptTarget?.kind === "resume") lines.push("", this.accent("Resume conversation"), ...this.renderPrompt(width));
     if (this.actionError) lines.push(this.error(this.actionError));
     return lines;
@@ -429,7 +433,8 @@ export class SubagentOverlayComponent implements Component, Focusable {
       this.chronologyOffset = 0;
       this.detail = { conversationId: conversation.conversationId, ...(run ? { runId: run.runId } : {}) };
     } else if (data.toLowerCase() === "r") this.openResumePrompt(conversation.conversationId);
-    else if (data.toLowerCase() === "x" || data.toLowerCase() === "c") this.removeConversation(conversation.conversationId);
+    else if (data.toLowerCase() === "c") this.cancelRun(conversation.conversationId);
+    else if (data.toLowerCase() === "x") this.removeConversation(conversation.conversationId);
     this.requestRender();
   }
 
@@ -474,6 +479,13 @@ export class SubagentOverlayComponent implements Component, Focusable {
     }
   }
 
+  private cancelRun(conversationId: string, runId?: string): void {
+    const conversation = this.findConversation(conversationId);
+    if (!conversation) return;
+    const run = this.findRun(conversation, runId);
+    if (run?.status.kind === "queued" || run?.status.kind === "running") this.options.onCancel?.(run.runId);
+  }
+
   private removeConversation(conversationId: string): void {
     this.options.onRemove?.(conversationId);
     if (this.detail?.conversationId === conversationId) this.detail = undefined;
@@ -481,10 +493,13 @@ export class SubagentOverlayComponent implements Component, Focusable {
   }
 
   private moveDetailRun(delta: number): void {
-    const conversation = this.detail && this.findConversation(this.detail.conversationId);
+    const detail = this.detail;
+    if (!detail) return;
+    const conversation = this.findConversation(detail.conversationId);
     if (!conversation?.runs.length) return;
-    const current = this.findRun(conversation, this.detail!.runId);
-    const index = clamp(conversation.runs.findIndex(run => run.runId === current?.runId) + delta, 0, conversation.runs.length - 1);
+    const current = this.findRun(conversation, detail.runId);
+    const currentIndex = conversation.runs.findIndex(run => run.runId === current?.runId);
+    const index = clamp((currentIndex < 0 ? conversation.runs.length - 1 : currentIndex) + delta, 0, conversation.runs.length - 1);
     this.detail = { conversationId: conversation.conversationId, runId: conversation.runs[index].runId };
     this.chronologyOffset = 0;
     this.requestRender();
@@ -601,9 +616,9 @@ export class SubagentOverlayComponent implements Component, Focusable {
   private row(content: string, width: number): string { return `${this.border("│")}${pad(content, width)}${this.border("│")}`; }
   private helpText(): string {
     if (this.focusRegion === "prompt") return "enter submit · esc cancel";
-    if (this.detail) return "↑↓ runs · pgup/pgdn scroll · home/end · r resume · x remove · esc back";
+    if (this.detail) return "↑↓ runs · pgup/pgdn scroll · home/end · c cancel · r resume · x remove · esc back";
     if (this.page === "agents") return "↑↓ select · / filter · enter/s start · tab pages · esc close";
-    if (this.page === "conversations") return "↑↓ select · pgup/pgdn scroll · enter inspect · / filter · t flat/tree · r resume · x remove · tab pages · esc close";
+    if (this.page === "conversations") return "↑↓ select · pgup/pgdn scroll · enter inspect · / filter · t flat/tree · c cancel · r resume · x remove · tab pages · esc close";
     return this.settings.isEditing ? "type value · enter save · esc cancel" : "↑↓ select · enter/space change · tab pages · esc close";
   }
 }
@@ -613,24 +628,6 @@ function requestedConfigLabel(conversation: ConversationSnapshot): string {
   if (model && thinking) return `${model}:${thinking}`;
   if (model) return model;
   return thinking ? `thinking ${thinking}` : "";
-}
-function runElapsedMs(run: RunSnapshot, now = Date.now()): number {
-  const start = run.status.kind === "queued" ? run.status.queuedAt : run.status.kind === "running" ? run.status.startedAt : run.status.startedAt ?? run.createdAt;
-  const end = run.status.kind === "done" ? run.status.completedAt : now;
-  return Math.max(0, end - start);
-}
-function formatElapsed(milliseconds: number): string {
-  if (milliseconds < 1_000) return `${milliseconds}ms`;
-  const seconds = milliseconds / 1_000;
-  if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
-  const minutes = Math.floor(seconds / 60);
-  const remainder = Math.floor(seconds - minutes * 60);
-  return `${minutes}m${remainder.toString().padStart(2, "0")}s`;
-}
-function formatTokens(tokens: number): string {
-  if (tokens < 1_000) return `${tokens} tokens`;
-  if (tokens < 1_000_000) return `${(tokens / 1_000).toFixed(tokens < 10_000 ? 1 : 0)}k tokens`;
-  return `${(tokens / 1_000_000).toFixed(tokens < 10_000_000 ? 1 : 0)}m tokens`;
 }
 function runRecency(run: RunSnapshot, now = Date.now()): string {
   if (run.status.kind === "running") return "active now";

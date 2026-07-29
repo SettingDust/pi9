@@ -236,7 +236,7 @@ async function listAgentFilesRecursive(dir: string, extensions: Set<string>, war
     for (const entry of entries) {
       const path = join(dir, entry.name);
       if (entry.isDirectory()) files.push(...await listAgentFilesRecursive(path, extensions, warn));
-      else if ((entry.isFile() || entry.isSymbolicLink()) && extensions.has(extname(entry.name)) && !basename(entry.name).endsWith(".chain.md")) files.push(path);
+      else if (entry.isFile() && extensions.has(extname(entry.name)) && !basename(entry.name).endsWith(".chain.md")) files.push(path);
     }
   } catch (error) {
     warn(`Failed to enumerate subagent directory ${dir}: ${error instanceof Error ? error.message : String(error)}`);

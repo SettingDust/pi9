@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-07-28
+
+### Changed
+
+- Use the dim color for the compaction reserve in the context graph and breakdown.
+
+## [0.2.1] - 2026-07-26
+
+### Changed
+
+- Update Pi development dependencies to 0.82.1.
+
 ## [0.2.0] - 2026-07-16
 
 ### Changed
@@ -40,6 +52,8 @@
 - Simplify tool detail lines and remove the report capture-age line.
 - Align development dependencies with Pi 0.80 and remove the unused `typebox` peer.
 
-[Unreleased]: https://github.com/Chase-C/pi9/compare/context-v0.2.0...HEAD
+[Unreleased]: https://github.com/Chase-C/pi9/compare/context-v0.2.2...HEAD
+[0.2.2]: https://github.com/Chase-C/pi9/compare/context-v0.2.1...context-v0.2.2
+[0.2.1]: https://github.com/Chase-C/pi9/compare/context-v0.2.0...context-v0.2.1
 [0.2.0]: https://github.com/Chase-C/pi9/compare/context-v0.1.0...context-v0.2.0
 [0.1.0]: https://github.com/Chase-C/pi9/releases/tag/context-v0.1.0

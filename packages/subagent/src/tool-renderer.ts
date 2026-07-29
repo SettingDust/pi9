@@ -1,9 +1,10 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Text, visibleWidth, wrapTextWithAnsi, type Component } from "@earendil-works/pi-tui";
 import type { AgentSource } from "./agents.js";
-import type { RunKind } from "./conversation.js";
+import type { ConversationEffectiveConfig, ConversationRequestedOverrides, RunKind, RunPhase, SteerReceipt } from "./conversation.js";
 import type { ConversationId, RunId } from "./identifiers.js";
-import type { RunStatus, SubagentAction } from "./schema.js";
+import { formatElapsed, formatTokens } from "./run-format.js";
+import type { DispatchTaskKind, RunStatus, SubagentAction } from "./schema.js";
 
 type ThemeLike = Partial<Pick<Theme, "fg" | "bold">>;
 type ThemeColor = Parameters<Theme["fg"]>[0];
@@ -17,30 +18,75 @@ export interface AgentRenderItem {
   tools?: readonly string[];
 }
 
-export interface RunRenderItem {
+export interface DispatchTaskRenderItem {
   inputIndex: number;
-  kind?: RunKind;
+  kind?: DispatchTaskKind;
   agent?: string;
   label?: string;
   prompt?: string;
   conversationId?: ConversationId;
   runId?: RunId;
+  steer?: SteerReceipt;
   error?: string;
 }
 
 export interface ListedRunRenderItem {
-  conversationId: ConversationId;
   runId: RunId;
-  agent: string;
-  label?: string;
+  parentRunId?: RunId;
+  rootRunId: RunId;
+  depth: number;
   kind: RunKind;
   status: RunStatus;
+  createdAt: number;
+}
+
+export interface ListedConversationRenderItem {
+  conversationId: ConversationId;
+  agent: string;
+  label?: string;
+  createdAt: number;
+  canResume: boolean;
+  runs: ListedRunRenderItem[];
 }
 
 export interface JoinActivityRenderItem {
   toolCallId?: string;
   tool: string;
   summary?: string;
+}
+
+export interface CancelledRunRenderItem {
+  conversationId?: ConversationId;
+  runId: string;
+  status?: "aborted";
+  error?: string;
+}
+
+export interface InspectedRunErrorRenderItem {
+  inputIndex: number;
+  runId: string;
+  error: string;
+}
+
+export interface InspectedRunRenderItem {
+  conversationId: ConversationId;
+  runId: RunId;
+  parentRunId?: RunId;
+  rootRunId: RunId;
+  depth: number;
+  requestedOverrides?: ConversationRequestedOverrides;
+  effectiveConfig?: ConversationEffectiveConfig;
+  agent?: string;
+  label?: string;
+  status: RunStatus;
+  phase?: RunPhase;
+  elapsedMs: number;
+  turns: number;
+  compactions: number;
+  messageSnippet?: string;
+  errorSnippet?: string;
+  recentTools: Array<JoinActivityRenderItem & { status: "running" | "completed" | "error" | "interrupted" }>;
+  steers: readonly SteerReceipt[];
 }
 
 /** A join invocation, retained in invocation order (including repeated targets). */
@@ -59,6 +105,9 @@ export interface JoinTargetRenderItem {
   agent?: string;
   label?: string;
   status: RunStatus;
+  elapsedMs?: number;
+  turns?: number;
+  tokens?: number;
   activity?: JoinActivityRenderItem[];
   joins?: JoinInvocationRenderItem[];
   background?: JoinBackgroundOwnerRenderItem[];
@@ -81,8 +130,8 @@ export interface JoinBackgroundOwnerRenderItem {
 }
 
 export interface JoinedRunRenderItem {
-  conversationId: ConversationId;
-  runId: RunId;
+  conversationId?: ConversationId;
+  runId: string;
   agent?: string;
   label?: string;
   kind?: RunKind;
@@ -90,6 +139,9 @@ export interface JoinedRunRenderItem {
   status: RunStatus;
   output?: string;
   error?: string;
+  elapsedMs?: number;
+  turns?: number;
+  tokens?: number;
   activity?: JoinActivityRenderItem[];
   joins?: JoinInvocationRenderItem[];
   background?: JoinBackgroundOwnerRenderItem[];
@@ -99,13 +151,16 @@ export interface JoinedRunRenderItem {
 
 export type SubagentToolDetails =
   | { action: "agents"; agents: AgentRenderItem[] }
-  | { action: "list"; runs: ListedRunRenderItem[] }
-  | { action: "run"; tasks: RunRenderItem[] }
+  | { action: "list"; conversations: ListedConversationRenderItem[] }
+  | { action: "spawn"; tasks: DispatchTaskRenderItem[] }
+  | { action: "resume"; tasks: DispatchTaskRenderItem[] }
+  | { action: "steer"; tasks: DispatchTaskRenderItem[] }
+  | { action: "cancel"; runs: CancelledRunRenderItem[] }
+  | { action: "inspect"; runs: Array<InspectedRunRenderItem | InspectedRunErrorRenderItem> }
   | { action: "join"; runs: JoinedRunRenderItem[] }
   | {
       action: "remove";
       removed: number;
-      aborted: number;
       conversationIds: ConversationId[];
       errors: Array<{ conversationId: string; error: string }>;
     }
@@ -161,26 +216,48 @@ function collapsedLines(details: Exclude<SubagentToolDetails, { action: "error" 
       ];
     }
     case "list": {
-      if (details.runs.length === 0) return [success(theme, "No runs found")];
+      if (details.conversations.length === 0) return [success(theme, "No conversations found")];
+      const runs = details.conversations.flatMap(conversation => conversation.runs);
       return [
-        success(theme, `Found ${count(details.runs.length, "run")}${statusSummary(details.runs.map(run => run.status), theme)}`),
-        secondary(details.runs.map(runLabel), theme),
+        success(theme, `Found ${count(details.conversations.length, "conversation")} ${paint(theme, "muted", "·")} ${count(runs.length, "run")}${statusSummary(runs.map(run => run.status), theme)}`),
+        secondary(details.conversations.map(conversationLabel), theme),
       ];
     }
-    case "run": {
+    case "spawn":
+    case "resume":
+    case "steer": {
       const accepted = details.tasks.filter(task => task.runId);
       const rejected = details.tasks.length - accepted.length;
       const spawned = accepted.filter(task => task.kind === "spawn").length;
       const resumed = accepted.filter(task => task.kind === "resume").length;
-      const outcome = runOutcomeSummary(spawned, resumed, rejected, theme);
+      const steered = accepted.filter(task => task.kind === "steer").length;
+      const outcome = dispatchOutcomeSummary(spawned, resumed, steered, rejected, theme);
       const labels = details.tasks.map((task, index) => taskLabel(task, index));
       return labels.length ? [success(theme, outcome), secondary(labels, theme)] : [success(theme, outcome)];
+    }
+    case "cancel": {
+      const cancelled = details.runs.filter(run => run.status === "aborted").length;
+      const errors = details.runs.length - cancelled;
+      const summary = [`Cancelled ${count(cancelled, "run")}`];
+      if (errors) summary.push(count(errors, "error"));
+      return [success(theme, summary.join(paint(theme, "muted", " · "))), secondary(details.runs.map(run => run.runId), theme)];
+    }
+    case "inspect": {
+      if (details.runs.length === 0) return [success(theme, "No runs inspected")];
+      const inspected = details.runs.filter((run): run is InspectedRunRenderItem => !("error" in run));
+      const errors = details.runs.length - inspected.length;
+      const summary = inspected.length
+        ? `Inspected ${count(inspected.length, "run")}${statusSummary(inspected.map(run => run.status), theme)}${errors ? `${paint(theme, "muted", " · ")}${count(errors, "error")}` : ""}`
+        : `Inspected ${count(errors, "target")} ${paint(theme, "muted", "·")} ${count(errors, "error")}`;
+      return [
+        success(theme, summary),
+        secondary(details.runs.map(run => "error" in run ? run.runId : run.label || run.agent || run.runId), theme),
+      ];
     }
     case "join":
       return joinLines(details.runs, false, partial, theme);
     case "remove": {
       const summary = [`Removed ${count(details.removed, "conversation")}`];
-      if (details.aborted) summary.push(`${count(details.aborted, "active run")} aborted`);
       if (details.errors.length) summary.push(count(details.errors.length, "error"));
       const lines = [success(theme, summary.join(paint(theme, "muted", " · ")))];
       if (details.conversationIds.length) lines.push(secondary(details.conversationIds, theme));
@@ -200,19 +277,55 @@ function expandedLines(details: Exclude<SubagentToolDetails, { action: "error" }
         `  ${tag(theme, "tools", agent.tools?.join(", ") || "default toolset")}`,
       ]);
     case "list":
-      if (details.runs.length === 0) return [success(theme, "No runs found")];
-      return blocks(details.runs, run => [
-        `${arrow(theme)} ${paint(theme, "text", runLabel(run))} ${paint(theme, "muted", `· ${run.agent} · ${run.kind}`)}`,
-        `  ${statusText(theme, run.status)} ${paint(theme, "muted", "·")} ${identity(theme, run.conversationId, run.runId)}`,
-      ]);
-    case "run":
+      if (details.conversations.length === 0) return [success(theme, "No conversations found")];
+      return blocks(details.conversations, conversation => {
+        const lines = [
+          `${arrow(theme)} ${paint(theme, "text", conversationLabel(conversation))} ${paint(theme, "muted", `· ${conversation.agent} · ${count(conversation.runs.length, "run")}${conversation.canResume ? " · resumable" : ""}`)}`,
+          `  ${tag(theme, "conversation", conversation.conversationId)}`,
+        ];
+        for (const run of conversation.runs) {
+          lines.push(`  ${statusMarker(theme, run.status)} ${paint(theme, "text", run.runId)} ${paint(theme, "muted", `· ${run.kind} · depth ${run.depth} ·`)} ${statusText(theme, run.status)}`);
+        }
+        return lines;
+      });
+    case "spawn":
+    case "resume":
+    case "steer":
       return blocks(details.tasks, (task, index) => {
         const label = taskLabel(task, index);
         const meta = [task.agent, task.kind].filter(Boolean).join(" · ");
         const lines = [`${task.error ? errorMarker(theme) : arrow(theme)} ${paint(theme, "text", label)}${meta ? ` ${paint(theme, "muted", `· ${meta}`)}` : ""}`];
         if (task.prompt) lines.push(`  ${paint(theme, "dim", task.prompt)}`);
         if (task.error) lines.push(`  ${paint(theme, "error", task.error)}`);
-        else if (task.conversationId && task.runId) lines.push(`  ${paint(theme, "success", "started")} ${paint(theme, "muted", "·")} ${identity(theme, task.conversationId, task.runId)}`);
+        else if (task.conversationId && task.runId) {
+          const receipt = task.steer ? ` ${paint(theme, "muted", `· steer #${task.steer.id} ${task.steer.state}`)}` : "";
+          lines.push(`  ${paint(theme, "success", task.kind === "steer" ? "steered" : "started")} ${paint(theme, "muted", "·")} ${identity(theme, task.conversationId, task.runId)}${receipt}`);
+        }
+        return lines;
+      });
+    case "cancel":
+      return blocks(details.runs, run => run.error ? [
+        `${errorMarker(theme)} ${paint(theme, "text", run.runId)} ${paint(theme, "muted", "· not cancelled")}`,
+        `  ${paint(theme, "error", run.error)}`,
+      ] : [
+        `${arrow(theme)} ${paint(theme, "text", run.runId)} ${paint(theme, "muted", "· cancelled")}`,
+        ...(run.conversationId ? [`  ${identity(theme, run.conversationId, run.runId)}`] : []),
+      ]);
+    case "inspect":
+      return blocks(details.runs, run => {
+        if ("error" in run) return [
+          `${errorMarker(theme)} ${paint(theme, "text", run.runId)} ${paint(theme, "muted", "· not inspected")}`,
+          `  ${paint(theme, "error", run.error)}`,
+        ];
+        const label = run.label || run.agent || run.runId;
+        const lines = [
+          `${statusMarker(theme, run.status)} ${paint(theme, "text", label)} ${paint(theme, "muted", "·")} ${statusText(theme, run.status)}${run.phase ? ` ${paint(theme, "muted", `· ${run.phase.replaceAll("_", " ")}`)}` : ""}`,
+          `  ${identity(theme, run.conversationId, run.runId)} ${paint(theme, "muted", `· ${run.turns} turns · ${run.compactions} compactions · ${run.elapsedMs}ms`)}`,
+        ];
+        if (run.messageSnippet) lines.push(`  ${paint(theme, "dim", `[partial] ${run.messageSnippet}`)}`);
+        if (run.errorSnippet) lines.push(`  ${paint(theme, "error", run.errorSnippet)}`);
+        for (const tool of run.recentTools) lines.push(`  ${paint(theme, "muted", `${tool.tool}${tool.summary ? `(${tool.summary})` : ""} · ${tool.status}`)}`);
+        for (const steer of run.steers) lines.push(`  ${paint(theme, "muted", `steer #${steer.id} · ${steer.state}`)}`);
         return lines;
       });
     case "join":
@@ -229,10 +342,6 @@ function expandedLines(details: Exclude<SubagentToolDetails, { action: "error" }
         ]);
       }
       const lines = joinBlocks(items);
-      if (details.aborted) {
-        if (lines.length) lines.push("");
-        lines.push(`  ${paint(theme, "warning", `${count(details.aborted, "active run")} aborted`)}`);
-      }
       return lines.length ? lines : [success(theme, "No conversations removed")];
     }
   }
@@ -250,7 +359,7 @@ function renderJoinRoot(run: JoinedRunRenderItem, index: number, expanded: boole
   const label = run.label || run.agent || run.runId || `run ${index + 1}`;
   const meta = [run.agent, run.kind].filter(Boolean).join(" · ");
   const lines = [
-    `${statusMarker(theme, run.status)} ${paint(theme, "text", label)}${meta ? ` ${paint(theme, "muted", `· ${meta}`)}` : ""} ${paint(theme, "muted", "·")} ${statusText(theme, run.status)}`,
+    `${statusMarker(theme, run.status)} ${paint(theme, "text", label)}${meta ? ` ${paint(theme, "muted", `· ${meta}`)}` : ""} ${paint(theme, "muted", "·")} ${statusText(theme, run.status)}${runStats(run, theme)}`,
   ];
   const message = run.output ?? run.error;
   if (terminal && !expanded) {
@@ -259,7 +368,7 @@ function renderJoinRoot(run: JoinedRunRenderItem, index: number, expanded: boole
   }
 
   if (expanded) {
-    lines.push(`  ${identity(theme, run.conversationId, run.runId)}`);
+    lines.push(`  ${run.conversationId ? identity(theme, run.conversationId, run.runId) : paint(theme, "muted", run.runId)}`);
     if (run.prompt) appendSection(lines, [`  ${paint(theme, "dim", run.prompt)}`]);
   } else if (partial && !run.activity?.length && !run.joins?.length) {
     lines.push(`  ${paint(theme, "dim", "waiting for result")}`);
@@ -339,7 +448,7 @@ function renderJoinTargets(targets: readonly JoinTargetRenderItem[], indent: str
     const label = target.label || target.agent || target.runId;
     const agent = target.agent && target.agent !== label ? ` · ${target.agent}` : "";
     const lines = [
-      `${indent}${paint(theme, "muted", connector)} ${statusMarker(theme, target.status)} ${paint(theme, "text", label)}${paint(theme, "muted", agent)} ${paint(theme, "muted", "·")} ${statusText(theme, target.status)}`,
+      `${indent}${paint(theme, "muted", connector)} ${statusMarker(theme, target.status)} ${paint(theme, "text", label)}${paint(theme, "muted", agent)} ${paint(theme, "muted", "·")} ${statusText(theme, target.status)}${runStats(target, theme)}`,
     ];
     const childIndent = `${indent}${last ? "   " : `${paint(theme, "muted", "│")}  `}  `;
     if (!isTerminal(target.status) || expanded) {
@@ -363,6 +472,15 @@ function renderBackground(owner: JoinBackgroundOwnerRenderItem, expanded: boolea
   return lines;
 }
 
+function runStats(run: { elapsedMs?: number; turns?: number; tokens?: number }, theme?: ThemeLike): string {
+  const parts = [
+    run.elapsedMs !== undefined ? formatElapsed(run.elapsedMs) : undefined,
+    run.turns !== undefined ? count(run.turns, "turn") : undefined,
+    run.tokens !== undefined ? formatTokens(run.tokens) : undefined,
+  ].filter((part): part is string => part !== undefined);
+  return parts.length ? ` ${paint(theme, "muted", `· ${parts.join(" · ")}`)}` : "";
+}
+
 function truncate(value: string, limit: number): string {
   const text = value.replace(/\s+/g, " ").trim();
   return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
@@ -370,8 +488,10 @@ function truncate(value: string, limit: number): string {
 
 function callSuffix(action: string, input: Record<string, unknown> | undefined): string {
   if (!input) return "";
-  if (action === "run") return arrayCount(input.tasks, "task");
-  if (action === "join") return arrayCount(input.runIds, "run");
+  if (action === "spawn") return arrayCount(input.spawns, "task");
+  if (action === "resume") return arrayCount(input.resumes, "task");
+  if (action === "steer") return arrayCount(input.messages, "message");
+  if (action === "cancel" || action === "inspect" || action === "join") return arrayCount(input.runIds, "run");
   if (action === "remove") return arrayCount(input.conversationIds, "conversation");
   return "";
 }
@@ -380,11 +500,12 @@ function arrayCount(value: unknown, noun: string): string {
   return Array.isArray(value) && value.length ? count(value.length, noun) : "";
 }
 
-function runOutcomeSummary(spawned: number, resumed: number, rejected: number, theme?: ThemeLike): string {
+function dispatchOutcomeSummary(spawned: number, resumed: number, steered: number, rejected: number, theme?: ThemeLike): string {
   const parts: string[] = [];
   if (spawned) parts.push(`Started ${count(spawned, "new conversation")}`);
-  if (resumed) parts.push(spawned ? `resumed ${resumed}` : `Resumed ${count(resumed, "conversation")}`);
-  if (!spawned && !resumed) parts.push("No tasks started");
+  if (resumed) parts.push(`${parts.length ? "resumed" : "Resumed"} ${count(resumed, "conversation")}`);
+  if (steered) parts.push(`${parts.length ? "steered" : "Steered"} ${count(steered, "run")}`);
+  if (!parts.length) parts.push("No tasks accepted");
   let summary = parts.join(" and ");
   if (rejected) summary += paint(theme, "muted", ` · ${count(rejected, "rejected task")}`);
   return summary;
@@ -414,12 +535,12 @@ function joinBlocks(items: readonly string[][]): string[] {
   return items.flatMap((item, index) => index === items.length - 1 ? item : [...item, ""]);
 }
 
-function taskLabel(task: RunRenderItem, index: number): string {
+function taskLabel(task: DispatchTaskRenderItem, index: number): string {
   return task.label || task.agent || task.conversationId || `task ${index + 1}`;
 }
 
-function runLabel(run: { label?: string; agent: string }): string {
-  return run.label || run.agent;
+function conversationLabel(conversation: { label?: string; agent: string }): string {
+  return conversation.label || conversation.agent;
 }
 
 function identity(theme: ThemeLike | undefined, conversationId: string, runId: string): string {

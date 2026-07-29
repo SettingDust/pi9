@@ -3,7 +3,7 @@ import { DEFAULT_SUBAGENT_SETTINGS } from "../../src/settings.js";
 import { SubagentOverlayComponent, type OverlayOptions } from "../../src/command/overlay.js";
 import { fakeAgent, fakeRunSection, ZERO_USAGE } from "../helpers/fake-agent.js";
 
-function overlay(conversations: any[], overrides: Partial<OverlayOptions> = {}, theme: any = {}, terminal?: { rows: number } | number) {
+function overlay(conversations: any[], overrides: Partial<OverlayOptions> = {}, theme: any = {}, terminal?: { rows: number } | number, keybindings?: any) {
   const terminalConfig = typeof terminal === "number" ? { rows: terminal } : terminal;
   let listener: (() => void) | undefined;
   const unsubscribe = vi.fn();
@@ -13,6 +13,7 @@ function overlay(conversations: any[], overrides: Partial<OverlayOptions> = {}, 
     notify: vi.fn(),
     onStart: vi.fn(),
     onResume: vi.fn(),
+    onCancel: vi.fn(),
     onRemove: vi.fn(),
     onSettingsChange: vi.fn(),
   };
@@ -24,7 +25,7 @@ function overlay(conversations: any[], overrides: Partial<OverlayOptions> = {}, 
     manager as any,
     { requestRender, ...(terminalConfig ? { terminal: terminalConfig } : {}) } as any,
     theme,
-    undefined,
+    keybindings,
     done,
     {
       initialPage: "conversations",
@@ -75,6 +76,14 @@ describe("subagent overlay behavior", () => {
       component.handleInput("\r");
       expect(callbacks.onResume).not.toHaveBeenCalled();
     }
+  });
+
+  it.each(["queued", "running"] as const)("cancels the selected %s run", status => {
+    const conversation = fakeAgent({ conversationId: "conversation-1", runId: "run-1", status: { kind: status } });
+    const { component, callbacks } = overlay([conversation]);
+    component.handleInput("c");
+    expect(callbacks.onCancel).toHaveBeenCalledWith("run-1");
+    expect(callbacks.onRemove).not.toHaveBeenCalled();
   });
 
   it("removes the selected conversation", () => {
@@ -336,6 +345,18 @@ describe("subagent overlay behavior", () => {
     expect(output).toContain("◆ Final output");
   });
 
+  it("keeps local actions ahead of conflicting custom page bindings", () => {
+    const conversation = fakeAgent({ conversationId: "conversation-1", runId: "run-1", status: { kind: "running" } });
+    const keybindings = { matches: (data: string, key: string) => data === "c" && key === "tui.select.pageDown" };
+    const { component, callbacks } = overlay([conversation], {}, {}, undefined, keybindings);
+
+    component.handleInput("t");
+    component.handleInput("\r");
+    component.handleInput("c");
+
+    expect(callbacks.onCancel).toHaveBeenCalledWith("run-1");
+  });
+
   it("scrolls overflowing earlier-run detail and clamps safely after resize", () => {
     const terminal = { rows: 20 };
     const output = Array.from({ length: 40 }, (_, index) => `chronology-line-${index}`).join("\n");
@@ -359,6 +380,7 @@ describe("subagent overlay behavior", () => {
     component.handleInput("\x1b[H");
     expect(component.render(56).join("\n")).toContain("Older prompt");
   });
+
 
   it("marks the selected conversation across all three row lines", () => {
     const conversations = [

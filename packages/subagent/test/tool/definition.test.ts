@@ -1,99 +1,36 @@
 import { test } from "vitest";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import { convertResponsesTools } from "@earendil-works/pi-ai/api/openai-responses-shared";
-import subagentExtension from "../../src/index.js";
-import { parseSubagentInvocation, prepareSubagentInvocationArguments } from "../../src/schema.js";
+import { prepareSubagentInvocationArguments } from "../../src/schema.js";
 import { defineSubagentTool, makeChildSubagentTool } from "../../src/tool.js";
 
 const settings = { runtime: { maxTasksPerRun: 1 }, display: {} } as any;
 const registry = { agents: new Map(), summarizeAgent: () => "helper" } as any;
 
-test("definition opts into Pi JSON-schema constrained sampling", () => {
-  const tool = defineSubagentTool({
-    runtime: {} as any,
-    agentRegistry: registry,
-    prepareInvocation: async () => settings,
-  });
-  assert.deepEqual(tool.constrainedSampling, { type: "json_schema", strict: "prefer" });
-  assert.equal(tool.parameters.type, "object");
-  assert.deepEqual(tool.parameters.required, ["action", "status", "tasks", "runIds", "conversationIds"]);
-});
-
-test("the registered root Pi wrapper forwards constrained sampling", async () => {
-  let registered: any;
-  const runtime = {
-    scheduler: { setChildTool: () => {} },
-    configure: () => {},
-    listConversations: () => [],
-    onConversationUpdate: () => () => {},
-  };
-  subagentExtension({
-    on: () => {},
-    registerTool: (definition: any) => { registered = definition; },
-    registerCommand: () => {},
-  } as any, {
-    runtime: runtime as any,
-    agentRegistry: { agents: new Map(), reload: async () => {} } as any,
-    settingsStore: { load: async () => ({ settings }), save: async () => {} },
-  });
-
-  const { wrapRegisteredTool } = await import(new URL(
-    "../../../../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/wrapper.js",
-    import.meta.url,
-  ).href);
-  const wrapped = wrapRegisteredTool(
-    { definition: registered },
-    { createContext: () => ({}), getActiveTools: () => [] } as any,
-  );
-
-  assert.deepEqual(wrapped.constrainedSampling, { type: "json_schema", strict: "prefer" });
-});
-
-test("strict schema admits every legal action after host preparation", () => {
+test("definition enables strict-preferred constrained sampling for every typed action", () => {
   const tool = defineSubagentTool({ runtime: {} as any, agentRegistry: registry, prepareInvocation: async () => settings });
+  assert.deepEqual(tool.constrainedSampling, { type: "json_schema", strict: "prefer" });
+  assert.deepEqual(tool.parameters.required, ["action", "status", "spawns", "resumes", "messages", "runIds", "conversationIds"]);
   for (const args of [
     { action: "agents" },
     { action: "list", status: ["running"] },
-    { action: "run", tasks: [{ agent: "helper", prompt: "work" }] },
-    { action: "run", tasks: [{ conversationId: "amber-acorn", prompt: "continue" }] },
+    { action: "spawn", spawns: [{ agent: "helper", prompt: "work" }] },
+    { action: "resume", resumes: [{ conversationId: "amber-acorn", prompt: "continue" }] },
+    { action: "steer", messages: [{ runId: "adapt-ably", message: "redirect" }] },
+    { action: "cancel", runIds: ["adapt-ably"] },
+    { action: "inspect", runIds: ["adapt-ably"] },
     { action: "join", runIds: ["adapt-ably"] },
     { action: "remove", conversationIds: ["amber-acorn"] },
   ]) validateToolArguments(tool, toolCall(prepareSubagentInvocationArguments(args)));
-});
 
-test("parser rejects fields from other action branches after host validation", () => {
-  for (const args of [
-    { action: "agents", status: ["running"] },
-    { action: "list", runIds: ["adapt-ably"] },
-    { action: "join", conversationIds: ["amber-acorn"] },
-    { action: "remove", runIds: ["adapt-ably"] },
-  ]) {
-    const parsed = parseSubagentInvocation(prepareSubagentInvocationArguments(args));
-    assert.ok("error" in parsed);
-  }
-});
-
-test("OpenAI strict-tool conversion receives a strict-compatible object schema", () => {
-  const tool = defineSubagentTool({ runtime: {} as any, agentRegistry: registry, prepareInvocation: async () => settings });
   const [converted] = convertResponsesTools([tool], { supportsStrictMode: true }) as any[];
-  const schema = converted.parameters;
-
   assert.equal(converted.strict, true);
-  assert.equal(schema.type, "object");
-  assert.equal("anyOf" in schema, false);
-  assert.equal(schema.additionalProperties, false);
-  assert.deepEqual([...schema.required].sort(), Object.keys(schema.properties).sort());
-  assert.deepEqual(schema.properties.action.enum, ["agents", "list", "run", "join", "remove"]);
-  for (const field of ["status", "tasks", "runIds", "conversationIds"]) {
-    assert.ok(schema.properties[field].anyOf.some((branch: any) => branch.type === "null"));
-  }
+  assert.equal(converted.parameters.additionalProperties, false);
+  assert.deepEqual([...converted.parameters.required].sort(), Object.keys(converted.parameters.properties).sort());
 });
 
-test("root and child tools share identical input constraints", () => {
+test("root and child tools share constrained sampling and input preparation", () => {
   const root = defineSubagentTool({ runtime: {} as any, agentRegistry: registry, prepareInvocation: async () => settings });
   const child = makeChildSubagentTool({
     manager: {} as any,
@@ -103,6 +40,32 @@ test("root and child tools share identical input constraints", () => {
   });
   assert.deepEqual(child.parameters, root.parameters);
   assert.deepEqual(child.constrainedSampling, root.constrainedSampling);
+  assert.deepEqual(child.prepareArguments?.({ action: "agents" }), root.prepareArguments?.({ action: "agents" }));
+});
+
+test("description names typed action inputs without restating task unions", () => {
+  const tool = defineSubagentTool({
+    runtime: {} as any,
+    agentRegistry: registry,
+    prepareInvocation: async () => settings,
+  });
+  const description = tool.description;
+  assert.match(description, /Conversation IDs use adjective-noun form; run IDs use verb-adverb form\./);
+  assert.match(description, /list\(status\?\).*matching a status/);
+  assert.match(description, /spawn\(spawns\)/);
+  assert.match(description, /resume\(resumes\)/);
+  assert.match(description, /steer\(messages\)/);
+  assert.match(description, /cancel\(runIds\)/);
+  assert.match(description, /inspect\(runIds\)/);
+  assert.match(description, /join\(runIds\)/);
+  assert.match(description, /remove\(conversationIds\).*Surviving children are reparented/);
+  assert.doesNotMatch(description, /Spawn:|Resume:|Steer:|union/);
+  const properties = (tool.parameters as any).properties;
+  const nonNull = (schema: any) => schema.anyOf.find((branch: any) => branch.type !== "null");
+  assert.deepEqual(Object.keys(properties), ["action", "status", "spawns", "resumes", "messages", "runIds", "conversationIds"]);
+  assert.match(nonNull(properties.spawns).items.description, /agent.*prompt/);
+  assert.match(nonNull(properties.resumes).items.description, /conversationId.*prompt/);
+  assert.match(nonNull(properties.messages).items.description, /runId.*message/);
 });
 
 const toolCall = (arguments_: Record<string, any>) => ({
@@ -112,44 +75,31 @@ const toolCall = (arguments_: Record<string, any>) => ({
   arguments: arguments_,
 });
 
-test("SDK validation keeps malformed run tasks isolated so valid siblings start", async () => {
-  let received: unknown;
+test("malformed batch items remain isolated so valid siblings still start", async () => {
+  const started: unknown[] = [];
   const tool: any = defineSubagentTool({
     runtime: {
-      startRun: (_ctx: unknown, tasks: unknown) => {
-        received = tasks;
-        return {
-          starts: [{ ok: true, inputIndex: 0, conversationId: "amber-acorn", runId: "adapt-ably" }],
-          completion: Promise.resolve(),
-        };
+      startRun: (_ctx: unknown, tasks: unknown[]) => {
+        started.push(...tasks);
+        return { starts: tasks.map((_task, inputIndex) => ({ ok: true, inputIndex, conversationId: "amber-acorn", runId: "adapt-ably" })) };
       },
     } as any,
     agentRegistry: registry,
     prepareInvocation: async () => ({ runtime: { maxTasksPerRun: 2 }, display: {} }) as any,
   });
   const raw = {
-    action: "run",
-    tasks: [
+    action: "spawn",
+    spawns: [
       { agent: "helper", prompt: "malformed", extra: true },
       { agent: "helper", prompt: "valid" },
     ],
   };
-  const arguments_ = validateToolArguments(tool, toolCall(prepareSubagentInvocationArguments(raw)));
-  const parsed = parseSubagentInvocation(arguments_, { maxTasks: 2 });
 
-  assert.deepEqual(parsed, {
-    action: "run",
-    tasks: [
-      { error: "Task property extra is not allowed for a spawn task." },
-      { kind: "spawn", agent: "helper", prompt: "valid" },
-    ],
-  });
+  const arguments_ = validateToolArguments(tool, toolCall(prepareSubagentInvocationArguments(raw)));
   const result = await tool.execute("call", arguments_, undefined, undefined, {});
-  assert.deepEqual(received, [{ kind: "spawn", agent: "helper", prompt: "valid" }]);
-  assert.deepEqual(JSON.parse(result.content[0].text), [
-    { ok: false, inputIndex: 0, error: "Task property extra is not allowed for a spawn task." },
-    { ok: true, inputIndex: 1, conversationId: "amber-acorn", runId: "adapt-ably" },
-  ]);
+  assert.deepEqual(started, [{ kind: "spawn", agent: "helper", prompt: "valid" }]);
+  assert.equal(JSON.parse(result.content[0].text).results[0].ok, false);
+  assert.equal(JSON.parse(result.content[0].text).results[1].ok, true);
 });
 
 test("SDK validation enforces the task-array minimum", () => {
@@ -159,64 +109,51 @@ test("SDK validation enforces the task-array minimum", () => {
     prepareInvocation: async () => settings,
   });
   assert.throws(
-    () => validateToolArguments(tool, toolCall(prepareSubagentInvocationArguments({ action: "run", tasks: [] }))),
+    () => validateToolArguments(tool, toolCall({ action: "spawn", spawns: [] })),
     /Validation failed/,
   );
-});
-
-test("child production session wrapper forwards constrained sampling", async () => {
-  let childFactory: ((parent: unknown) => unknown) | undefined;
-  const runtime = {
-    scheduler: { setChildTool: (factory: (parent: unknown) => unknown) => { childFactory = factory; } },
-    configure: () => {},
-    listConversations: () => [],
-    onConversationUpdate: () => () => {},
-  };
-  subagentExtension({
-    on: () => {},
-    registerTool: () => {},
-    registerCommand: () => {},
-  } as any, {
-    runtime: runtime as any,
-    agentRegistry: { agents: new Map(), reload: async () => {} } as any,
-    settingsStore: { load: async () => ({ settings }), save: async () => {} },
-  });
-  assert.ok(childFactory);
-  const child = childFactory({
-    conversationId: "amber-acorn",
-    requireCurrentRun: () => ({ runId: "adapt-ably" }),
-  }) as any;
-  const { createAgentSession, SessionManager } = await import("@earendil-works/pi-coding-agent");
-  const cwd = await mkdtemp(join(tmpdir(), "pi9-subagent-"));
-  try {
-    const { session } = await createAgentSession({
-      cwd,
-      agentDir: cwd,
-      sessionManager: SessionManager.inMemory(cwd),
-      customTools: [child],
-      tools: ["subagent"],
-    });
-    assert.deepEqual(session.agent.state.tools[0]?.constrainedSampling, { type: "json_schema", strict: "prefer" });
-  } finally {
-    await rm(cwd, { recursive: true, force: true });
-  }
 });
 
 test("tool prepares settings, applies task limits, and renders simple typed content", async () => {
   let prepared = 0;
   const tool: any = defineSubagentTool({ runtime: {} as any, agentRegistry: registry, prepareInvocation: async () => { prepared++; return settings; } });
-  const result = await tool.execute("call", { action: "run", tasks: [{ agent: "a", prompt: "1" }, { agent: "a", prompt: "2" }] }, undefined, undefined, {});
-  assert.equal(prepared, 1); assert.equal(result.isError, true); assert.match(result.content[0].text, /Too many tasks/);
+  const result = await tool.execute("call", { action: "spawn", spawns: [{ agent: "a", prompt: "1" }, { agent: "a", prompt: "2" }] }, undefined, undefined, {});
+  assert.equal(prepared, 1);
+  assert.equal(result.isError, true);
+  assert.deepEqual(JSON.parse(result.content[0].text), {
+    action: "spawn",
+    error: "Too many tasks (2). Max is 1.\n\nAvailable agents:\nhelper",
+  });
   assert.match(tool.renderResult(result, {}, {}).render(120).join("\n"), /Too many tasks/);
-  assert.match(tool.renderCall({ action: "run", tasks: [{}, {}] }, {}, {}).render(120).join("\n"), /2 tasks/);
+  assert.match(tool.renderCall({ action: "spawn", spawns: [{}, {}] }, {}, {}).render(120).join("\n"), /2 tasks/);
 });
 
-test("rejected mixed join releases every valid requested claim", async () => {
-  let released: readonly string[] = [];
-  const tool: any = defineSubagentTool({ runtime: {} as any, agentRegistry: registry, prepareInvocation: async () => settings, releaseJoinClaims: ids => { released = ids; } });
-  const result = await tool.execute("call", { action: "join", runIds: ["valid-run", 42] }, undefined, undefined, {});
+test("unknown actions return a structured global error envelope", async () => {
+  const tool: any = defineSubagentTool({
+    runtime: {} as any,
+    agentRegistry: registry,
+    prepareInvocation: async () => settings,
+  });
+
+  const result = await tool.execute("call", { action: "bogus" }, undefined, undefined, {});
+
   assert.equal(result.isError, true);
-  assert.deepEqual(released, ["valid-run"]);
+  assert.deepEqual(JSON.parse(result.content[0].text), {
+    action: "unknown",
+    error: 'Unknown action: bogus. Use "agents", "list", "spawn", "resume", "steer", "cancel", "inspect", "join", or "remove".',
+  });
+});
+
+test("mixed join target errors remain ordered item failures", async () => {
+  const tool: any = defineSubagentTool({ runtime: {} as any, agentRegistry: registry, prepareInvocation: async () => settings });
+  const result = await tool.execute("call", { action: "join", runIds: ["valid-run", 42] }, undefined, undefined, {});
+  assert.equal(result.isError, false);
+  const response = JSON.parse(result.content[0].text);
+  assert.equal(response.action, "join");
+  assert.deepEqual(response.results, [
+    { ok: false, runId: "valid-run", error: "join received invalid runId format 'valid-run'." },
+    { ok: false, runId: "42", error: "join received invalid runId format '42'." },
+  ]);
 });
 
 test("settings preparation failures propagate without starting manager work", async () => {

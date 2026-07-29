@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "vitest";
@@ -54,6 +54,24 @@ test("isolates invalid manifests, missing and escaping paths, and directory erro
   assert.equal(registry.agents.get("valid")?.source, "package");
   assert.ok(warnings.some(warning => warning.includes("Invalid package manifest")));
   assert.ok(warnings.some(warning => warning.includes("Invalid package subagent path")));
+});
+
+test("does not follow package agent symlink files outside the declared directory", async () => {
+  const root = await mkdtemp(join(tmpdir(), "subagent-package-symlink-"));
+  const packageRoot = join(root, "package");
+  const agents = join(packageRoot, "agents");
+  await mkdir(agents, { recursive: true });
+  const outside = join(root, "outside.md");
+  await writeFile(outside, "---\nname: escaped\ndescription: Escaped\n---\nEscaped");
+  await symlink(outside, join(agents, "escaped.md"));
+  await writeFile(join(packageRoot, "package.json"), JSON.stringify({ pi: { agents: ["./agents"] } }));
+
+  const registry = new AgentRegistry();
+  await registry.reload(root, {
+    discovery: { includeUserAgents: false, includeProjectAgents: false },
+    packageManager: packages(packageRoot),
+  });
+  assert.equal(registry.agents.has("escaped"), false);
 });
 
 test("isolates package-manager failure from project discovery", async () => {
