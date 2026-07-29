@@ -7,6 +7,19 @@ const renderCall = (args: unknown) => lines(renderSubagentCall(args));
 const renderResult = (details: SubagentToolDetails, expanded = false, isPartial = false, width = 200) =>
   renderSubagentResult({ details }, { expanded, isPartial }).render(width).map(line => line.trimEnd()).join("\n");
 
+test("legacy result details fall back to text instead of crashing during history rerender", () => {
+  const result = {
+    content: [{ type: "text", text: "legacy result" }],
+    details: { action: "run", tasks: [] },
+  } as any;
+
+  assert.doesNotThrow(() => lines(renderSubagentResult(result)));
+  assert.equal(lines(renderSubagentResult(result)), "legacy result");
+
+  const oldShape = { ...result, details: { action: "spawn", results: [] } };
+  assert.equal(lines(renderSubagentResult(oldShape as any)), "legacy result");
+});
+
 test("call titles summarize action-specific input counts", () => {
   assert.equal(renderCall({ action: "spawn", spawns: [{}, {}] }), "subagent spawn  2 tasks");
   assert.equal(renderCall({ action: "resume", resumes: [{}] }), "subagent resume  1 task");

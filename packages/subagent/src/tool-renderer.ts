@@ -180,13 +180,30 @@ export function renderSubagentResult(
   theme?: ThemeLike,
 ): Component {
   const details = result.details;
-  if (!details) return new Text(fallbackText(result), 0, 0);
+  if (!details || !isSupportedDetails(details)) return new Text(fallbackText(result), 0, 0);
   if (details.action === "error") return new Text(paint(theme, "error", details.message), 0, 0);
 
   const lines = options.expanded
     ? expandedLines(details, theme)
     : collapsedLines(details, options.isPartial === true, theme);
   return new IndentedText(lines);
+}
+
+function isSupportedDetails(details: unknown): details is SubagentToolDetails {
+  const value = asRecord(details);
+  switch (value?.action) {
+    case "agents": return Array.isArray(value.agents);
+    case "list": return Array.isArray(value.conversations);
+    case "spawn":
+    case "resume":
+    case "steer": return Array.isArray(value.tasks);
+    case "cancel":
+    case "inspect":
+    case "join": return Array.isArray(value.runs);
+    case "remove": return typeof value.removed === "number" && Array.isArray(value.conversationIds) && Array.isArray(value.errors);
+    case "error": return typeof value.message === "string";
+    default: return false;
+  }
 }
 
 class IndentedText implements Component {
