@@ -1,13 +1,37 @@
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { expect, test, vi } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
+import { DefaultResourceLoader, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { Conversation } from "../../src/conversation.js";
 import { completedRun } from "../../src/conversation.js";
 import { DEFAULT_EXECUTE_RUN_DEPENDENCIES, resolveModel, resolveTaskCwd, executeRun } from "../../src/execute.js";
 
 const config = { name: "worker", description: "", systemPrompt: "", source: "project" } as any;
+const savedHome = process.env.HOME;
+afterEach(() => {
+  if (savedHome === undefined) delete process.env.HOME;
+  else process.env.HOME = savedHome;
+});
+
+function finishedSession(overrides: Record<string, unknown> = {}) {
+  return {
+    messages: [{ role: "assistant", content: [{ type: "text", text: "finished" }] }],
+    subscribe: () => () => {}, prompt: async () => {}, abort: vi.fn(), dispose: vi.fn(), bindExtensions: vi.fn(),
+    ...overrides,
+  } as any;
+}
+
+function spawning(skills: string[], systemPrompt = "BASE") {
+  return new Conversation(
+    "amber-acorn" as any,
+    "adapt-ably" as any,
+    { ...config, systemPrompt },
+    { kind: "spawn", agent: "worker", prompt: "first", skills },
+    () => {},
+  );
+}
 function resumable(messages: any[], prompt: () => Promise<void>, abort = vi.fn()) {
   const agent = new Conversation("amber-acorn" as any, "adapt-ably" as any, config, { kind: "spawn", agent: "worker", prompt: "first" }, () => {});
   const session = { messages, subscribe: () => () => {}, prompt, abort } as any;
@@ -46,6 +70,174 @@ test("child session lifecycle observers span finalized tool execution events", a
 
   expect(observed.map(event => event.type)).toEqual(["tool_execution_start", "tool_execution_end"]);
   expect(listeners).toHaveLength(0);
+});
+
+test("discovers requested skills through Pi ResourceLoader instead of the low-level scanner", async () => {
+  const skill = { name: "resource-only", filePath: "/skills/resource-only/SKILL.md", baseDir: "/skills/resource-only" };
+  let loaderOptions: any;
+  class ResourceLoader {
+    constructor(options: any) { loaderOptions = options; }
+    async reload() {}
+    getExtensions() { return { extensions: [], errors: [], runtime: {} }; }
+    getSkills() { return { skills: [skill], diagnostics: [] }; }
+    getPrompts() { return { prompts: [], diagnostics: [] }; }
+    getThemes() { return { themes: [], diagnostics: [] }; }
+    getAgentsFiles() { return { agentsFiles: [] }; }
+    getSystemPrompt() { return loaderOptions.systemPromptOverride?.() ?? loaderOptions.systemPrompt; }
+    getAppendSystemPrompt() { return []; }
+    extendResources() {}
+  }
+  const session = finishedSession();
+  let resourceLoader: any;
+  const agent = spawning(["resource-only"]);
+
+  const result = await executeRun({ cwd: process.cwd(), modelRegistry: registry() } as any, agent, agent.requireCurrentRun(), undefined, {
+    ...DEFAULT_EXECUTE_RUN_DEPENDENCIES,
+    ResourceLoader: ResourceLoader as any,
+    getAgentDir: () => "/tmp/pi-agent",
+    settingsManager: (() => ({ setProjectTrusted() {} })) as any,
+    sessionManager: (() => ({})) as any,
+    loadExtensionPaths: async () => [],
+    readSkillFile: (() => "---\nname: resource-only\ndescription: test\n---\n\nRESOURCE BODY") as any,
+    createAgentSession: (async (options: any) => { resourceLoader = options.resourceLoader; return { session }; }) as any,
+  });
+
+  expect(result.status).toMatchObject({ kind: "done", outcome: "completed" });
+  expect(resourceLoader.getSystemPrompt()).toContain("RESOURCE BODY");
+  expect(resourceLoader.getSkills().skills).toEqual([]);
+  expect(session.bindExtensions).not.toHaveBeenCalled();
+});
+
+test("loads requested skills from Pi's standard ~/.agents discovery path with shared trust settings", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "subagent-native-skills-"));
+  const home = path.join(root, "home");
+  const cwd = path.join(root, "project");
+  const agentDir = path.join(root, "pi-agent");
+  const skillDir = path.join(home, ".agents", "skills", "native-only");
+  await mkdir(skillDir, { recursive: true });
+  await mkdir(cwd, { recursive: true });
+  await mkdir(agentDir, { recursive: true });
+  await writeFile(path.join(skillDir, "SKILL.md"), "---\nname: native-only\ndescription: Native discovery\n---\n\nNATIVE BODY");
+  process.env.HOME = home;
+
+  let loaderSettings: any;
+  let sessionSettings: any;
+  let resourceLoader: any;
+  class RecordingLoader extends DefaultResourceLoader {
+    constructor(options: any) { super(options); loaderSettings = options.settingsManager; }
+  }
+  const agent = spawning(["native-only"]);
+  const result = await executeRun({ cwd, modelRegistry: registry(), isProjectTrusted: () => true } as any, agent, agent.requireCurrentRun(), undefined, {
+    ...DEFAULT_EXECUTE_RUN_DEPENDENCIES,
+    ResourceLoader: RecordingLoader,
+    getAgentDir: () => agentDir,
+    settingsManager: SettingsManager.create,
+    sessionManager: (() => ({})) as any,
+    loadExtensionPaths: async () => [],
+    createAgentSession: (async (options: any) => {
+      sessionSettings = options.settingsManager;
+      resourceLoader = options.resourceLoader;
+      return { session: finishedSession() };
+    }) as any,
+  });
+
+  expect(result.status).toMatchObject({ kind: "done", outcome: "completed" });
+  expect(loaderSettings).toBe(sessionSettings);
+  expect(loaderSettings.isProjectTrusted()).toBe(true);
+  expect(resourceLoader.getSystemPrompt()).toContain("NATIVE BODY");
+  await rm(root, { recursive: true, force: true });
+});
+
+test("validates extension-discovered skills after bindExtensions", async () => {
+  const skill = { name: "late", filePath: "/skills/late/SKILL.md", baseDir: "/skills/late" };
+  let skills: any[] = [];
+  class ResourceLoader {
+    async reload() {}
+    getExtensions() { return { extensions: [{ handlers: new Map([["resources_discover", [{}]]]) }], errors: [], runtime: {} }; }
+    getSkills() { return { skills, diagnostics: [] }; }
+    getPrompts() { return { prompts: [], diagnostics: [] }; }
+    getThemes() { return { themes: [], diagnostics: [] }; }
+    getAgentsFiles() { return { agentsFiles: [] }; }
+    getSystemPrompt() { return undefined; }
+    getAppendSystemPrompt() { return []; }
+    extendResources() {}
+  }
+  let resourceLoader: any;
+  const session = finishedSession({ bindExtensions: async () => { skills = [skill]; } });
+  const agent = spawning(["late"]);
+  const result = await executeRun({ cwd: process.cwd(), modelRegistry: registry() } as any, agent, agent.requireCurrentRun(), undefined, {
+    ...DEFAULT_EXECUTE_RUN_DEPENDENCIES,
+    ResourceLoader: ResourceLoader as any,
+    getAgentDir: () => "/tmp/pi-agent",
+    settingsManager: (() => ({ setProjectTrusted() {} })) as any,
+    sessionManager: (() => ({})) as any,
+    loadExtensionPaths: async () => [],
+    readSkillFile: (() => "---\nname: late\ndescription: test\n---\n\nLATE BODY") as any,
+    createAgentSession: (async (options: any) => { resourceLoader = options.resourceLoader; return { session }; }) as any,
+  });
+
+  expect(result.status).toMatchObject({ kind: "done", outcome: "completed" });
+  expect(resourceLoader.getSystemPrompt()).toContain("LATE BODY");
+});
+
+test("disposes a new session when an extension-discovered skill is still unavailable", async () => {
+  const dispose = vi.fn();
+  class ResourceLoader {
+    async reload() {}
+    getExtensions() { return { extensions: [{ handlers: new Map([["resources_discover", [{}]]]) }], errors: [], runtime: {} }; }
+    getSkills() { return { skills: [], diagnostics: [] }; }
+    getPrompts() { return { prompts: [], diagnostics: [] }; }
+    getThemes() { return { themes: [], diagnostics: [] }; }
+    getAgentsFiles() { return { agentsFiles: [] }; }
+    getSystemPrompt() { return undefined; }
+    getAppendSystemPrompt() { return []; }
+    extendResources() {}
+  }
+  const agent = spawning(["missing"]);
+  const result = await executeRun({ cwd: process.cwd(), modelRegistry: registry() } as any, agent, agent.requireCurrentRun(), undefined, {
+    ...DEFAULT_EXECUTE_RUN_DEPENDENCIES,
+    ResourceLoader: ResourceLoader as any,
+    getAgentDir: () => "/tmp/pi-agent",
+    settingsManager: (() => ({ setProjectTrusted() {} })) as any,
+    sessionManager: (() => ({})) as any,
+    loadExtensionPaths: async () => [],
+    createAgentSession: (async () => ({ session: finishedSession({ dispose }) })) as any,
+  });
+
+  expect(result.status).toMatchObject({ kind: "done", outcome: "error", error: "Unknown skill: missing" });
+  expect(dispose).toHaveBeenCalledOnce();
+});
+
+test.each([
+  { label: "unknown", skills: [] as any[], read: () => "", error: "Unknown skill: missing" },
+  { label: "unreadable", skills: [{ name: "missing", filePath: "/skills/missing/SKILL.md", baseDir: "/skills/missing" }], read: () => { throw new Error("permission denied"); }, error: "Could not load requested skill: permission denied" },
+])("fails $label requested skills before prompting", async ({ skills, read, error }) => {
+  let createCalled = false;
+  class ResourceLoader {
+    async reload() {}
+    getExtensions() { return { extensions: [], errors: [], runtime: {} }; }
+    getSkills() { return { skills, diagnostics: [] }; }
+    getPrompts() { return { prompts: [], diagnostics: [] }; }
+    getThemes() { return { themes: [], diagnostics: [] }; }
+    getAgentsFiles() { return { agentsFiles: [] }; }
+    getSystemPrompt() { return undefined; }
+    getAppendSystemPrompt() { return []; }
+    extendResources() {}
+  }
+  const agent = spawning(["missing"]);
+  const result = await executeRun({ cwd: process.cwd(), modelRegistry: registry() } as any, agent, agent.requireCurrentRun(), undefined, {
+    ...DEFAULT_EXECUTE_RUN_DEPENDENCIES,
+    ResourceLoader: ResourceLoader as any,
+    getAgentDir: () => "/tmp/pi-agent",
+    settingsManager: (() => ({ setProjectTrusted() {} })) as any,
+    sessionManager: (() => ({})) as any,
+    loadExtensionPaths: async () => [],
+    readSkillFile: read as any,
+    createAgentSession: (async () => { createCalled = true; return { session: finishedSession() }; }) as any,
+  });
+
+  expect(result.status).toMatchObject({ kind: "done", outcome: "error", error });
+  expect(createCalled).toBe(false);
 });
 
 test("assistant errors and prompt failures terminalize the run as errors", async () => {
@@ -197,4 +389,73 @@ test("rejects missing working directories and files", async () => {
     ok: false,
     error: `Working directory is not a directory: ${file}`,
   });
+});
+
+
+test("preserves cancellation during session creation and disposes the late session", async () => {
+  let finishCreate!: (value: any) => void;
+  const dispose = vi.fn();
+  const createStarted = new Promise<void>(resolve => {
+    finishCreate = value => { resolve(); return value; };
+  });
+  let resolveSession!: (value: any) => void;
+  const pendingSession = new Promise<any>(resolve => { resolveSession = resolve; });
+  class ResourceLoader {
+    async reload() {}
+    getExtensions() { return { extensions: [], errors: [], runtime: {} }; }
+    getSkills() { return { skills: [], diagnostics: [] }; }
+    getPrompts() { return { prompts: [], diagnostics: [] }; }
+    getThemes() { return { themes: [], diagnostics: [] }; }
+    getAgentsFiles() { return { agentsFiles: [] }; }
+    getSystemPrompt() { return undefined; }
+    getAppendSystemPrompt() { return []; }
+    extendResources() {}
+  }
+  const agent = spawning([]);
+  const execution = executeRun({ cwd: process.cwd(), modelRegistry: registry() } as any, agent, agent.requireCurrentRun(), undefined, {
+    ...DEFAULT_EXECUTE_RUN_DEPENDENCIES,
+    ResourceLoader: ResourceLoader as any,
+    getAgentDir: () => "/tmp/pi-agent",
+    settingsManager: (() => ({ setProjectTrusted() {} })) as any,
+    sessionManager: (() => ({})) as any,
+    loadExtensionPaths: async () => [],
+    createAgentSession: (async () => { finishCreate(undefined); return pendingSession; }) as any,
+  });
+
+  await createStarted;
+  await agent.abort("Run cancelled.");
+  resolveSession({ session: finishedSession({ dispose }) });
+
+  await expect(execution).resolves.toMatchObject({ status: { kind: "done", outcome: "aborted", error: "Run cancelled." } });
+  expect(dispose).toHaveBeenCalledOnce();
+});
+
+test("deduplicates requested skills before injection", async () => {
+  const skill = { name: "review", filePath: "/skills/review/SKILL.md", baseDir: "/skills/review" };
+  let resourceLoader: any;
+  class ResourceLoader {
+    async reload() {}
+    getExtensions() { return { extensions: [], errors: [], runtime: {} }; }
+    getSkills() { return { skills: [skill], diagnostics: [] }; }
+    getPrompts() { return { prompts: [], diagnostics: [] }; }
+    getThemes() { return { themes: [], diagnostics: [] }; }
+    getAgentsFiles() { return { agentsFiles: [] }; }
+    getSystemPrompt() { return undefined; }
+    getAppendSystemPrompt() { return []; }
+    extendResources() {}
+  }
+  const agent = spawning(["review", "review"]);
+  const result = await executeRun({ cwd: process.cwd(), modelRegistry: registry() } as any, agent, agent.requireCurrentRun(), undefined, {
+    ...DEFAULT_EXECUTE_RUN_DEPENDENCIES,
+    ResourceLoader: ResourceLoader as any,
+    getAgentDir: () => "/tmp/pi-agent",
+    settingsManager: (() => ({ setProjectTrusted() {} })) as any,
+    sessionManager: (() => ({})) as any,
+    loadExtensionPaths: async () => [],
+    readSkillFile: (() => "---\nname: review\ndescription: test\n---\n\nREVIEW BODY") as any,
+    createAgentSession: (async (options: any) => { resourceLoader = options.resourceLoader; return { session: finishedSession() }; }) as any,
+  });
+
+  expect(result.status).toMatchObject({ kind: "done", outcome: "completed" });
+  expect(resourceLoader.getSystemPrompt().match(/<skill name="review"/g)).toHaveLength(1);
 });
