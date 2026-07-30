@@ -82,19 +82,69 @@ it("preserves Chinese prompts in a PowerShell 5.1-compatible UTF-8 script", asyn
     expect(script.startsWith("\ufeff")).toBe(true);
     expect(script).toContain("'只读审查：返回拒绝原因。'");
   });
-it("retries the managed Herdr layout after an empty pane ID", async () => {
+it("alternates Herdr splits within the child region", async () => {
     const mux = fakeMux();
-    mux.getMuxBackend.mockReturnValue("herdr");
-    mux.createSurface.mockReturnValueOnce("").mockReturnValueOnce("surface-2");
+    const split = vi.fn()
+      .mockReturnValueOnce("surface-a")
+      .mockReturnValueOnce("surface-b")
+      .mockReturnValueOnce("surface-c");
+    (mux as any).createSurfaceSplit = split;
     const previousPaneId = process.env.HERDR_PANE_ID;
-    process.env.HERDR_PANE_ID = "test:parent";
-const removeFile = vi.fn();
+    process.env.HERDR_PANE_ID = "parent";
 
     try {
-      const handle = await launchPaneExecution({ ...options(mux), dependencies: { ...options(mux).dependencies, removeFile } });
-      expect(handle.surface).toBe("surface-2");
-      expect(mux.createSurface).toHaveBeenCalledTimes(2);
-expect(removeFile).toHaveBeenCalledWith("/tmp/herdr-subagent-pane-test_parent.json");
+      const first = await launchPaneExecution(options(mux));
+      const second = await launchPaneExecution(options(mux));
+      const third = await launchPaneExecution(options(mux));
+      expect(split.mock.calls).toEqual([
+        ["subagent", "right", "parent"],
+        ["subagent", "down", "surface-a"],
+        ["subagent", "right", "surface-b"],
+      ]);
+      third.close();
+      second.close();
+      first.close();
+    } finally {
+      if (previousPaneId === undefined) delete process.env.HERDR_PANE_ID;
+      else process.env.HERDR_PANE_ID = previousPaneId;
+    }
+  });
+
+it("restarts the Herdr child region when the previous source disappeared", async () => {
+    const mux = fakeMux();
+    const split = vi.fn()
+      .mockReturnValueOnce("surface-stale")
+      .mockImplementationOnce(() => { throw new Error("pane_not_found"); })
+      .mockReturnValueOnce("surface-recovered");
+    (mux as any).createSurfaceSplit = split;
+    const previousPaneId = process.env.HERDR_PANE_ID;
+    process.env.HERDR_PANE_ID = "parent";
+
+    try {
+      await launchPaneExecution(options(mux));
+      const recovered = await launchPaneExecution(options(mux));
+      expect(split.mock.calls).toEqual([
+        ["subagent", "right", "parent"],
+        ["subagent", "down", "surface-stale"],
+        ["subagent", "right", "parent"],
+      ]);
+      recovered.close();
+    } finally {
+      if (previousPaneId === undefined) delete process.env.HERDR_PANE_ID;
+      else process.env.HERDR_PANE_ID = previousPaneId;
+    }
+  });
+
+  it("does not retry non-missing-pane split failures", async () => {
+    const mux = fakeMux();
+    const split = vi.fn(() => { throw new Error("mux unavailable"); });
+    (mux as any).createSurfaceSplit = split;
+    const previousPaneId = process.env.HERDR_PANE_ID;
+    process.env.HERDR_PANE_ID = "parent";
+
+    try {
+      await expect(launchPaneExecution(options(mux))).rejects.toThrow("mux unavailable");
+      expect(split).toHaveBeenCalledOnce();
     } finally {
       if (previousPaneId === undefined) delete process.env.HERDR_PANE_ID;
       else process.env.HERDR_PANE_ID = previousPaneId;
@@ -130,6 +180,23 @@ const writeFile = vi.fn();
     expect(mux.sendEscape).toHaveBeenCalledWith("surface-1");
 expect(writeFile).toHaveBeenCalledWith("/sessions/child.jsonl.exit", JSON.stringify({ type: "done" }));
     expect(mux.closeSurface).toHaveBeenCalledOnce();
+  });
+it("treats an already-closed pane as an idempotent interrupt", async () => {
+    const mux = fakeMux();
+    const writeFile = vi.fn();
+    mux.sendEscape.mockImplementation(() => { throw new Error('pane_not_found: pane not found'); });
+    const handle = await launchPaneExecution(options(mux, writeFile));
+
+    expect(() => handle.interrupt()).not.toThrow();
+    expect(writeFile).toHaveBeenCalledWith("/sessions/child.jsonl.exit", JSON.stringify({ type: "done" }));
+  });
+
+  it("propagates non-missing-pane interrupt failures", async () => {
+    const mux = fakeMux();
+    mux.sendEscape.mockImplementation(() => { throw new Error("mux unavailable"); });
+    const handle = await launchPaneExecution(options(mux));
+
+    expect(() => handle.interrupt()).toThrow("mux unavailable");
   });
 
   it("closes a partially-created surface when launch fails", async () => {

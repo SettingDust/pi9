@@ -1,4 +1,4 @@
-import { rmSync, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
 
 interface PollResult {
   reason: "done" | "ping" | "structured_output" | "sentinel";
@@ -21,6 +21,7 @@ isMuxAvailable(): boolean;
     signal: AbortSignal,
     options: { interval: number; sessionFile?: string; onTick?: (elapsed: number) => void },
   ): Promise<PollResult>;
+createSurfaceSplit?(name: string, direction: "left" | "right" | "up" | "down", fromSurface?: string): string;
 }
 
 export interface PaneExecutionDependencies {
@@ -28,7 +29,6 @@ export interface PaneExecutionDependencies {
 writeFile?: typeof writeFileSync;
 sleep?: (milliseconds: number) => Promise<void>;
 platform?: NodeJS.Platform;
-removeFile?: (path: string) => void;
 }
 
 export interface PaneExecutionOptions {
@@ -70,21 +70,46 @@ export interface PaneCompletionObserverOptions {
   onTick?: (elapsed: number) => void;
 }
 
+const herdrSurfaces: string[] = [];
+let herdrNextDirection: "right" | "down" = "right";
+
 export async function launchPaneExecution(options: PaneExecutionOptions): Promise<PaneExecutionHandle> {
   const mux = options.dependencies?.mux ?? await loadMux();
-if (!mux.isMuxAvailable()) throw new Error("No supported terminal multiplexer is available; pane-backed subagents require a steer-capable mux surface.");
-let surface = mux.createSurface("subagent");
-  if (!surface && mux.getMuxBackend() === "herdr" && process.env.HERDR_PANE_ID) {
-    resetHerdrManagedLayout(process.env.HERDR_PANE_ID, options.dependencies?.removeFile);
+  if (!mux.isMuxAvailable()) throw new Error("No supported terminal multiplexer is available; pane-backed subagents require a steer-capable mux surface.");
+  const herdr = mux.getMuxBackend() === "herdr" && process.env.HERDR_PANE_ID && mux.createSurfaceSplit;
+  let surface: string;
+if (herdr) {
+    while (true) {
+      const source = herdrSurfaces.at(-1) ?? process.env.HERDR_PANE_ID!;
+      try {
+        surface = mux.createSurfaceSplit!("subagent", herdrNextDirection, source);
+        break;
+      } catch (error) {
+        if (!isMissingPaneError(error) || herdrSurfaces.length === 0) throw error;
+        herdrSurfaces.pop();
+        if (herdrSurfaces.length === 0) herdrNextDirection = "right";
+      }
+    }
+    herdrSurfaces.push(surface);
+    herdrNextDirection = herdrNextDirection === "right" ? "down" : "right";
+  } else {
     surface = mux.createSurface("subagent");
   }
   if (!surface) throw new Error("Terminal multiplexer did not return a pane ID from its managed split layout.");
   await (options.dependencies?.sleep ?? sleep)(500);
-  let closed = false;
+let closed = false;
   const close = () => {
     if (closed) return;
     closed = true;
-    mux.closeSurface(surface);
+    try {
+      mux.closeSurface(surface);
+    } catch (error) {
+      if (!isMissingPaneError(error)) throw error;
+    } finally {
+      const index = herdrSurfaces.indexOf(surface);
+      if (index >= 0) herdrSurfaces.splice(index, 1);
+if (herdrSurfaces.length === 0) herdrNextDirection = "right";
+    }
   };
 
 const invocation = options.piInvocation ?? { command: "pi", args: [] };
@@ -123,11 +148,15 @@ const parts = [mux.shellEscape(invocation.command), ...(invocation.args ?? []).m
     throw error;
   }
 
-  return {
+return {
     surface,
     send: text => mux.sendCommand(surface, text),
-interrupt: () => {
-      mux.sendEscape(surface);
+    interrupt: () => {
+      try {
+        mux.sendEscape(surface);
+      } catch (error) {
+        if (!isMissingPaneError(error)) throw error;
+      }
       (options.dependencies?.writeFile ?? writeFileSync)(`${options.sessionFile}.exit`, JSON.stringify({ type: "done" }));
     },
     close,
@@ -194,9 +223,9 @@ async function loadMux(): Promise<TerminalMux> {
   const packageName: string = "pi-terminal-mux";
   return await import(packageName) as TerminalMux;
 }
-function resetHerdrManagedLayout(parentPaneId: string, removeFile: (path: string) => void = path => rmSync(path, { force: true })): void {
-  const safePaneId = parentPaneId.replace(/[^a-zA-Z0-9_-]/g, "_");
-  removeFile(`/tmp/herdr-subagent-pane-${safePaneId}.json`);
+function isMissingPaneError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("pane_not_found") || message.includes("pane not found");
 }
 function sleep(milliseconds: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, milliseconds));
