@@ -250,7 +250,8 @@ function collapsedLines(details: Exclude<SubagentToolDetails, { action: "error" 
       const steered = accepted.filter(task => task.kind === "steer").length;
       const outcome = dispatchOutcomeSummary(spawned, resumed, steered, rejected, theme);
       const labels = details.tasks.map((task, index) => taskLabel(task, index));
-      return labels.length ? [success(theme, outcome), secondary(labels, theme)] : [success(theme, outcome)];
+      const errors = details.tasks.flatMap((task, index) => task.error ? [`${taskLabel(task, index)}: ${task.error}`] : []);
+      return [success(theme, outcome), ...(labels.length ? [secondary(labels, theme)] : []), ...errors.map(error => `  ${paint(theme, "error", error)}`)];
     }
     case "cancel": {
       const cancelled = details.runs.filter(run => run.status === "aborted").length;

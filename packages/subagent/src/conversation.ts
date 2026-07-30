@@ -6,7 +6,7 @@ import { RunActivity, type RunActivityListener } from "./activity.js";
 import type { ConversationId, RunId } from "./identifiers.js";
 import type { SpawnRequest } from "./schema.js";
 
-/** A run starts a conversation or resumes its existing SDK session. */
+/** A run starts a conversation or resumes its persisted pane-owned Pi session. */
 export type RunKind = "spawn" | "resume";
 export type RunOutcomeStatus =
   | "completed"
@@ -109,11 +109,18 @@ export interface ConversationSnapshot {
   readonly effectiveConfig?: ConversationEffectiveConfig;
   readonly requestedOverrides?: ConversationRequestedOverrides;
   readonly canResume: boolean;
+  /** Persisted session exclusively owned by the pane Pi process. */
+  readonly sessionFile?: string;
+}
+export interface RunExecutionControl {
+  send(text: string): void | Promise<void>;
+  interrupt(): void | Promise<void>;
+  close(): void;
 }
 
 export type AttemptState =
   | { readonly kind: "queued" }
-  | { readonly kind: "running"; readonly session: AgentSession; readonly startedAt: number }
+  | { readonly kind: "running"; readonly session: RunExecutionControl; readonly startedAt: number }
   | { readonly kind: "done"; readonly result: RunOutcome; readonly startedAt?: number; readonly completedAt: number };
 
 /** Mutable execution holder. Once terminal, its state and projected history entry never change. */
@@ -129,7 +136,7 @@ export class Run {
     this.activity = new RunActivity(onChange, event => this.handleSessionEvent(event));
   }
 
-  attach(session: AgentSession): void {
+  attach(session: RunExecutionControl): void {
     if (this.state.kind !== "queued") throw new Error(`Cannot attach a session to a run that is ${this.state.kind}.`);
     this.state = { kind: "running", session, startedAt: Date.now() };
   }
@@ -209,9 +216,6 @@ function projectSteer(steer: TrackedSteerReceipt): SteerReceipt {
   });
 }
 
-function clearSessionQueue(session: AgentSession | undefined): void {
-  try { session?.clearQueue?.(); } catch {}
-}
 
 function messageText(content: unknown): string {
   if (typeof content === "string") return content;
@@ -236,10 +240,11 @@ export class Conversation {
   readonly label?: string;
   private readonly runs: Run[] = [];
   private currentRun?: Run;
-  private session?: AgentSession;
+  private sessionFile?: string;
   private stopping?: { runId: RunId; abortSettled: boolean; executionSettled: boolean };
   private steerTail: Promise<void> = Promise.resolve();
   private unsubscribe?: () => void;
+private retainedExecution?: RunExecutionControl;
   private effectiveConfig?: ConversationEffectiveConfig;
 
   constructor(
@@ -270,7 +275,7 @@ export class Conversation {
   get status(): RunViewStatus { return this.project(this.runs[this.runs.length - 1]).status; }
   get canResume(): boolean {
     const latest = this.runs.at(-1);
-    return !this.currentRun && !this.stopping && !!this.session && latest?.state.kind === "done" &&
+    return !this.currentRun && !this.stopping && !!this.sessionFile && latest?.state.kind === "done" &&
       (latest.state.result.status === "completed"
         || latest.state.result.status === "interrupted"
         || latest.state.result.status === "aborted");
@@ -283,6 +288,7 @@ export class Conversation {
   beginResume(runId: RunId, prompt: string): Run {
     if (!this.canResume) throw new Error(`Conversation ${this.conversationId} cannot be resumed.`);
     if (this.runs.some(run => run.runId === runId)) throw new Error(`Run ${runId} already exists.`);
+this.closeRetainedPane();
     const run = this.newRun(runId, "resume", prompt);
     this.runs.push(run);
     this.currentRun = run;
@@ -294,16 +300,33 @@ export class Conversation {
     return this.currentRun;
   }
 
-  bindSession(session: AgentSession): void {
+bindExecution(session: RunExecutionControl): void {
     const run = this.requireCurrentRun();
+    this.retainedExecution = session;
     run.attach(session);
-    this.session = session;
-    this.unsubscribe = run.activity.subscribe(session);
     this.listener(this, "status");
   }
-  sessionForResume(): AgentSession | undefined { return this.session; }
+observePaneActivity(activity: import("./pane-activity.js").PaneActivityState): void {
+    this.requireCurrentRun().activity.observePane(activity);
+  }
+/** Compatibility adapter for existing SDK-focused unit tests; production execution binds pane controls. */
+  bindSession(session: AgentSession): void {
+    this.bindExecution({
+      send: prompt => session.steer(prompt),
+      interrupt: () => session.abort(),
+      close: () => session.dispose?.(),
+    });
+    this.unsubscribe = this.requireCurrentRun().activity.subscribe(session);
+if (!this.sessionFile) this.sessionFile = `sdk-test://${this.conversationId}`;
+  }
+  setSessionFile(sessionFile: string | undefined): void { this.sessionFile = sessionFile; }
   get isStopping(): boolean { return this.stopping !== undefined; }
   reparent(parent?: ParentRun): void { this.parent = parent; }
+closeRetainedPane(): void {
+    const execution = this.retainedExecution;
+    this.retainedExecution = undefined;
+    try { execution?.close(); } catch { /* pane may already have been closed manually */ }
+  }
   executionSettled(runId: RunId): void {
     if (this.stopping?.runId !== runId) return;
     this.stopping.executionSettled = true;
@@ -318,11 +341,9 @@ export class Conversation {
         const status = run.state.kind === "queued" ? "queued" : run.state.result.status;
         throw new Error(`Run ${runId} is ${status} and cannot be steered.`);
       }
-      const session = run.state.session;
-      await session.steer(prompt);
-      const deliveryText = session.getSteeringMessages?.().at(-1) ?? prompt;
-      if (this.stopping) clearSessionQueue(session);
-      const receipt = run.acceptSteer(deliveryText);
+const session = run.state.session;
+      await session.send(prompt);
+      const receipt = run.acceptSteer(prompt);
       this.listener(this, "steer");
       return receipt;
     });
@@ -362,12 +383,10 @@ export class Conversation {
     const run = this.currentRun;
     if (!run) return;
     this.stopping = { runId: run.runId, abortSettled: false, executionSettled: false };
-    const runningSession = run.state.kind === "running" ? run.state.session : undefined;
-    clearSessionQueue(runningSession);
+const runningSession = run.state.kind === "running" ? run.state.session : undefined;
     this.settle(run.runId, { status: "aborted", error: reason });
-    const aborting = Promise.resolve(runningSession?.abort()).catch(() => undefined);
+    const aborting = Promise.resolve(runningSession?.interrupt()).catch(() => undefined);
     await this.steerTail;
-    clearSessionQueue(runningSession);
     await aborting;
     if (this.stopping?.runId === run.runId) {
       this.stopping.abortSettled = true;
@@ -411,6 +430,7 @@ export class Conversation {
       ...(this.effectiveConfig ? { effectiveConfig: this.effectiveConfig } : {}),
       ...(this.requestedOverrides ? { requestedOverrides: this.requestedOverrides } : {}),
       canResume: this.canResume,
+      ...(this.sessionFile ? { sessionFile: this.sessionFile } : {}),
     });
   }
 

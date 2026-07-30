@@ -102,7 +102,7 @@ Only descendants named in an explicit nested join block that caller. Unjoined de
 
 ![A technical-lead subagent joining two nested investigations with live tool activity](media/recursive-delegation.png)
 
-Cancellation settles a queued or running run as `aborted` and preserves its conversation and exact run record, so the caller can inspect or join the outcome. Queued runs are removed before execution. Once SDK abortion and execution cleanup have both settled, a preserved conversation becomes resumable. Removal accepts only terminal conversations and permanently deletes the conversation, child session state, and every associated run record; removed IDs can no longer be resumed, inspected, joined, steered, or cancelled. Surviving descendants are reparented to the nearest retained ancestor so recursive ownership and reported lineage remain operational.
+Cancellation settles a queued or running run as `aborted` and preserves its conversation and exact run record, so the caller can inspect or join the outcome. Queued runs are removed before execution. Once pane interruption and execution cleanup have both settled, a preserved conversation becomes resumable. Removal accepts only terminal conversations and permanently deletes the conversation, child session state, and every associated run record; removed IDs can no longer be resumed, inspected, joined, steered, or cancelled. Surviving descendants are reparented to the nearest retained ancestor so recursive ownership and reported lineage remain operational.
 
 ## Capacity and concurrency
 
@@ -114,11 +114,14 @@ Settings are stored at `${PI_AGENT_DIR ?? ~/.pi/agent}/subagent/settings.json`. 
 
 Completion notifications alert the parent to terminal outcomes it has not otherwise observed. Their status-neutral header says subagents “finished,” while each entry retains its exact terminal status. A terminal `inspect` or successful `cancel` suppresses a later notification for that run without retrieving or acknowledging its outcome; inspecting an active run does not suppress notification if it settles later. `list` remains pure and does not suppress notifications. Joining a run retrieves and acknowledges that exact outcome, while cleanup clears notifications associated with removed conversations. Delivery waits through a fixed grace window and tool-call-scoped inspect, cancel, or join claims shared across root and recursive agents, so immediate lifecycle handling can finish before notifications are coalesced and sent.
 
-`/subagents` opens the conversation, agent, and settings UI. It provides live status and progress, cancellation of queued or running work, access to completed output, follow-up prompts when `canResume` is true, and permanent terminal-conversation cleanup.
+`/subagents` opens the conversation, agent, and settings UI. It provides live pane-backed status and progress, cancellation of queued or running work, access to completed output, follow-up prompts when `canResume` is true, and permanent terminal-conversation cleanup. Spawn and resume create a dedicated terminal surface whose Pi process exclusively executes and writes that child session; the parent observes activity and completion sidecars instead of opening a second process on the same JSONL. A completed pane remains open for inspection. Resuming that conversation replaces its retained pane, and removing the conversation closes it.
+
+Pane execution requires `pi-terminal-mux` and a supported active terminal multiplexer. Install the package beside this one with `npm install --legacy-peer-deps pi-terminal-mux@^0.2.2`. It remains an optional peer because its current `pi-extensions-i18n` dependency declares a stale Pi `<0.81` peer range; installing it transitively would pull a duplicate legacy Pi runtime into current hosts. Without a steer-capable mux surface, a run fails explicitly instead of silently falling back to a headless process that cannot receive `steer` messages.
+Managed pane placement uses the mux backend's breadth-first alternating split layout: the first child splits to the right of the main Pi pane, then later children split right/down within the child region. This keeps the left-side main conversation as the largest stable pane instead of repeatedly splitting it.
 
 The package emits lifecycle updates for queued, started, and completed work. Nested join changes emit `subagent:updated` with `kind: "nestedJoin"` and the owner conversation snapshot; they do not create additional queued, started, or completed milestones. Identifiers, run records, child conversation context, and nested join-attempt history are runtime-local only. They are not restored after a process restart or extension reload.
 
-Spawn and resume tasks remain asynchronous regardless of recursive delegation. Steer messages return after Pi accepts the message; they do not wait for the target to act on it. Cancel waits for in-flight steering and SDK abortion to finish after terminalizing the run. These semantics do not change the scope or behavior of `/subagents` or its widget.
+Spawn and resume tasks remain asynchronous regardless of recursive delegation. Steer messages are sent to the running pane and return after the mux accepts them; they do not wait for the target to act. Cancel waits for in-flight steering, sends Escape, and completes through the pane sidecar/polling lifecycle.
 
 ## Major-version migration
 
@@ -136,8 +139,8 @@ There is no compatibility layer for the previous lifecycle API.
 ## Architecture
 
 - `src/agents.ts` owns agent definitions, discovery, parsing, and requested configuration.
-- `src/conversation.ts` and `src/activity.ts` own persistent conversations, exact runs, lifecycle state, and live SDK activity.
-- `src/runtime.ts` owns the conversation catalog, cancellation, joining, scheduling, queue limits, and exact run records; `src/execute.ts` owns child SDK session execution.
+- `src/conversation.ts` and `src/activity.ts` own persistent conversations, exact runs, retained pane controls, lifecycle state, and live activity.
+- `src/runtime.ts` owns the conversation catalog, cancellation, joining, scheduling, queue limits, cleanup, and exact run records; `src/execute.ts` and `src/pane-*.ts` own pane-backed child execution, sidecars, and completion observation.
 - `src/schema.ts` and `src/tool.ts` own provider-facing validation and tool actions.
 - `src/notifications.ts`, `src/widget.ts`, and `src/command/` own the three user-facing presentation surfaces.
 - `src/settings.ts`, `src/identifiers.ts`, and `src/index.ts` own configuration, runtime-local identifiers, and Pi extension composition respectively.

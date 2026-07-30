@@ -127,7 +127,7 @@ export class SubagentOverlayComponent implements Component, Focusable {
     if (isShiftTabKey(data)) { this.switchPage(-1); return; }
     if ((this.page === "conversations" || this.page === "agents") && data === "/") { this.setFocus("filter"); return; }
     if (this.page === "settings") { this.settings.handleInput(data); return; }
-    if (this.page === "conversations" && !["t", "c", "r", "x"].includes(data.toLowerCase()) && this.handleChronologyScroll(data)) return;
+    if (this.page === "conversations" && !["t", "c", "r", "x", "o"].includes(data.toLowerCase()) && this.handleChronologyScroll(data)) return;
     if (isUpKey(data, this.keybindings)) { this.moveSelection(-1); return; }
     if (isDownKey(data, this.keybindings)) { this.moveSelection(1); return; }
     if (this.page === "agents") this.handleAgentAction(data);
@@ -492,6 +492,7 @@ export class SubagentOverlayComponent implements Component, Focusable {
     if (this.selectedConversationId === conversationId) this.selectedConversationId = undefined;
   }
 
+
   private moveDetailRun(delta: number): void {
     const detail = this.detail;
     if (!detail) return;
@@ -616,9 +617,13 @@ export class SubagentOverlayComponent implements Component, Focusable {
   private row(content: string, width: number): string { return `${this.border("│")}${pad(content, width)}${this.border("│")}`; }
   private helpText(): string {
     if (this.focusRegion === "prompt") return "enter submit · esc cancel";
-    if (this.detail) return "↑↓ runs · pgup/pgdn scroll · home/end · c cancel · r resume · x remove · esc back";
+    if (this.detail) {
+return "↑↓ runs · pgup/pgdn scroll · home/end · c cancel · r resume · x remove · esc back";
+    }
     if (this.page === "agents") return "↑↓ select · / filter · enter/s start · tab pages · esc close";
-    if (this.page === "conversations") return "↑↓ select · pgup/pgdn scroll · enter inspect · / filter · t flat/tree · c cancel · r resume · x remove · tab pages · esc close";
+if (this.page === "conversations") {
+      return "↑↓ select · pgup/pgdn scroll · enter inspect · / filter · t flat/tree · c cancel · r resume · x remove · tab pages · esc close";
+    }
     return this.settings.isEditing ? "type value · enter save · esc cancel" : "↑↓ select · enter/space change · tab pages · esc close";
   }
 }

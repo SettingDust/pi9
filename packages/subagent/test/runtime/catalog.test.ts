@@ -2,7 +2,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { test, expect } from "vitest";
+import { test, expect, vi } from "vitest";
 import { SubagentRuntime } from "../../src/runtime.js";
 import { completedRun, errorRun } from "../../src/conversation.js";
 
@@ -311,13 +311,29 @@ test("completed removal deletes exact runs, prevents resume, and reclaims capaci
   expect(() => manager.inspectRuns([first.runId])).toThrow(`Unknown run: ${first.runId}.`);
   expect(() => manager.bindJoin([second.runId])).toThrow(`Unknown run: ${second.runId}.`);
 
-  const replacement = manager.startRun(ctx, [{
+const replacement = manager.startRun(ctx, [{
     kind: "spawn",
     agent: "worker",
     prompt: "replacement",
   }] as any);
   expect(replacement.starts[0]).toMatchObject({ ok: true });
   await replacement.completion;
+});
+
+test("removing a terminal conversation closes its retained pane", async () => {
+  const close = vi.fn();
+  const paneRunner = async (_ctx: any, agent: any, attempt: any) => {
+    agent.bindExecution({ send() {}, interrupt() {}, close });
+    return completedRun(agent, attempt.runId, attempt.prompt);
+  };
+  const manager = new SubagentRuntime(registry, 1, paneRunner);
+  const start = manager.startRun(ctx, [{ kind: "spawn", agent: "worker", prompt: "done" }] as any);
+  await start.completion;
+  const identity = start.starts[0] as any;
+
+  expect(close).not.toHaveBeenCalled();
+  await manager.removeConversation(identity.conversationId);
+  expect(close).toHaveBeenCalledOnce();
 });
 
 test("bound joins cannot publish conversation updates after removal", async () => {
@@ -517,21 +533,16 @@ test("cancellation waits for in-flight steering and retains its discarded receip
   const runGate = new Promise<void>(done => { releaseRun = done; });
   const queued = new Promise<void>(done => { steerQueued = done; });
   const steering: string[] = [];
-  let clears = 0;
+  const interrupt = vi.fn();
   const controlled = async (_ctx: any, agent: any, attempt: any) => {
-    agent.bindSession({
-      ...session(),
-      async steer(prompt: string) {
+agent.bindExecution({
+      async send(prompt: string) {
         steering.push(prompt);
         steerQueued();
         await steerGate;
       },
-      getSteeringMessages: () => steering,
-      clearQueue() {
-        clears++;
-        const removed = steering.splice(0);
-        return { steering: removed, followUp: [] };
-      },
+      interrupt,
+      close() {},
     });
     await runGate;
     return completedRun(agent, attempt.runId, attempt.prompt);
@@ -548,8 +559,8 @@ test("cancellation waits for in-flight steering and retains its discarded receip
 
   await expect(steer).resolves.toMatchObject({ steer: { state: "discarded" } });
   await expect(cancelling).resolves.toMatchObject({ conversationId: identity.conversationId, runId: identity.runId, status: "aborted" });
-  expect(clears).toBeGreaterThan(0);
-  expect(steering).toEqual([]);
+  expect(interrupt).toHaveBeenCalledOnce();
+  expect(steering).toEqual(["redirect"]);
   expect(manager.runSnapshot(identity.runId).steers).toMatchObject([{ id: 1, state: "discarded" }]);
   expect(manager.conversation(identity.conversationId).runs).toHaveLength(1);
 

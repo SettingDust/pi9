@@ -7,6 +7,7 @@ import type { ConversationId, RunId } from "../../src/identifiers.js";
 const config = { name: "worker", description: "", systemPrompt: "", source: "project" } as any;
 const registry = { agents: new Map([["worker", config]]) } as any;
 
+
 test("spawn publishes queued after manager conversation and run indexes exist", async () => {
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
@@ -50,3 +51,4 @@ test("nested join changes publish owner updates without extra lifecycle mileston
     error: "cancelled",
   });
 });
+

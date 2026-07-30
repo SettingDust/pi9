@@ -6,10 +6,10 @@ import type { Conversation, ConversationSnapshot, ConversationUpdateKind } from 
 import { SubagentRuntime } from "./runtime.js";
 import { CompletionNotifier } from "./notifications.js";
 import { timingAsync } from "./timing.js";
-import { makeChildSubagentTool } from "./tool.js";
 import { defineSubagentTool } from "./tool.js";
 import { SubagentSettingsStore, DEFAULT_SUBAGENT_SETTINGS, prepareSubagentRuntime, type SubagentSettings } from "./settings.js";
 import { registerSubagentsCommand } from "./command/index.js";
+
 import { registerSubagentWidgetLifecycle, updateSubagentWidget } from "./widget.js";
 import {
   formatCompletionNotificationMessage,
@@ -36,19 +36,12 @@ export default function subagentExtension(pi: ExtensionAPI, dependencies: Subage
   const getCurrentSettings = () => currentSettings;
   registerSubagentWidgetLifecycle(pi, runtime, getCurrentSettings);
 
-  const completionNotifier = new CompletionNotifier({
+  new CompletionNotifier({
     pi: pi as any,
     manager: runtime,
     getMode: () => currentSettings.runtime.completionNotify,
     getDisplay: () => currentSettings.display,
   });
-  runtime.scheduler?.setChildTool?.(parent =>
-    makeChildSubagentTool({ manager: runtime, registry: agentRegistry, parent, getCurrentSettings })
-  );
-  runtime.scheduler?.setChildSessionEvent?.((_parent, run, event) =>
-    completionNotifier.handleToolEvent(`child:${run.runId}`, event)
-  );
-
   registerSubagentLifecycleEvents(pi.events, runtime);
   registerSubagentMetadataPersistence(pi, runtime);
   registerSubagentSessionGuards(pi as any, runtime);

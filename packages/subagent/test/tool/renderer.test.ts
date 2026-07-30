@@ -58,7 +58,20 @@ test("spawn uses outcome-first collapsed output and tagged delegation blocks whe
     "  started · conversation amber-fox · run inspect-carefully",
   ].join("\n"));
 });
+test("collapsed dispatch output includes rejection reasons", () => {
+  const details: SubagentToolDetails = {
+    action: "spawn",
+    tasks: [
+      { inputIndex: 0, kind: "spawn", agent: "worker", label: "拒绝任务", error: "缺少 prompt" },
+    ],
+  };
 
+  assert.equal(renderResult(details), [
+    "✓ No tasks accepted · 1 rejected task",
+    "  拒绝任务",
+    "  拒绝任务: 缺少 prompt",
+  ].join("\n"));
+});
 test("steer renders receipts and inspect renders bounded activity", () => {
   const steer: SubagentToolDetails = {
     action: "steer",

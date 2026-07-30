@@ -7,7 +7,7 @@ import { fakeAgent } from "../helpers/fake-agent.js";
 test("loading settings for a tool invocation refreshes the visible widget", async () => {
   let tool: any;
   const runtime = {
-    scheduler: { setChildTool: vi.fn() },
+    scheduler: {},
     configure: vi.fn(),
     listConversations: () => [fakeAgent({ status: { kind: "running", startedAt: 1 } })],
     onConversationUpdate: () => () => {},

@@ -1,6 +1,7 @@
 import { Usage } from "@earendil-works/pi-ai";
 import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import type { ConversationUpdateKind, RunActivitySnapshot, RunPhase, RunToolUse } from "./conversation.js";
+import type { PaneActivityState } from "./pane-activity.js";
 
 const DefaultUsage: Usage = {
   input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
@@ -18,6 +19,8 @@ export class RunActivity {
   private _compactions: number = 0;
   private _latestUsage: Usage = DefaultUsage;
   private _nextSyntheticToolId = 0;
+private _paneSequence = 0;
+  private _paneTurnIndex = 0;
 
   constructor(
     private readonly onChange: RunActivityListener,
@@ -79,6 +82,29 @@ export class RunActivity {
         this.onChange("turn");
       }
     });
+  }
+observePane(activity: PaneActivityState): void {
+    if (activity.sequence <= this._paneSequence) return;
+    this._paneSequence = activity.sequence;
+    if (activity.latestEvent === "agent_start" || activity.latestEvent === "turn_start") this._setPhase("thinking");
+    else if (activity.latestEvent === "message_update") this._setPhase("responding");
+    else if (activity.latestEvent === "agent_end") this._setPhase("settling");
+    else if (activity.latestEvent === "tool_execution_start" && activity.toolName) {
+      this._startToolUse({ toolCallId: activity.toolCallId, toolName: activity.toolName });
+      this._setPhase("executing_tool");
+      this.onChange("tool");
+    } else if (activity.latestEvent === "tool_execution_end") {
+      this._finishToolUse({ toolCallId: activity.toolCallId, toolName: activity.toolName });
+      this._setPhase(this._toolHistory.some(tool => tool.completedAt === undefined) ? "executing_tool" : "thinking");
+      this.onChange("tool");
+    } else if (activity.latestEvent === "turn_end") {
+      const nextTurn = activity.turnIndex ?? this._paneTurnIndex + 1;
+      if (nextTurn > this._paneTurnIndex) {
+        this._turns += nextTurn - this._paneTurnIndex;
+        this._paneTurnIndex = nextTurn;
+        this.onChange("turn");
+      }
+    }
   }
 
   private _setPhase(phase: RunPhase): void {

@@ -94,6 +94,25 @@ test("preserves immutable exact run history across resume", () => {
   assert.equal(first.status.kind, "done");
   assert.ok(Object.isFrozen(first));
 });
+test("retains a completed pane until resume replaces it", () => {
+  const agent = make();
+  let closes = 0;
+  agent.setSessionFile("/sessions/child.jsonl");
+  agent.bindExecution({ send() {}, interrupt() {}, close() { closes++; } });
+  agent.settle(r1, { status: "completed", output: "first" });
+
+  assert.equal(closes, 0);
+  agent.beginResume(r2, "two");
+  assert.equal(closes, 1);
+});
+test("manual pane closure does not block resume cleanup", () => {
+  const agent = make();
+  agent.setSessionFile("/sessions/child.jsonl");
+  agent.bindExecution({ send() {}, interrupt() {}, close() { throw new Error("pane not found"); } });
+  agent.settle(r1, { status: "completed", output: "first" });
+
+  assert.doesNotThrow(() => agent.beginResume(r2, "two"));
+});
 
 test("resume capability requires a resumable outcome and intact context", () => {
   for (const status of ["completed", "interrupted", "error", "aborted", "skipped"] as const) {
