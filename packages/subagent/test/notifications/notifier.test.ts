@@ -4,6 +4,7 @@ import { CompletionNotifier } from "../../src/notifications.js";
 
 function fixture(mode: "auto" | "steer" | "none" = "auto", idle = true, send?: (message: any, options: any) => void | Promise<void>) {
   let listener: any;
+  let isIdle = idle;
   const handlers = new Map<string, any>();
   const sent: any[] = [];
   const scheduled: Array<{ fn: () => void; delay: number; cancelled: boolean }> = [];
@@ -19,7 +20,7 @@ function fixture(mode: "auto" | "steer" | "none" = "auto", idle = true, send?: (
     sendMessage(message: any, options: any) { sent.push({ message, options }); return send?.(message, options); },
   };
   const notifier = new CompletionNotifier({ pi, manager, getMode: () => mode, scheduleRetry: (fn, delay) => { const item = { fn, delay, cancelled: false }; scheduled.push(item); return () => { item.cancelled = true; }; } });
-  return { run, conversations, sent, scheduled, notifier, flush(maxDelay = 0) { for (;;) { const index = scheduled.findIndex(item => item.delay <= maxDelay); if (index < 0) break; const item = scheduled.splice(index, 1)[0]; if (!item.cancelled) item.fn(); } }, fire(event: string, value: unknown = {}) { handlers.get(event)?.(value, { isIdle: () => idle }); }, update(kind: string, updatedRun: any = run) { listener?.({ snapshot: () => ({ runs: [updatedRun] }) }, kind); } };
+  return { run, conversations, sent, scheduled, notifier, setIdle(value: boolean) { isIdle = value; }, flush(maxDelay = 0) { for (;;) { const index = scheduled.findIndex(item => item.delay <= maxDelay); if (index < 0) break; const item = scheduled.splice(index, 1)[0]; if (!item.cancelled) item.fn(); } }, fire(event: string, value: unknown = {}) { handlers.get(event)?.(value, { isIdle: () => isIdle }); }, update(kind: string, updatedRun: any = run) { listener?.({ snapshot: () => ({ runs: [updatedRun] }) }, kind); } };
 }
 
 test("notifies a terminal run once without leaking output", () => {
@@ -105,7 +106,17 @@ test("finalized results cannot mark unclaimed runs observed", () => {
   f.notifier.beginTool("child:delegate-boldly", "inspect-target", { action: "inspect", runIds: [f.run.runId] });
   f.notifier.completeTool("child:delegate-boldly", "inspect-target", { content: [], details: { action: "inspect", runs: [{ runId: unrelated.runId, status: "completed" }] } });
   f.fire("session_start"); f.flush();
-  assert.deepEqual(f.sent[0].message.details.completions.map((entry: any) => entry.runId), [f.run.runId, unrelated.runId]);
+
+  assert.deepEqual(f.sent[0].message.details.completions.map((entry: any) => entry.runId), [f.run.runId]);
+  f.setIdle(false);
+  f.fire("turn_end"); f.fire("agent_end");
+  assert.equal(f.sent.length, 1);
+
+  f.setIdle(true);
+  f.fire("turn_end");
+  assert.deepEqual(f.sent[1].message.details.completions.map((entry: any) => entry.runId), [unrelated.runId]);
+  assert.equal(f.sent[1].message.details.completions.length, 1);
+  assert.deepEqual(f.sent.map(value => value.options), [{ triggerTurn: true }, { triggerTurn: true }]);
   f.notifier.unsubscribe();
 });
 
@@ -215,7 +226,7 @@ test("later completions do not restart the first completion's grace deadline", (
   f.notifier.unsubscribe();
 });
 
-test("coalesces completions that settle during the same grace window", () => {
+test("near-simultaneous completions send one independent turn per run", () => {
   const f = fixture();
   const second: any = { runId: "gather-gently", createdAt: 1, observerCount: 0, acknowledged: false, status: { kind: "running", startedAt: 1 } };
   f.run.status = { kind: "running", startedAt: 1 };
@@ -229,8 +240,61 @@ test("coalesces completions that settle during the same grace window", () => {
   f.flush(499);
   assert.equal(f.sent.length, 0);
   f.flush(500);
+
+  assert.deepEqual(f.sent[0].message.details.completions, [
+    { runId: f.run.runId, conversationId: "calm-river", agent: "worker", status: "completed", elapsedMs: 1 },
+  ]);
+  assert.deepEqual(f.sent[0].options, { triggerTurn: true });
+
+  // Production sendCustomMessage starts streaming before sendMessage returns.
+  f.setIdle(false);
+  f.fire("turn_end"); f.fire("agent_end");
   assert.equal(f.sent.length, 1);
-  assert.deepEqual(f.sent[0].message.details.completions.map((entry: any) => entry.runId), [f.run.runId, second.runId]);
+
+  f.setIdle(true);
+  f.fire("turn_end");
+  assert.deepEqual(f.sent[1].message.details.completions, [
+    { runId: second.runId, conversationId: "still-forest", agent: "explorer", status: "error", elapsedMs: 2 },
+  ]);
+  assert.deepEqual(f.sent[1].options, { triggerTurn: true });
+  assert.equal(f.sent[1].message.details.completions.length, 1);
+  f.notifier.unsubscribe();
+});
+
+test("injectable async send failure retries only that run", async () => {
+  const attempts = new Map<string, number>();
+  let failedRunId: string;
+  const f = fixture("auto", true, message => {
+    const runId = message.details.completions[0].runId;
+    attempts.set(runId, (attempts.get(runId) ?? 0) + 1);
+    return runId === failedRunId && attempts.get(runId) === 1
+      ? Promise.reject(new Error("closed"))
+      : Promise.resolve();
+  });
+  failedRunId = f.run.runId;
+  const second: any = { runId: "gather-gently", createdAt: 1, observerCount: 0, acknowledged: false, status: { kind: "done", outcome: "completed", completedAt: 2 } };
+  f.conversations.push({ conversationId: "still-forest", config: { name: "explorer" }, runs: [second] });
+
+  // The Promise rejection is an injectable notifier seam; production ExtensionAPI.sendMessage returns void.
+  f.fire("session_start"); f.flush();
+  f.setIdle(false);
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(f.sent.length, 1);
+  assert.deepEqual(f.sent[0].message.details.completions.map((entry: any) => entry.runId), [f.run.runId]);
+
+  f.setIdle(true);
+  f.fire("turn_end");
+  assert.deepEqual(f.sent[1].message.details.completions.map((entry: any) => entry.runId), [f.run.runId]);
+  f.setIdle(false);
+  f.fire("agent_end");
+  assert.equal(f.sent.length, 2);
+
+  f.setIdle(true);
+  f.fire("turn_end");
+  assert.deepEqual(f.sent[2].message.details.completions.map((entry: any) => entry.runId), [second.runId]);
+  assert.deepEqual(f.sent.map(value => value.message.details.completions.length), [1, 1, 1]);
+  assert.deepEqual(f.sent.map(value => value.options), [{ triggerTurn: true }, { triggerTurn: true }, { triggerTurn: true }]);
+  assert.deepEqual([...attempts], [[f.run.runId, 2], [second.runId, 1]]);
   f.notifier.unsubscribe();
 });
 

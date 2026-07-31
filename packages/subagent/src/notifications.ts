@@ -176,7 +176,7 @@ export interface CompletionNotifierDeps {
 }
 const schedule = (fn: () => void, ms: number) => { const handle = setTimeout(fn, ms); return () => clearTimeout(handle); };
 
-/** Delivers batched notifications for terminal runs the parent has not observed or acknowledged. */
+/** Delivers one notification per terminal run the parent has not observed or acknowledged. */
 export class CompletionNotifier {
   private ctx?: NotifierContext;
   private cancelTimer?: () => void;
@@ -308,26 +308,28 @@ export class CompletionNotifier {
 
     // Catalog, observer and acknowledgement state are intentionally projected again immediately before send.
     const live = new Map(this.catalog().map(value => [value.run.runId, value]));
-    const entries: CompletionNotification[] = [];
+    let entry: CompletionNotification | undefined;
     for (const candidate of eligible) {
       const value = live.get(candidate.run.runId);
       if (!value || value.run.acknowledged || value.run.observerCount || this.claimCountByRun.has(value.run.runId)) continue;
       const started = value.run.status.kind === "done" ? value.run.status.startedAt ?? value.run.createdAt : value.run.createdAt;
       if (value.run.status.kind !== "done") continue;
-      entries.push({ runId: value.run.runId, conversationId: value.conversation.conversationId, agent: value.conversation.config.name, ...(value.conversation.label ? { label: value.conversation.label } : {}), status: value.run.status.outcome, elapsedMs: Math.max(0, value.run.status.completedAt - started) });
+      entry = { runId: value.run.runId, conversationId: value.conversation.conversationId, agent: value.conversation.config.name, ...(value.conversation.label ? { label: value.conversation.label } : {}), status: value.run.status.outcome, elapsedMs: Math.max(0, value.run.status.completedAt - started) };
+      break;
     }
-    if (!entries.length || !this.deps.pi.sendMessage) return;
-    const message = createCompletionNotificationMessage(entries, this.deps.getDisplay?.() ?? DEFAULT_SUBAGENT_SETTINGS.display);
+    if (!entry || !this.deps.pi.sendMessage) return;
     const active = !this.ctx.isIdle();
+    const options = mode === "steer" && active ? { deliverAs: "steer" as const } : { triggerTurn: true };
+    const message = createCompletionNotificationMessage([entry], this.deps.getDisplay?.() ?? DEFAULT_SUBAGENT_SETTINGS.display);
     try {
-      const sent = this.deps.pi.sendMessage({ customType: "subagent-completion", ...message }, mode === "steer" && active ? { deliverAs: "steer" } : { triggerTurn: true });
-      for (const entry of entries) this.delivered.add(entry.runId);
+      const sent = this.deps.pi.sendMessage({ customType: "subagent-completion", ...message }, options);
+      this.delivered.add(entry.runId);
       void Promise.resolve(sent).catch(() => {
-        for (const entry of entries) this.delivered.delete(entry.runId);
+        this.delivered.delete(entry.runId);
         this.arm(500, mode === "steer" && active);
       });
     } catch {
-      for (const entry of entries) this.delivered.delete(entry.runId);
+      this.delivered.delete(entry.runId);
       this.arm(500, mode === "steer" && active);
     }
   }

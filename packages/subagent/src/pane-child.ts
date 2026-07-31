@@ -19,6 +19,9 @@ export default function paneChild(pi: ExtensionAPI) {
   on("turn_start", event => recorder.record("turn_start", { turnIndex: event.turnIndex }));
   on("turn_end", event => recorder.record("turn_end", { turnIndex: event.turnIndex }));
   on("message_update", event => recorder.record("message_update", { messageEventType: event.assistantMessageEvent?.type }));
+  on("message_end", event => {
+    if (event.message.role === "assistant") recorder.record("message_end", { usage: event.message.usage });
+  });
   on("tool_execution_start", event => recorder.record("tool_execution_start", { toolCallId: event.toolCallId, toolName: event.toolName }));
   on("tool_execution_end", event => recorder.record("tool_execution_end", { toolCallId: event.toolCallId, toolName: event.toolName }));
   on("session_shutdown", () => recorder.record("session_shutdown"));

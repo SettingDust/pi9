@@ -113,6 +113,74 @@ test("manual pane closure does not block resume cleanup", () => {
 
   assert.doesNotThrow(() => agent.beginResume(r2, "two"));
 });
+test("exposes retained surface and persisted session file after binding", () => {
+  const agent = make();
+  const execution = { surface: "pane-1", send() {}, interrupt() {}, close() {} };
+  agent.setSessionFile("/sessions/child.jsonl");
+  agent.bindExecution(execution);
+
+  assert.equal(agent.retainedSurface, "pane-1");
+  assert.equal(agent.persistedSessionFile, "/sessions/child.jsonl");
+});
+
+test("replaces retained execution without mutating history and owns cleanup once", () => {
+  const agent = make();
+  let oldCloses = 0;
+  let newCloses = 0;
+  const oldExecution = {
+    surface: "pane-old",
+    send() {},
+    interrupt() {},
+    close() { oldCloses++; throw new Error("pane already closed"); },
+  };
+  const newExecution = {
+    surface: "pane-new",
+    send() {},
+    interrupt() {},
+    close() { newCloses++; },
+  };
+  agent.bindExecution(oldExecution);
+  agent.settle(r1, { status: "completed", output: "first" });
+  const history = agent.runHistory;
+
+  assert.doesNotThrow(() => agent.replaceRetainedExecution(newExecution));
+  assert.equal(agent.retainedSurface, "pane-new");
+  assert.equal(oldCloses, 1);
+  assert.deepEqual(agent.runHistory, history);
+
+  agent.closeRetainedPane();
+  agent.closeRetainedPane();
+  assert.equal(newCloses, 1);
+});
+
+test("replacing retained execution with itself does not close it", () => {
+  const agent = make();
+  let closes = 0;
+  const execution = { send() {}, interrupt() {}, close() { closes++; } };
+  agent.bindExecution(execution);
+
+  agent.replaceRetainedExecution(execution);
+
+  assert.equal(closes, 0);
+});
+
+test("resume closes the replacement owner once", () => {
+  const agent = make();
+  let oldCloses = 0;
+  let newCloses = 0;
+  const oldExecution = { send() {}, interrupt() {}, close() { oldCloses++; } };
+  const newExecution = { send() {}, interrupt() {}, close() { newCloses++; } };
+  agent.setSessionFile("/sessions/child.jsonl");
+  agent.bindExecution(oldExecution);
+  agent.settle(r1, { status: "completed", output: "first" });
+  agent.replaceRetainedExecution(newExecution);
+
+  agent.beginResume(r2, "two");
+  agent.closeRetainedPane();
+
+  assert.equal(oldCloses, 1);
+  assert.equal(newCloses, 1);
+});
 
 test("resume capability requires a resumable outcome and intact context", () => {
   for (const status of ["completed", "interrupted", "error", "aborted", "skipped"] as const) {
@@ -146,6 +214,29 @@ test("logical abort terminalizes before best-effort SDK abort resolves", async (
   assert.equal(agent.canResume, false);
   release();
   await aborting;
+  assert.equal(agent.canResume, true);
+});
+test.each([
+  ["synchronous throw", () => { throw new Error("interrupt failed"); }],
+  ["asynchronous rejection", () => Promise.reject(new Error("interrupt failed"))],
+])("interrupt %s does not wedge cancellation", async (_failure, interrupt) => {
+  const agent = make();
+  agent.setSessionFile("/sessions/child.jsonl");
+  agent.bindExecution({ send() {}, interrupt, close() {} });
+
+  const aborting = agent.abort("stopped");
+  const status = agent.snapshot().runs[0].status;
+
+  assert.equal(status.kind, "done");
+  assert.equal(status.kind === "done" && status.outcome, "aborted");
+  assert.equal(agent.isStopping, true);
+  assert.equal(agent.canResume, false);
+  await assert.doesNotReject(aborting);
+  assert.equal(agent.isStopping, true);
+  assert.equal(agent.canResume, false);
+
+  agent.executionSettled(r1);
+  assert.equal(agent.isStopping, false);
   assert.equal(agent.canResume, true);
 });
 

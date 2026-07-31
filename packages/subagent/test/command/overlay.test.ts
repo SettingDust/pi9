@@ -13,6 +13,7 @@ function overlay(conversations: any[], overrides: Partial<OverlayOptions> = {}, 
     notify: vi.fn(),
     onStart: vi.fn(),
     onResume: vi.fn(),
+    onOpenPane: vi.fn(),
     onCancel: vi.fn(),
     onRemove: vi.fn(),
     onSettingsChange: vi.fn(),
@@ -98,6 +99,39 @@ describe("subagent overlay behavior", () => {
     expect(requestRender).toHaveBeenCalled();
     component.dispose();
     expect(unsubscribe).toHaveBeenCalled();
+  });
+it("opens the selected terminal conversation without resuming it", () => {
+    const conversation = fakeAgent({ conversationId: "terminal-conversation", canResume: true, status: { kind: "completed" } });
+    const { component, callbacks } = overlay([conversation]);
+
+    component.handleInput("o");
+
+    expect(callbacks.onOpenPane).toHaveBeenCalledWith("terminal-conversation");
+    expect(callbacks.onResume).not.toHaveBeenCalled();
+    expect(component.render(120).join("\\n")).toContain("o open pane");
+  });
+
+  it.each(["queued", "running"] as const)("does nothing for a %s conversation", status => {
+    const conversation = fakeAgent({ conversationId: `${status}-conversation`, status: { kind: status } });
+    const { component, callbacks } = overlay([conversation]);
+
+    component.handleInput("o");
+
+    expect(callbacks.onOpenPane).not.toHaveBeenCalled();
+    expect(callbacks.onResume).not.toHaveBeenCalled();
+  });
+
+  it("opens the detail conversation without leaving detail or resuming", () => {
+    const conversation = fakeAgent({ conversationId: "detail-conversation", runId: "detail-run", canResume: true, status: { kind: "completed" } });
+    const { component, callbacks } = overlay([conversation]);
+
+    component.handleInput("\\r");
+    component.handleInput("o");
+
+    expect(callbacks.onOpenPane).toHaveBeenCalledWith("detail-conversation");
+    expect(callbacks.onResume).not.toHaveBeenCalled();
+    expect(component.render(120).join("\\n")).toContain("o open pane");
+    expect(component.render(120).join("\\n")).toContain("detail-run");
   });
 
   it("renders the title and tabs in a framed header drawer", () => {
@@ -512,3 +546,9 @@ describe("subagent overlay behavior", () => {
     expect(output).toContain("Return evidence-backed findings.");
   });
 });
+it("includes open pane help in the detail view", () => {
+    const conversation = fakeAgent({ conversationId: "help-detail", runId: "help-run", status: { kind: "completed" } });
+    const { component } = overlay([conversation]);
+    component.handleInput("\\r");
+    expect(component.render(120).join("\\n")).toContain("o open pane");
+  });

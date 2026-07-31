@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
-import { launchPaneExecution, observePaneCompletion, type PaneExecutionHandle } from "../src/pane-execution.js";
+import {
+  launchPaneExecution,
+  observePaneCompletion,
+  reopenPaneExecution,
+  retainedHerdrPaneExists,
+  type PaneExecutionHandle,
+} from "../src/pane-execution.js";
 
 function fakeMux() {
   return {
@@ -257,5 +263,170 @@ describe("pane completion mapping", () => {
 
     await expect(observePaneCompletion({ handle })).rejects.toThrow("screen unavailable");
     expect(handle.close).not.toHaveBeenCalled();
+  });
+});
+describe("pane display names", () => {
+  it("sanitizes, trims, caps, and falls back display names for regular panes", async () => {
+    const mux = fakeMux();
+
+    await launchPaneExecution(options(mux));
+    await launchPaneExecution({ ...options(mux), displayName: "\u0000\u007f" });
+    await launchPaneExecution({ ...options(mux), displayName: `  ${"x".repeat(60)}  ` });
+
+    expect((mux.createSurface.mock.calls as unknown as [string][]).map(([name]) => name)).toEqual(["subagent", "subagent", "x".repeat(48)]);
+  });
+
+  it("passes the sanitized display name to managed Herdr splits", async () => {
+    const mux = fakeMux();
+    const split = vi.fn(() => "surface-herdr");
+    (mux as any).createSurfaceSplit = split;
+    const previousPaneId = process.env.HERDR_PANE_ID;
+    process.env.HERDR_PANE_ID = "parent";
+
+    try {
+      const handle = await launchPaneExecution({ ...options(mux), displayName: "  child\u0007 pane  " });
+
+      expect(split).toHaveBeenCalledWith("child pane", "right", "parent");
+      handle.close();
+    } finally {
+      if (previousPaneId === undefined) delete process.env.HERDR_PANE_ID;
+      else process.env.HERDR_PANE_ID = previousPaneId;
+    }
+  });
+});
+
+describe("retained Herdr pane probing", () => {
+  it("classifies successful and missing pane probes", async () => {
+    const execFile = vi.fn();
+    const mux = fakeMux();
+
+    await expect(retainedHerdrPaneExists("surface-1", { mux, execFile })).resolves.toBe(true);
+    execFile.mockImplementationOnce(() => { throw new Error("pane_not_found"); });
+    await expect(retainedHerdrPaneExists("surface-2", { mux, execFile })).resolves.toBe(false);
+    expect(execFile).toHaveBeenNthCalledWith(1, "herdr", ["pane", "get", "surface-1"], expect.any(Object));
+    expect(execFile).toHaveBeenNthCalledWith(2, "herdr", ["pane", "get", "surface-2"], expect.any(Object));
+  });
+
+  it("rethrows unrelated probe failures", async () => {
+    const execFile = vi.fn(() => { throw new Error("herdr unavailable"); });
+
+    await expect(retainedHerdrPaneExists("surface-1", { mux: fakeMux(), execFile })).rejects.toThrow("herdr unavailable");
+  });
+
+  it("rejects unsupported mux backends without probing", async () => {
+    const execFile = vi.fn();
+    const mux = fakeMux();
+    mux.getMuxBackend.mockReturnValue("tmux");
+
+    await expect(retainedHerdrPaneExists("surface-1", { mux, execFile })).rejects.toThrow("unsupported mux backend: tmux");
+    expect(execFile).not.toHaveBeenCalled();
+  });
+});
+
+describe("pane execution reopen", () => {
+  it("reopens Unix with only the explicit invocation, session, and extensions", async () => {
+    const mux = fakeMux();
+    const handle = await reopenPaneExecution({
+      cwd: "/work/project",
+      sessionFile: "/sessions/reopen-unix.jsonl",
+      displayName: "reopen",
+      extensionPaths: ["/extensions/one.ts", "/extensions/two.ts"],
+      env: { TOKEN: "secret" },
+      piInvocation: { command: "C:\\runtime\\node.exe", args: ["C:\\pi\\cli.js"] },
+      dependencies: { mux, platform: "linux", stat: vi.fn(() => ({ isFile: () => true }) as any) },
+    });
+
+    const command = (mux.sendLongCommand.mock.calls as unknown as [string, string][])[0]![1];
+    expect(command).toContain("[C:\\runtime\\node.exe] [C:\\pi\\cli.js] --session [/sessions/reopen-unix.jsonl]");
+    expect(command).toContain("-e [/extensions/one.ts] -e [/extensions/two.ts]");
+    expect(command).not.toContain("do the work");
+    expect(command).not.toContain("/skill:");
+    expect(command).not.toMatch(/--(?:model|tools|system-prompt)/);
+    handle.close();
+  });
+
+  it("reopens Windows through PowerShell without a prompt or Bash transport", async () => {
+    const mux = fakeMux();
+    const writeFile = vi.fn();
+    const handle = await reopenPaneExecution({
+      cwd: "C:\\work\\project",
+      sessionFile: "C:\\sessions\\reopen-windows.jsonl",
+      displayName: "reopen",
+      extensionPaths: ["C:\\extensions\\one.ts", "C:\\extensions\\two.ts"],
+      env: { TOKEN: "secret" },
+      piInvocation: { command: "C:\\runtime\\node.exe", args: ["C:\\pi\\cli.js"] },
+      dependencies: { mux, writeFile, platform: "win32", stat: vi.fn(() => ({ isFile: () => true }) as any) },
+    });
+
+    const script = writeFile.mock.calls[0]![1] as string;
+    expect(script).toContain("& 'C:\\runtime\\node.exe' @arguments");
+    expect(script).toContain("'C:\\pi\\cli.js'");
+    expect(script).toContain("'--session'");
+    expect(script).toContain("'C:\\sessions\\reopen-windows.jsonl'");
+    expect(script).toContain("'-e', 'C:\\extensions\\one.ts', '-e', 'C:\\extensions\\two.ts'");
+    expect(script).not.toContain("do the work");
+    expect(script).not.toContain("/skill:");
+    expect(script).not.toMatch(/--(?:model|tools|system-prompt)/);
+    expect(script).not.toMatch(/bash|\.sh/i);
+    expect(mux.sendCommand).toHaveBeenCalledWith("surface-1", expect.stringContaining("powershell.exe"));
+    handle.close();
+  });
+
+it("rejects a non-absolute session file before stat or surface creation", async () => {
+    const mux = fakeMux();
+    const stat = vi.fn();
+
+    await expect(reopenPaneExecution({
+      cwd: "/work/project",
+      sessionFile: "sessions/reopen.jsonl",
+      extensionPaths: [],
+      dependencies: { mux, stat },
+    })).rejects.toThrow("absolute session file");
+    expect(stat).not.toHaveBeenCalled();
+    expect(mux.createSurface).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["missing", vi.fn(() => { throw new Error("ENOENT"); })],
+    ["non-file", vi.fn(() => ({ isFile: () => false }) as any)],
+  ])("rejects a %s session before creating a surface", async (_label, stat) => {
+    const mux = fakeMux();
+
+    await expect(reopenPaneExecution({
+      cwd: "/work/project",
+      sessionFile: "/sessions/reopen.jsonl",
+      extensionPaths: [],
+      dependencies: { mux, stat },
+    })).rejects.toThrow(_label === "non-file" ? "regular file" : "missing or inaccessible");
+    expect(mux.createSurface).not.toHaveBeenCalled();
+  });
+
+  it("returns a viewer handle that cannot wait or write a completion sidecar", async () => {
+    const mux = fakeMux();
+    const writeFile = vi.fn();
+    const handle = await reopenPaneExecution({
+      cwd: "/work/project",
+      sessionFile: "/sessions/reopen.jsonl",
+      extensionPaths: [],
+      dependencies: { mux, writeFile, platform: "linux", stat: vi.fn(() => ({ isFile: () => true }) as any) },
+    });
+
+    await expect(handle.wait()).rejects.toThrow("viewer handle");
+    expect(() => handle.interrupt()).not.toThrow();
+    expect(writeFile).not.toHaveBeenCalledWith("/sessions/reopen.jsonl.exit", expect.anything());
+    handle.close();
+  });
+
+  it("does not consume a stale completion sidecar when reopening", async () => {
+    const mux = fakeMux();
+    const handle = await reopenPaneExecution({
+      cwd: "/work/project",
+      sessionFile: "/sessions/reopen.jsonl",
+      extensionPaths: [],
+      dependencies: { mux, platform: "linux", stat: vi.fn(() => ({ isFile: () => true }) as any) },
+    });
+
+    expect(mux.pollForExit).not.toHaveBeenCalled();
+    handle.close();
   });
 });

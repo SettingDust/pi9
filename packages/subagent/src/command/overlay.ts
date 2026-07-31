@@ -37,6 +37,7 @@ export interface OverlayOptions {
   onSettingsChange(change: SubagentSettingsChange): SubagentSettings | void;
   onStart(agent: string, prompt: string): string | undefined;
   onResume(conversationId: string, prompt: string): void;
+  onOpenPane?(conversationId: string): void;
   onCancel?(runId: string): void;
   onRemove?(conversationId: string): void;
 }
@@ -113,6 +114,7 @@ export class SubagentOverlayComponent implements Component, Focusable {
       const command = data.toLowerCase();
       if (isCancelKey(data, this.keybindings)) this.detail = undefined;
       else if (command === "r") this.openResumePrompt(this.detail.conversationId);
+      else if (command === "o") this.openPane(this.detail.conversationId);
       else if (command === "c") this.cancelRun(this.detail.conversationId, this.detail.runId);
       else if (command === "x") this.removeConversation(this.detail.conversationId);
       else if (this.handleChronologyScroll(data)) return;
@@ -433,6 +435,7 @@ export class SubagentOverlayComponent implements Component, Focusable {
       this.chronologyOffset = 0;
       this.detail = { conversationId: conversation.conversationId, ...(run ? { runId: run.runId } : {}) };
     } else if (data.toLowerCase() === "r") this.openResumePrompt(conversation.conversationId);
+    else if (data.toLowerCase() === "o") this.openPane(conversation.conversationId);
     else if (data.toLowerCase() === "c") this.cancelRun(conversation.conversationId);
     else if (data.toLowerCase() === "x") this.removeConversation(conversation.conversationId);
     this.requestRender();
@@ -484,6 +487,13 @@ export class SubagentOverlayComponent implements Component, Focusable {
     if (!conversation) return;
     const run = this.findRun(conversation, runId);
     if (run?.status.kind === "queued" || run?.status.kind === "running") this.options.onCancel?.(run.runId);
+  }
+private openPane(conversationId: string): void {
+    const conversation = this.findConversation(conversationId);
+    const run = conversation?.currentRun;
+    if (conversation && (!run || (run.status.kind !== "queued" && run.status.kind !== "running"))) {
+      this.options.onOpenPane?.(conversationId);
+    }
   }
 
   private removeConversation(conversationId: string): void {
@@ -618,11 +628,11 @@ export class SubagentOverlayComponent implements Component, Focusable {
   private helpText(): string {
     if (this.focusRegion === "prompt") return "enter submit · esc cancel";
     if (this.detail) {
-return "↑↓ runs · pgup/pgdn scroll · home/end · c cancel · r resume · x remove · esc back";
+return "↑↓ runs · pgup/pgdn scroll · home/end · c cancel · r resume · o open pane · x remove · esc back";
     }
     if (this.page === "agents") return "↑↓ select · / filter · enter/s start · tab pages · esc close";
 if (this.page === "conversations") {
-      return "↑↓ select · pgup/pgdn scroll · enter inspect · / filter · t flat/tree · c cancel · r resume · x remove · tab pages · esc close";
+      return "↑↓ select · pgup/pgdn scroll · enter inspect · / filter · t flat/tree · c cancel · r resume · o open pane · x remove · tab pages · esc close";
     }
     return this.settings.isEditing ? "type value · enter save · esc cancel" : "↑↓ select · enter/space change · tab pages · esc close";
   }

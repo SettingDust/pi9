@@ -1042,3 +1042,237 @@ test("nested interruption tolerates a deleted owner", async () => {
   await targetStart.completion;
   expect(() => manager.runSnapshot(owner.runId)).toThrow(`Unknown run: ${owner.runId}.`);
 });
+
+async function makeTerminalFixture(options: {
+  paneExists?: boolean;
+  probe?: Promise<boolean> | (() => Promise<boolean>);
+  reopen?: (options: any) => Promise<any>;
+  runner?: (agent: any, attempt: any, retained: any) => Promise<any>;
+} = {}) {
+  const cwd = path.resolve("packages/subagent");
+  const sessionFile = path.join(cwd, ".runtime-catalog-child.jsonl");
+  const retained = { surface: "retained-surface", send: vi.fn(), interrupt: vi.fn(), close: vi.fn() };
+  const reopened = { surface: "reopened-surface", send: vi.fn(), interrupt: vi.fn(), close: vi.fn(), wait: vi.fn() };
+  const invocation = { command: "C:\\runtime\\node.exe", args: ["C:\\pi\\cli.js"] };
+  const probe = vi.fn(async () => typeof options.probe === "function" ? options.probe() : options.probe ?? options.paneExists ?? false);
+  const reopen = vi.fn(options.reopen ?? (async () => reopened));
+  const dependencies = {
+    retainedHerdrPaneExists: probe,
+    reopenPaneExecution: reopen,
+    getPiInvocation: vi.fn(() => invocation),
+    getAgentDir: vi.fn(() => path.join(cwd, ".pi-agent")),
+    loadExtensionPaths: vi.fn(async () => ["inherited-extension.ts"]),
+    ownExtensionPath: path.join(cwd, "subagent-extension.ts"),
+  };
+  const terminalRunner = options.runner ?? (async (agent: any, attempt: any, retainedHandle: any) => {
+    agent.setSessionFile(sessionFile);
+    agent.setEffectiveConfig({ cwd, skills: [], tools: [] });
+    agent.bindExecution(retainedHandle);
+    return completedRun(agent, attempt.runId, attempt.prompt);
+  });
+const manager = new SubagentRuntime(registry, 2, async (_ctx, agent, attempt) =>
+    terminalRunner(agent, attempt, retained), 100, dependencies);
+  const started = manager.startRun(ctx, [{ kind: "spawn", agent: "worker", prompt: "terminal", label: "Terminal worker" }] as any);
+  await started.completion;
+  return { manager, conversationId: (started.starts[0] as any).conversationId, cwd, sessionFile, retained, reopened, invocation, probe, reopen };
+}
+
+test("opening a live retained pane reports already_open without a duplicate writer", async () => {
+  const fixture = await makeTerminalFixture({ paneExists: true });
+
+  await expect(fixture.manager.openConversationPane(fixture.conversationId)).resolves.toEqual({
+    conversationId: fixture.conversationId,
+    status: "already_open",
+    surface: "retained-surface",
+    message: "Conversation pane is already open; exact pane focus is unavailable.",
+  });
+  expect(fixture.probe).toHaveBeenCalledOnce();
+  expect(fixture.reopen).not.toHaveBeenCalled();
+  expect(fixture.retained.close).not.toHaveBeenCalled();
+});
+
+test("reopening a missing pane keeps one run, passes pane launch identity, and replaces ownership", async () => {
+  const fixture = await makeTerminalFixture();
+
+  await expect(fixture.manager.openConversationPane(fixture.conversationId)).resolves.toMatchObject({
+    conversationId: fixture.conversationId,
+    status: "reopened",
+    surface: "reopened-surface",
+  });
+  expect(fixture.manager.conversation(fixture.conversationId).runs).toHaveLength(1);
+  expect(fixture.retained.close).toHaveBeenCalledOnce();
+expect(fixture.reopen).toHaveBeenCalledWith(expect.objectContaining({
+    cwd: fixture.cwd,
+    sessionFile: fixture.sessionFile,
+    displayName: "Terminal worker",
+    piInvocation: fixture.invocation,
+  }));
+  const args = fixture.reopen.mock.calls[0][0];
+  expect(args.extensionPaths).toContain("inherited-extension.ts");
+  expect(args.extensionPaths).toContain(path.join(fixture.cwd, "subagent-extension.ts"));
+  expect(args.extensionPaths.some((value: string) => value.endsWith("pane-child.ts"))).toBe(true);
+  await fixture.manager.removeConversation(fixture.conversationId);
+  expect(fixture.reopened.close).toHaveBeenCalledOnce();
+});
+
+test("pane probe errors propagate without launching", async () => {
+  const fixture = await makeTerminalFixture({ probe: () => Promise.reject(new Error("probe failed")) });
+
+  await expect(fixture.manager.openConversationPane(fixture.conversationId)).rejects.toThrow("probe failed");
+  expect(fixture.reopen).not.toHaveBeenCalled();
+  expect(fixture.retained.close).not.toHaveBeenCalled();
+});
+
+test("pane launch errors preserve the old owner", async () => {
+  const fixture = await makeTerminalFixture({ reopen: async () => { throw new Error("launch failed"); } });
+
+  await expect(fixture.manager.openConversationPane(fixture.conversationId)).rejects.toThrow("launch failed");
+  expect(fixture.retained.close).not.toHaveBeenCalled();
+  await expect(fixture.manager.removeConversation(fixture.conversationId)).resolves.toMatchObject({ removed: 1 });
+  expect(fixture.retained.close).toHaveBeenCalledOnce();
+});
+
+test("concurrent pane opens share one probe and one reopen", async () => {
+  let releaseProbe!: (exists: boolean) => void;
+  const probe = new Promise<boolean>(resolve => { releaseProbe = resolve; });
+  const fixture = await makeTerminalFixture({ probe });
+
+  const first = fixture.manager.openConversationPane(fixture.conversationId);
+  const second = fixture.manager.openConversationPane(fixture.conversationId);
+  expect(second).toBe(first);
+  releaseProbe(false);
+  await expect(Promise.all([first, second])).resolves.toHaveLength(2);
+  expect(fixture.probe).toHaveBeenCalledOnce();
+  expect(fixture.reopen).toHaveBeenCalledOnce();
+});
+
+test("resume and remove are blocked during a pending pane probe, then work after it settles", async () => {
+  let releaseProbe!: (exists: boolean) => void;
+  const probe = new Promise<boolean>(resolve => { releaseProbe = resolve; });
+  const fixture = await makeTerminalFixture({ probe });
+  const opening = fixture.manager.openConversationPane(fixture.conversationId);
+
+  expect(fixture.manager.startRun(ctx, [{ kind: "resume", conversationId: fixture.conversationId, prompt: "resume" }] as any).starts[0])
+    .toMatchObject({ ok: false, error: `Conversation ${fixture.conversationId} pane is reopening. Wait before resuming.` });
+  await expect(fixture.manager.removeConversation(fixture.conversationId)).resolves.toEqual({
+    removed: 0,
+    conversationIds: [],
+    errors: [{ conversationId: fixture.conversationId, error: `Conversation ${fixture.conversationId} pane is reopening. Wait before removal.` }],
+  });
+
+  releaseProbe(true);
+  await expect(opening).resolves.toMatchObject({ status: "already_open" });
+  const resumed = fixture.manager.startRun(ctx, [{ kind: "resume", conversationId: fixture.conversationId, prompt: "resume" }] as any);
+  expect(resumed.starts[0]).toMatchObject({ ok: true, conversationId: fixture.conversationId });
+  await resumed.completion;
+  await expect(fixture.manager.removeConversation(fixture.conversationId)).resolves.toMatchObject({ removed: 1 });
+});
+
+test("resume and remove close a reopened pane through normal ownership cleanup", async () => {
+  const resumedFixture = await makeTerminalFixture();
+  await resumedFixture.manager.openConversationPane(resumedFixture.conversationId);
+  const resumed = resumedFixture.manager.startRun(ctx, [{ kind: "resume", conversationId: resumedFixture.conversationId, prompt: "resume" }] as any);
+  await resumed.completion;
+  expect(resumedFixture.reopened.close).toHaveBeenCalledOnce();
+
+  const removedFixture = await makeTerminalFixture();
+  await removedFixture.manager.openConversationPane(removedFixture.conversationId);
+  await removedFixture.manager.removeConversation(removedFixture.conversationId);
+  expect(removedFixture.reopened.close).toHaveBeenCalledOnce();
+});
+
+test("terminal pane retention waits for stopping execution, keeps the latest three, and ignores duplicate terminal status", async () => {
+  let releaseActive!: () => void;
+  let releaseStopping!: () => void;
+  const activeGate = new Promise<void>(resolve => { releaseActive = resolve; });
+  const stoppingGate = new Promise<void>(resolve => { releaseStopping = resolve; });
+  const closeOrder: string[] = [];
+  const panes = new Map<string, { surface: string; send: ReturnType<typeof vi.fn>; interrupt: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> }>();
+  const controlled = async (_ctx: any, agent: any, attempt: any) => {
+    const pane = {
+      surface: `surface-${attempt.prompt}`,
+      send: vi.fn(),
+      interrupt: vi.fn(),
+      close: vi.fn(() => { closeOrder.push(attempt.prompt); }),
+    };
+    panes.set(attempt.prompt, pane);
+    agent.bindExecution(pane);
+    if (attempt.prompt === "active") await activeGate;
+    if (attempt.prompt === "one") await stoppingGate;
+    return completedRun(agent, attempt.runId, attempt.prompt);
+  };
+  const manager = new SubagentRuntime(registry, 6, controlled);
+  const statusUpdates: string[] = [];
+  manager.onConversationUpdate((agent, kind) => {
+    if (kind === "status") statusUpdates.push(agent.conversationId);
+  });
+  const active = manager.startRun(ctx, [{ kind: "spawn", agent: "worker", prompt: "active" }] as any);
+  await new Promise(resolve => setImmediate(resolve));
+  const first = manager.startRun(ctx, [{ kind: "spawn", agent: "worker", prompt: "one" }] as any);
+  const firstIdentity = first.starts[0] as any;
+  await new Promise(resolve => setImmediate(resolve));
+  await manager.cancelRun(firstIdentity.runId);
+  const stoppingStatusCount = statusUpdates.filter(id => id === firstIdentity.conversationId).length;
+
+  for (const prompt of ["two", "three", "four"]) {
+    const started = manager.startRun(ctx, [{ kind: "spawn", agent: "worker", prompt }] as any);
+    await started.completion;
+  }
+
+  expect(statusUpdates.filter(id => id === firstIdentity.conversationId)).toHaveLength(stoppingStatusCount);
+  expect(panes.get("one")!.close).not.toHaveBeenCalled();
+  expect(panes.get("two")!.close).not.toHaveBeenCalled();
+  expect(panes.get("three")!.close).not.toHaveBeenCalled();
+  expect(panes.get("four")!.close).not.toHaveBeenCalled();
+  expect(panes.get("active")!.close).not.toHaveBeenCalled();
+  expect(closeOrder).toEqual([]);
+
+  releaseStopping();
+  await first.completion;
+  expect(statusUpdates.filter(id => id === firstIdentity.conversationId)).toHaveLength(stoppingStatusCount + 1);
+  expect(panes.get("one")!.close).not.toHaveBeenCalled();
+  expect(panes.get("two")!.close).toHaveBeenCalledOnce();
+  expect(panes.get("three")!.close).not.toHaveBeenCalled();
+  expect(closeOrder).toEqual(["two"]);
+
+  releaseActive();
+  await active.completion;
+  expect(panes.get("one")!.close).not.toHaveBeenCalled();
+  expect(panes.get("two")!.close).toHaveBeenCalledOnce();
+  expect(panes.get("three")!.close).toHaveBeenCalledOnce();
+  expect(panes.get("four")!.close).not.toHaveBeenCalled();
+  expect(panes.get("active")!.close).not.toHaveBeenCalled();
+  expect(closeOrder).toEqual(["two", "three"]);
+});
+
+test("opening an evicted terminal pane refreshes recency and closes the oldest retained pane", async () => {
+  const panes = new Map<string, { surface: string; send: ReturnType<typeof vi.fn>; interrupt: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> }>();
+  const fixture = await makeTerminalFixture({
+    runner: async (agent, attempt) => {
+      const pane = { surface: `surface-${attempt.prompt}`, send: vi.fn(), interrupt: vi.fn(), close: vi.fn() };
+      panes.set(attempt.prompt, pane);
+      agent.setSessionFile(path.resolve(`packages/subagent/.runtime-${attempt.prompt}.jsonl`));
+      agent.setEffectiveConfig({ cwd: path.resolve("packages/subagent"), skills: [], tools: [] });
+      agent.bindExecution(pane);
+      return completedRun(agent, attempt.runId, attempt.prompt);
+    },
+  });
+  for (const prompt of ["two", "three", "four"]) {
+    const started = fixture.manager.startRun(ctx, [{ kind: "spawn", agent: "worker", prompt }] as any);
+    await started.completion;
+  }
+
+  expect(panes.get("terminal")!.close).toHaveBeenCalledOnce();
+  expect(panes.get("two")!.close).not.toHaveBeenCalled();
+  await expect(fixture.manager.openConversationPane(fixture.conversationId)).resolves.toMatchObject({
+    status: "reopened",
+    surface: "reopened-surface",
+  });
+
+  expect(fixture.probe).toHaveBeenCalledWith("surface-terminal");
+  expect(panes.get("terminal")!.close).toHaveBeenCalledTimes(2);
+  expect(panes.get("two")!.close).toHaveBeenCalledOnce();
+  expect(panes.get("three")!.close).not.toHaveBeenCalled();
+  expect(panes.get("four")!.close).not.toHaveBeenCalled();
+  expect(fixture.reopened.close).not.toHaveBeenCalled();
+});

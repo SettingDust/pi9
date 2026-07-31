@@ -17,6 +17,9 @@ import { readPaneActivity } from "./pane-activity.js";
 
 const ownExtensionPath = fileURLToPath(new URL("./index.ts", import.meta.url));
 const paneChildExtensionPath = fileURLToPath(new URL("./pane-child.ts", import.meta.url));
+const FINAL_ACTIVITY_DRAIN_INTERVAL_MS = 25;
+const FINAL_ACTIVITY_DRAIN_POLLS = 40;
+const FINAL_ACTIVITY_EVENTS = new Set(["agent_end", "session_shutdown", "subagent_done", "caller_ping"]);
 export async function discoverInheritedExtensionPaths(cwd: string, agentDir: string): Promise<string[]> {
   const settingsManager = SettingsManager.create(cwd, agentDir);
   await settingsManager.reload();
@@ -54,6 +57,7 @@ getPiInvocation: () => { command: string; args: string[] };
   launchPaneExecution: typeof launchPaneExecution;
   observePaneCompletion: typeof observePaneCompletion;
   readSessionFile: typeof readFileSync;
+sleep: (milliseconds: number) => Promise<void>;
   ownExtensionPath: string;
   [legacyDependency: string]: unknown;
 }
@@ -66,6 +70,7 @@ getPiInvocation: resolveCurrentPiInvocation,
   launchPaneExecution,
   observePaneCompletion,
   readSessionFile: readFileSync,
+sleep: milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
   ownExtensionPath,
 };
 export function resolveCurrentPiInvocation(): { command: string; args: string[] } {
@@ -106,7 +111,7 @@ export async function executeRun(
   const requestedThinking = requestedConfig.thinking;
   const parentSession = ctx.sessionManager?.getSessionFile();
   const childSessionDir = parentSession
-    ? path.join(path.dirname(parentSession), path.basename(parentSession, path.extname(parentSession)))
+    ? path.join(path.dirname(parentSession), path.basename(parentSession, path.extname(parentSession)), "tasks")
     : undefined;
   const childSession = run.kind === "spawn"
     ? dependencies.sessionManager(cwd, childSessionDir, parentSession ? { parentSession } : undefined)
@@ -157,6 +162,7 @@ if (signal?.aborted) return skippedRun(agent, run.runId);
   let execution: PaneExecutionHandle;
   try {
 execution = await dependencies.launchPaneExecution({
+displayName: agent.label?.trim() || agent.agentName,
       cwd,
       sessionFile,
       prompt,
@@ -177,24 +183,42 @@ agent.bindExecution(execution);
 
   try {
 let activitySequence = 0;
+    const observeActivity = () => {
+      const activity = readPaneActivity(activityFile, run.runId);
+      if (!activity || activity.sequence <= activitySequence) return;
+      activitySequence = activity.sequence;
+      agent.observePaneActivity(run.runId, activity);
+      return activity;
+    };
     const observation = await dependencies.observePaneCompletion({
       handle: execution,
       ...(signal ? { signal } : {}),
-onTick: () => {
-        const activity = readPaneActivity(activityFile, run.runId);
-        if (!activity || activity.sequence <= activitySequence) return;
-        activitySequence = activity.sequence;
-        agent.observePaneActivity(activity);
-      },
+      onTick: observeActivity,
     });
-    if (isRunDone(run)) return existingRun(agent, run);
-if (observation.status === "cancelled") return interruptedRun(agent, run.runId, "Agent interrupted.");
+    observeActivity();
+    const activitySequenceAtCompletion = activitySequence;
+    if (isRunDone(run)) {
+      await drainFinalActivity(observeActivity, activitySequenceAtCompletion, dependencies.sleep);
+      return existingRun(agent, run);
+    }
+    if (observation.status === "cancelled") return interruptedRun(agent, run.runId, "Agent interrupted.");
     return completeFromPane(agent, run, observation.completion, sessionFile, dependencies.readSessionFile);
   } catch (error) {
     if (isRunDone(run)) return existingRun(agent, run);
     return signal?.aborted
       ? interruptedRun(agent, run.runId, errorMessage(error))
       : errorRun(agent, run.runId, errorMessage(error));
+  }
+}
+async function drainFinalActivity(
+  observeActivity: () => ReturnType<typeof readPaneActivity>,
+  sequenceAtCompletion: number,
+  sleep: (milliseconds: number) => Promise<void>,
+): Promise<void> {
+  for (let poll = 0; poll < FINAL_ACTIVITY_DRAIN_POLLS; poll++) {
+    await sleep(FINAL_ACTIVITY_DRAIN_INTERVAL_MS);
+    const activity = observeActivity();
+    if (activity && activity.sequence > sequenceAtCompletion && FINAL_ACTIVITY_EVENTS.has(activity.latestEvent)) return;
   }
 }
 

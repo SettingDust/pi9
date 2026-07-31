@@ -26,8 +26,8 @@ async function paneFixture(skills: string[] = []) {
   const root = await mkdtemp(path.join(tmpdir(), "pi9-pane-execute-"));
   roots.push(root);
   const parentSession = path.join(root, "parent.jsonl");
-  const childDir = parentSession.slice(0, -".jsonl".length);
-  const childSession = path.join(childDir, "child.jsonl");
+  const tasksDir = path.join(parentSession.slice(0, -".jsonl".length), "tasks");
+  const childSession = path.join(tasksDir, "child.jsonl");
   await writeFile(parentSession, "{}\n");
 
   const handle: PaneExecutionHandle = {
@@ -67,7 +67,7 @@ getPiInvocation: () => ({ command: "C:\\runtime\\node.exe", args: ["C:\\pi\\cli.
     sessionManager: { getSessionFile: () => parentSession },
   } as any;
 
-  return { root, parentSession, childDir, childSession, handle, launchPaneExecution, observePaneCompletion, sessionManager, dependencies, agent, ctx };
+  return { root, parentSession, tasksDir, childSession, handle, launchPaneExecution, observePaneCompletion, sessionManager, dependencies, agent, ctx };
 }
 
 test("spawns a pane-owned run with a seeded child session under the parent", async () => {
@@ -76,7 +76,8 @@ test("spawns a pane-owned run with a seeded child session under the parent", asy
   const result = await executeRun(f.ctx, f.agent, f.agent.requireCurrentRun(), undefined, f.dependencies);
 
   expect(result.status).toMatchObject({ kind: "done", outcome: "completed", output: "finished" });
-  expect(f.sessionManager).toHaveBeenCalledWith(f.root, f.childDir, { parentSession: f.parentSession });
+  expect(f.sessionManager).toHaveBeenCalledWith(f.root, f.tasksDir, { parentSession: f.parentSession });
+  expect(`${path.dirname(f.tasksDir)}.jsonl`).toBe(f.parentSession);
   expect(f.agent.snapshot().sessionFile).toBe(f.childSession);
   await expect(import("node:fs/promises").then(fs => fs.readFile(f.childSession, "utf8"))).resolves.toContain('"version":3');
   expect(f.launchPaneExecution).toHaveBeenCalledWith(expect.objectContaining({
@@ -89,6 +90,95 @@ test("spawns a pane-owned run with a seeded child session under the parent", asy
 piInvocation: { command: "C:\\runtime\\node.exe", args: ["C:\\pi\\cli.js"] },
   }));
   expect(f.observePaneCompletion).toHaveBeenCalledWith({ handle: f.handle, onTick: expect.any(Function) });
+});
+test("consumes final pane activity when completion resolves before the first tick", async () => {
+  const f = await paneFixture();
+  const usage = {
+    input: 12, output: 3, cacheRead: 4, cacheWrite: 0, totalTokens: 19,
+    cost: { input: 0.12, output: 0.03, cacheRead: 0.01, cacheWrite: 0, total: 0.16 },
+  };
+  f.observePaneCompletion.mockImplementationOnce(async () => {
+    await writeFile(`${f.childSession}.activity.json`, `${JSON.stringify({
+      version: 1,
+      runningChildId: f.agent.requireCurrentRun().runId,
+      sequence: 1,
+      updatedAt: Date.now(),
+      latestEvent: "turn_end",
+      phase: "active",
+      turnIndex: 0,
+      usage,
+    })}\n`);
+    return { status: "completed", completion: { type: "done" } } as const;
+  });
+
+  const result = await executeRun(f.ctx, f.agent, f.agent.requireCurrentRun(), undefined, f.dependencies);
+
+  expect(result.status).toMatchObject({ kind: "done", outcome: "completed", output: "finished" });
+  expect(result.activity.turns).toBe(1);
+  expect(result.usage).toEqual(usage);
+});
+test("drains newer terminal pane activity after synthetic cancellation", async () => {
+  const f = await paneFixture();
+  const run = f.agent.requireCurrentRun();
+  const staleUsage = {
+    input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+    cost: { input: 0.01, output: 0.01, cacheRead: 0, cacheWrite: 0, total: 0.02 },
+  };
+  const finalUsage = {
+    input: 21, output: 5, cacheRead: 2, cacheWrite: 1, totalTokens: 29,
+    cost: { input: 0.21, output: 0.05, cacheRead: 0.02, cacheWrite: 0.01, total: 0.29 },
+  };
+  let resolveObservation!: (observation: { status: "cancelled" }) => void;
+  const observation = new Promise<{ status: "cancelled" }>(resolve => { resolveObservation = resolve; });
+  f.observePaneCompletion.mockImplementationOnce(() => observation as any);
+
+  const executing = executeRun(f.ctx, f.agent, run, undefined, f.dependencies);
+  await vi.waitFor(() => expect(f.observePaneCompletion).toHaveBeenCalledOnce());
+  await writeFile(`${f.childSession}.activity.json`, `${JSON.stringify({
+    version: 1,
+    runningChildId: run.runId,
+    sequence: 7,
+    updatedAt: Date.now(),
+    latestEvent: "agent_end",
+    phase: "waiting",
+    usage: staleUsage,
+  })}\n`);
+
+  const aborting = f.agent.abort();
+  expect(run.state.kind).toBe("done");
+  expect(f.agent.snapshot().currentRun).toBeUndefined();
+  resolveObservation({ status: "cancelled" });
+
+  let publishTimer: ReturnType<typeof setTimeout> | undefined;
+  const published = new Promise<"published">((resolve, reject) => {
+    publishTimer = setTimeout(() => {
+      void writeFile(`${f.childSession}.activity.json`, `${JSON.stringify({
+        version: 1,
+        runningChildId: run.runId,
+        sequence: 8,
+        updatedAt: Date.now(),
+        latestEvent: "session_shutdown",
+        phase: "done",
+        turnIndex: 0,
+        usage: finalUsage,
+      })}\n`).then(() => resolve("published"), reject);
+    }, 10);
+  });
+
+  try {
+    await expect(Promise.race([executing.then(() => "settled" as const), published])).resolves.toBe("published");
+    const result = await executing;
+    f.agent.executionSettled(run.runId);
+    await aborting;
+
+    expect(result.status).toMatchObject({ kind: "done", outcome: "aborted", error: "Agent aborted." });
+    expect(result.activity.turns).toBe(1);
+    expect(result.usage).toEqual(finalUsage);
+    expect(result.usage).not.toEqual(staleUsage);
+    expect(f.agent.runHistory).toEqual([result]);
+  } finally {
+    if (publishTimer) clearTimeout(publishTimer);
+  }
 });
 
 test("resumes the same session in a new pane", async () => {

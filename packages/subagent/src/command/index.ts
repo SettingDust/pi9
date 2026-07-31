@@ -79,6 +79,15 @@ export function registerSubagentsCommand(
                 notify(ctx, `Started run ${start.runId} in conversation ${conversationId}.`, "info");
               }
             },
+            onOpenPane: async conversationId => {
+              try {
+                const result = await runtime.openConversationPane(conversationId);
+                if (result.status === "reopened") notify(ctx, `Reopened conversation pane ${conversationId}.`, "info");
+                else notify(ctx, `Conversation pane ${conversationId} is already open; exact pane focus is unavailable.`, "info");
+              } catch (error) {
+                notify(ctx, `Could not open conversation pane ${conversationId}: ${errorMessage(error)}`, "warning");
+              }
+            },
             onCancel: async runId => {
               try {
                 await runtime.cancelRun(runId as any);

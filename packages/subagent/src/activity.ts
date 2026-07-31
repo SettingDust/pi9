@@ -7,6 +7,13 @@ const DefaultUsage: Usage = {
   input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
 }
+function isUsage(value: unknown): value is Usage {
+  const usage = asRecord(value);
+  const cost = usage && asRecord(usage.cost);
+  return Boolean(usage && cost
+    && ["input", "output", "cacheRead", "cacheWrite", "totalTokens"].every(key => typeof usage[key] === "number")
+    && ["input", "output", "cacheRead", "cacheWrite", "total"].every(key => typeof cost[key] === "number"));
+}
 
 export type RunActivityListener = (kind: ConversationUpdateKind) => void;
 
@@ -19,7 +26,7 @@ export class RunActivity {
   private _compactions: number = 0;
   private _latestUsage: Usage = DefaultUsage;
   private _nextSyntheticToolId = 0;
-private _paneSequence = 0;
+  private _paneSequence = 0;
   private _paneTurnIndex = 0;
 
   constructor(
@@ -86,6 +93,20 @@ private _paneSequence = 0;
 observePane(activity: PaneActivityState): void {
     if (activity.sequence <= this._paneSequence) return;
     this._paneSequence = activity.sequence;
+    const turnIndex = activity.turnIndex;
+    if (typeof turnIndex === "number" && Number.isInteger(turnIndex) && turnIndex >= 0) {
+      const nextTurn = turnIndex + 1;
+      if (nextTurn > this._paneTurnIndex) {
+        this._turns += nextTurn - this._paneTurnIndex;
+        this._paneTurnIndex = nextTurn;
+        this.onChange("turn");
+      }
+    }
+    const paneUsage = activity.usage;
+    if (isUsage(paneUsage)) {
+      this._latestUsage = paneUsage;
+      this.onChange("usage");
+    }
     if (activity.latestEvent === "agent_start" || activity.latestEvent === "turn_start") this._setPhase("thinking");
     else if (activity.latestEvent === "message_update") this._setPhase("responding");
     else if (activity.latestEvent === "agent_end") this._setPhase("settling");
@@ -97,13 +118,10 @@ observePane(activity: PaneActivityState): void {
       this._finishToolUse({ toolCallId: activity.toolCallId, toolName: activity.toolName });
       this._setPhase(this._toolHistory.some(tool => tool.completedAt === undefined) ? "executing_tool" : "thinking");
       this.onChange("tool");
-    } else if (activity.latestEvent === "turn_end") {
-      const nextTurn = activity.turnIndex ?? this._paneTurnIndex + 1;
-      if (nextTurn > this._paneTurnIndex) {
-        this._turns += nextTurn - this._paneTurnIndex;
-        this._paneTurnIndex = nextTurn;
-        this.onChange("turn");
-      }
+    } else if (activity.latestEvent === "turn_end" && turnIndex === undefined) {
+      this._paneTurnIndex += 1;
+      this._turns += 1;
+      this.onChange("turn");
     }
   }
 

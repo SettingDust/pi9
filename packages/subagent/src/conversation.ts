@@ -114,6 +114,7 @@ export interface ConversationSnapshot {
 }
 export interface RunExecutionControl {
   send(text: string): void | Promise<void>;
+  readonly surface?: string;
   interrupt(): void | Promise<void>;
   close(): void;
 }
@@ -244,7 +245,7 @@ export class Conversation {
   private stopping?: { runId: RunId; abortSettled: boolean; executionSettled: boolean };
   private steerTail: Promise<void> = Promise.resolve();
   private unsubscribe?: () => void;
-private retainedExecution?: RunExecutionControl;
+  private retainedExecution?: RunExecutionControl;
   private effectiveConfig?: ConversationEffectiveConfig;
 
   constructor(
@@ -273,6 +274,9 @@ private retainedExecution?: RunExecutionControl;
   get runHistory(): readonly RunSnapshot[] { return this.runs.map(run => this.project(run)); }
   get latestRunId(): RunId { return this.runs[this.runs.length - 1].runId; }
   get status(): RunViewStatus { return this.project(this.runs[this.runs.length - 1]).status; }
+  get persistedSessionFile(): string | undefined { return this.sessionFile; }
+  get retainedSurface(): string | undefined { return this.retainedExecution?.surface; }
+  get retainedControl(): RunExecutionControl | undefined { return this.retainedExecution; }
   get canResume(): boolean {
     const latest = this.runs.at(-1);
     return !this.currentRun && !this.stopping && !!this.sessionFile && latest?.state.kind === "done" &&
@@ -288,7 +292,7 @@ private retainedExecution?: RunExecutionControl;
   beginResume(runId: RunId, prompt: string): Run {
     if (!this.canResume) throw new Error(`Conversation ${this.conversationId} cannot be resumed.`);
     if (this.runs.some(run => run.runId === runId)) throw new Error(`Run ${runId} already exists.`);
-this.closeRetainedPane();
+    this.closeRetainedPane();
     const run = this.newRun(runId, "resume", prompt);
     this.runs.push(run);
     this.currentRun = run;
@@ -306,8 +310,11 @@ bindExecution(session: RunExecutionControl): void {
     run.attach(session);
     this.listener(this, "status");
   }
-observePaneActivity(activity: import("./pane-activity.js").PaneActivityState): void {
-    this.requireCurrentRun().activity.observePane(activity);
+observePaneActivity(activity: import("./pane-activity.js").PaneActivityState): void;
+  observePaneActivity(runId: RunId, activity: import("./pane-activity.js").PaneActivityState): void;
+  observePaneActivity(runIdOrActivity: RunId | import("./pane-activity.js").PaneActivityState, activity?: import("./pane-activity.js").PaneActivityState): void {
+    const run = activity ? this.requireRun(runIdOrActivity as RunId) : this.requireCurrentRun();
+    run.activity.observePane(activity ?? runIdOrActivity as import("./pane-activity.js").PaneActivityState);
   }
 /** Compatibility adapter for existing SDK-focused unit tests; production execution binds pane controls. */
   bindSession(session: AgentSession): void {
@@ -317,12 +324,18 @@ observePaneActivity(activity: import("./pane-activity.js").PaneActivityState): v
       close: () => session.dispose?.(),
     });
     this.unsubscribe = this.requireCurrentRun().activity.subscribe(session);
-if (!this.sessionFile) this.sessionFile = `sdk-test://${this.conversationId}`;
+    if (!this.sessionFile) this.sessionFile = `sdk-test://${this.conversationId}`;
   }
   setSessionFile(sessionFile: string | undefined): void { this.sessionFile = sessionFile; }
   get isStopping(): boolean { return this.stopping !== undefined; }
   reparent(parent?: ParentRun): void { this.parent = parent; }
-closeRetainedPane(): void {
+  replaceRetainedExecution(execution: RunExecutionControl): void {
+    const previous = this.retainedExecution;
+    this.retainedExecution = execution;
+    if (previous === execution) return;
+    try { previous?.close(); } catch { /* pane may already have been closed manually */ }
+  }
+  closeRetainedPane(): void {
     const execution = this.retainedExecution;
     this.retainedExecution = undefined;
     try { execution?.close(); } catch { /* pane may already have been closed manually */ }
@@ -385,12 +398,15 @@ const session = run.state.session;
     this.stopping = { runId: run.runId, abortSettled: false, executionSettled: false };
 const runningSession = run.state.kind === "running" ? run.state.session : undefined;
     this.settle(run.runId, { status: "aborted", error: reason });
-    const aborting = Promise.resolve(runningSession?.interrupt()).catch(() => undefined);
-    await this.steerTail;
-    await aborting;
-    if (this.stopping?.runId === run.runId) {
-      this.stopping.abortSettled = true;
-      this.finishStopping(run.runId);
+const aborting = Promise.resolve().then(() => runningSession?.interrupt()).catch(() => undefined);
+    try {
+      await this.steerTail;
+      await aborting;
+    } finally {
+      if (this.stopping?.runId === run.runId) {
+        this.stopping.abortSettled = true;
+        this.finishStopping(run.runId);
+      }
     }
   }
 

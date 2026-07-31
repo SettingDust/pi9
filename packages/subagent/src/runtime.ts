@@ -1,10 +1,16 @@
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { AgentRegistry, resolveRequestedConfig } from "./agents.js";
 import { Conversation, errorRun, interruptedRun, skippedRun, type ConversationSnapshot, type ConversationUpdateKind, type NestedJoinTargetSnapshot, type ParentRun, type Run, type RunSnapshot, type SteerReceipt } from "./conversation.js";
-import { executeRun, resolveModel, resolveTaskCwd } from "./execute.js";
+import { DEFAULT_EXECUTE_RUN_DEPENDENCIES, executeRun, resolveModel, resolveTaskCwd } from "./execute.js";
+import { reopenPaneExecution, retainedHerdrPaneExists } from "./pane-execution.js";
 import { ConversationIdAllocator, RunIdAllocator, type ConversationId, type RunId } from "./identifiers.js";
 import type { SpawnRequest, ResumeRequest } from "./schema.js";
 import { timingStart } from "./timing.js";
+
+const paneChildExtensionPath = fileURLToPath(new URL("./pane-child.ts", import.meta.url));
+const MAX_RETAINED_TERMINAL_PANES = 3;
 
 /**
  * Lets a queued task voluntarily yield its slot while awaiting work that itself
@@ -222,6 +228,27 @@ export interface RemoveResult { removed: number; conversationIds: ConversationId
 export interface CancelResult { readonly conversationId: ConversationId; readonly runId: RunId; readonly status: "aborted" }
 export interface SteerResult { readonly conversationId: ConversationId; readonly runId: RunId; readonly steer: SteerReceipt }
 export interface InspectedRun { readonly conversationId: ConversationId; readonly snapshot: RunSnapshot }
+export type OpenConversationPaneResult =
+  | { readonly conversationId: ConversationId; readonly status: "already_open"; readonly surface: string; readonly message: string }
+  | { readonly conversationId: ConversationId; readonly status: "reopened"; readonly surface: string; readonly message: string };
+
+export interface OpenConversationPaneDependencies {
+  retainedHerdrPaneExists: (surface: string) => Promise<boolean | undefined>;
+  reopenPaneExecution: typeof reopenPaneExecution;
+  getPiInvocation: () => { command: string; args: string[] };
+  getAgentDir: typeof DEFAULT_EXECUTE_RUN_DEPENDENCIES.getAgentDir;
+  loadExtensionPaths: typeof DEFAULT_EXECUTE_RUN_DEPENDENCIES.loadExtensionPaths;
+  ownExtensionPath: string;
+}
+
+const DEFAULT_OPEN_CONVERSATION_PANE_DEPENDENCIES: OpenConversationPaneDependencies = {
+  retainedHerdrPaneExists,
+  reopenPaneExecution,
+  getPiInvocation: DEFAULT_EXECUTE_RUN_DEPENDENCIES.getPiInvocation,
+  getAgentDir: DEFAULT_EXECUTE_RUN_DEPENDENCIES.getAgentDir,
+  loadExtensionPaths: DEFAULT_EXECUTE_RUN_DEPENDENCIES.loadExtensionPaths,
+  ownExtensionPath: DEFAULT_EXECUTE_RUN_DEPENDENCIES.ownExtensionPath,
+};
 
 type JoinStatus = ConversationSnapshot["runs"][number]["status"];
 type RunRecord = {
@@ -242,8 +269,17 @@ export class SubagentRuntime {
   private readonly conversationIds = new ConversationIdAllocator();
   private readonly runIds = new RunIdAllocator();
   private readonly _scheduler: RunScheduler;
+  private readonly openingPanes = new Map<ConversationId, Promise<OpenConversationPaneResult>>();
+  private readonly retainedTerminalPanes: ConversationId[] = [];
+  private readonly retainedTerminalRunIds = new Map<ConversationId, RunId>();
 
-  constructor(readonly registry: AgentRegistry, maxRunning = 4, executor?: RunExecutor, private _maxConversations = 100) {
+  constructor(
+    readonly registry: AgentRegistry,
+    maxRunning = 4,
+    executor?: RunExecutor,
+    private _maxConversations = 100,
+    private readonly openPaneDependencies: OpenConversationPaneDependencies = DEFAULT_OPEN_CONVERSATION_PANE_DEPENDENCIES,
+  ) {
     this._scheduler = new RunScheduler({ maxRunning, ...(executor ? { executor } : {}), isTracked: id => this.conversations.has(id as ConversationId) });
   }
   get scheduler(): RunScheduler { return this._scheduler; }
@@ -285,6 +321,7 @@ export class SubagentRuntime {
       } else {
         agent = this.conversations.get(task.conversationId);
         if (!agent) error = `Unknown conversation: ${task.conversationId}.`;
+        else if (this.openingPanes.has(agent.conversationId)) error = `Conversation ${task.conversationId} pane is reopening. Wait before resuming.`;
         else if (agent.hasCurrentRun) {
           const status = agent.status.kind;
           if (status === "running") error = `Conversation ${task.conversationId} has running run ${agent.latestRunId}. Join it before resuming, or steer it while it runs.`;
@@ -292,7 +329,14 @@ export class SubagentRuntime {
           else error = `Conversation ${task.conversationId} cannot be resumed.`;
         }
         else if (!agent.canResume) error = this.resumeError(agent);
-        else { runId = this.runIds.allocate(); if (!runId) error = "Run ID space exhausted."; else agent.beginResume(runId, task.prompt); }
+        else {
+          runId = this.runIds.allocate();
+          if (!runId) error = "Run ID space exhausted.";
+          else {
+            this.forgetRetainedTerminalPane(agent.conversationId);
+            agent.beginResume(runId, task.prompt);
+          }
+        }
       }
       if (!agent || !runId || error) { starts.push({ ok: false, inputIndex, error: error ?? "Could not start run." }); continue; }
       this.runs.set(runId, {
@@ -416,6 +460,82 @@ export class SubagentRuntime {
     if (live) return { conversationId, ...(live.label ? { label: live.label } : {}), agentName: live.agentName };
     throw new Error(`Unknown conversation: ${conversationId}.`);
   }
+
+  openConversationPane(conversationId: string): Promise<OpenConversationPaneResult> {
+    const agent = this.requireConversation(conversationId);
+    const pending = this.openingPanes.get(agent.conversationId);
+    if (pending) return pending;
+    const opening = this.openTerminalConversationPane(agent);
+    this.openingPanes.set(agent.conversationId, opening);
+    void opening.finally(() => {
+      if (this.openingPanes.get(agent.conversationId) === opening) this.openingPanes.delete(agent.conversationId);
+    }).catch(() => undefined);
+    return opening;
+  }
+
+  private async openTerminalConversationPane(agent: Conversation): Promise<OpenConversationPaneResult> {
+    if (agent.hasCurrentRun || agent.status.kind !== "done") {
+      throw new Error(`Conversation ${agent.conversationId} is not terminal.`);
+    }
+    const sessionFile = agent.persistedSessionFile;
+    if (!sessionFile || !(path.posix.isAbsolute(sessionFile) || path.win32.isAbsolute(sessionFile))) {
+      throw new Error(`Conversation ${agent.conversationId} has no persisted absolute session file.`);
+    }
+    const retained = agent.retainedControl;
+    const surface = retained?.surface;
+    if (!retained || !surface) throw new Error(`Conversation ${agent.conversationId} has no retained pane control.`);
+    const exists = await this.openPaneDependencies.retainedHerdrPaneExists(surface);
+    if (this.conversations.get(agent.conversationId) !== agent || agent.hasCurrentRun || agent.retainedControl !== retained) {
+      throw new Error(`Conversation ${agent.conversationId} changed while probing its pane.`);
+    }
+    if (typeof exists !== "boolean") {
+      throw new Error(`Conversation ${agent.conversationId} pane existence cannot be determined for this terminal backend; refusing to launch a second writer.`);
+    }
+    if (exists) {
+      this.retainTerminalPane(agent, true);
+      return {
+        conversationId: agent.conversationId,
+        status: "already_open",
+        surface,
+        message: "Conversation pane is already open; exact pane focus is unavailable.",
+      };
+    }
+
+    const cwd = agent.snapshot().effectiveConfig?.cwd;
+    if (!cwd) throw new Error(`Conversation ${agent.conversationId} has no effective working directory.`);
+    const extensionPaths = [...new Set([
+      ...await this.openPaneDependencies.loadExtensionPaths(cwd, this.openPaneDependencies.getAgentDir()),
+      this.openPaneDependencies.ownExtensionPath,
+      paneChildExtensionPath,
+    ])];
+    if (this.conversations.get(agent.conversationId) !== agent || agent.hasCurrentRun || agent.retainedControl !== retained) {
+      throw new Error(`Conversation ${agent.conversationId} changed while preparing to reopen its pane.`);
+    }
+    const execution = await this.openPaneDependencies.reopenPaneExecution({
+      cwd,
+      sessionFile,
+      displayName: agent.label?.trim() || agent.agentName,
+      extensionPaths,
+      piInvocation: this.openPaneDependencies.getPiInvocation(),
+    });
+    if (this.conversations.get(agent.conversationId) !== agent || agent.hasCurrentRun || agent.retainedControl !== retained) {
+      try { execution.close(); } catch { /* preserve ownership error */ }
+      throw new Error(`Conversation ${agent.conversationId} changed while reopening its pane.`);
+    }
+    try {
+      agent.replaceRetainedExecution(execution);
+    } catch (error) {
+      try { execution.close(); } catch { /* preserve replacement error */ }
+      throw error;
+    }
+    this.retainTerminalPane(agent, true);
+    return {
+      conversationId: agent.conversationId,
+      status: "reopened",
+      surface: execution.surface,
+      message: "Conversation pane reopened.",
+    };
+  }
   directSpawnedChildren(runId: RunId): readonly RunIdentity[] {
     return [...this.runs.values()].filter(value => value.parentRunId === runId).map(value => ({ runId: value.runId, conversationId: value.conversationId, parentRunId: runId }));
   }
@@ -478,6 +598,10 @@ export class SubagentRuntime {
     for (const id of unique) {
       const agent = this.conversations.get(id as ConversationId);
       if (!agent) { errors.push({ conversationId: id, error: `Unknown conversation: ${id}.` }); continue; }
+      if (this.openingPanes.has(agent.conversationId)) {
+        errors.push({ conversationId: id, error: `Conversation ${id} pane is reopening. Wait before removal.` });
+        continue;
+      }
       if (agent.hasCurrentRun) {
         errors.push({
           conversationId: id,
@@ -485,8 +609,10 @@ export class SubagentRuntime {
         });
         continue;
       }
+      this.forgetRetainedTerminalPane(agent.conversationId);
+      this.retainedTerminalRunIds.delete(agent.conversationId);
       this.contractOwnership(agent);
-agent.closeRetainedPane();
+      agent.closeRetainedPane();
       this.conversations.delete(agent.conversationId);
       for (const run of agent.runHistory) this.runs.delete(run.runId);
       removed.push(agent.conversationId);
@@ -516,8 +642,39 @@ agent.closeRetainedPane();
     return `Conversation ${agent.conversationId} cannot be resumed.`;
   }
   private capacityError(): string { const removable = [...this.conversations.values()].filter(a => !a.hasCurrentRun).map(a => a.conversationId); return `Conversation capacity (${this.maxConversations}) reached. Remove terminal conversations${removable.length ? `: ${removable.join(", ")}` : " before spawning more"}.`; }
+
+  private retainTerminalPane(agent: Conversation, refresh = false): void {
+    if (this.conversations.get(agent.conversationId) !== agent || agent.hasCurrentRun || agent.isStopping || agent.status.kind !== "done" || !agent.retainedControl) {
+      this.forgetRetainedTerminalPane(agent.conversationId);
+      if (agent.isStopping) this.retainedTerminalRunIds.delete(agent.conversationId);
+      return;
+    }
+    if (!refresh && this.retainedTerminalRunIds.get(agent.conversationId) === agent.latestRunId) return;
+    this.retainedTerminalRunIds.set(agent.conversationId, agent.latestRunId);
+    this.forgetRetainedTerminalPane(agent.conversationId);
+    this.retainedTerminalPanes.push(agent.conversationId);
+    while (this.retainedTerminalPanes.length > MAX_RETAINED_TERMINAL_PANES) {
+      const oldestId = this.retainedTerminalPanes.shift()!;
+      const oldest = this.conversations.get(oldestId);
+      if (oldest?.isStopping) {
+        this.forgetRetainedTerminalPane(oldestId);
+        this.retainedTerminalRunIds.delete(oldestId);
+        continue;
+      }
+      if (!oldest || oldest.hasCurrentRun || oldest.status.kind !== "done") continue;
+      try { oldest.retainedControl?.close(); } catch { /* pane may already have been closed manually */ }
+    }
+  }
+  private forgetRetainedTerminalPane(conversationId: ConversationId): void {
+    let index: number;
+    while ((index = this.retainedTerminalPanes.indexOf(conversationId)) >= 0) this.retainedTerminalPanes.splice(index, 1);
+  }
   private updated(agent: Conversation, kind: ConversationUpdateKind): void {
     if (this.conversations.get(agent.conversationId) !== agent) return;
+    if (kind === "status") {
+      if (!agent.hasCurrentRun && agent.status.kind === "done" && agent.retainedControl) this.retainTerminalPane(agent);
+      else if (agent.hasCurrentRun || !agent.retainedControl) this.forgetRetainedTerminalPane(agent.conversationId);
+    }
     for (const listener of this.listeners) listener(agent, kind);
   }
 }
