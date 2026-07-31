@@ -30,6 +30,7 @@ const MAX_LISTED_COMPLETIONS = 20;
 const COMPLETION_GRACE_MS = 500;
 const TERMINAL_RUN_STATUSES = new Set<unknown>(["completed", "error", "aborted", "interrupted", "skipped"]);
 const RESULTS_INSTRUCTION = "Use `subagent join` when you need these terminal outcomes.";
+const COMPLETION_NOTIFICATION_REMINDER = "A subagent finished. Use `subagent join` to retrieve its terminal result when needed. If the result needs correction or follow-up, resume the same conversation.";
 
 type EntrySurface = "notification" | "renderer";
 
@@ -46,7 +47,7 @@ export function createCompletionNotificationMessage(
 ): CompletionNotificationMessagePayload {
   const completions = entries.map(copyCompletionNotification);
   return {
-    content: formatNotificationContent(completions, display),
+    content: formatModelNotificationContent(completions, display),
     details: { completions },
   };
 }
@@ -85,6 +86,15 @@ function formatNotificationContent(entries: readonly CompletionNotification[], d
   lines.push("");
   lines.push(RESULTS_INSTRUCTION);
   return [header, ...lines].join("\n");
+}
+
+function formatModelNotificationContent(entries: readonly CompletionNotification[], display: SubagentDisplaySettings): string {
+  return [
+    "<system-reminder>",
+    COMPLETION_NOTIFICATION_REMINDER,
+    formatNotificationContent(entries, display),
+    "</system-reminder>",
+  ].join("\n");
 }
 
 function copyCompletionNotification(entry: CompletionNotification): CompletionNotification {

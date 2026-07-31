@@ -144,6 +144,7 @@ const activityFile = `${sessionFile}.activity.json`;
     PI_SUBAGENT_RUN_ID: run.runId,
 PI_SUBAGENT_COMPLETION_FILE: `${sessionFile}.exit`,
     PI_SUBAGENT_ACTIVITY_FILE: activityFile,
+    PI_SUBAGENT_SKILLS: JSON.stringify(requestedSkills),
     ...(agent.parent ? {
       PI_SUBAGENT_PARENT_CONVERSATION_ID: agent.parent.conversationId,
       PI_SUBAGENT_PARENT_RUN_ID: agent.parent.runId,

@@ -42,6 +42,7 @@ export interface PaneExecutionOptions {
   displayName?: string;
   extensionPaths: readonly string[];
   systemPrompt?: string;
+  /** Requested skills are resolved by the child extension before the first task turn. */
   skills?: readonly string[];
   tools?: readonly string[];
   model?: string;
@@ -110,11 +111,6 @@ export async function launchPaneExecution(options: PaneExecutionOptions): Promis
     const tools = [...new Set([...options.tools, "caller_ping", "subagent_done"])].join(",");
     args.push("--tools", tools);
     unixArgs.push({ value: "--tools", escaped: false }, { value: tools, escaped: true });
-  }
-  for (const skill of options.skills ?? []) {
-    const command = `/skill:${skill}`;
-    args.push(command);
-    unixArgs.push({ value: command, escaped: true });
   }
   args.push(options.prompt);
   unixArgs.push({ value: options.prompt, escaped: true });

@@ -47,7 +47,7 @@ const mux = fakeMux();
 expect(sleep).toHaveBeenCalledWith(500);
     expect(mux.sendLongCommand).toHaveBeenCalledWith(
       "surface-1",
-      "cd [/work/project] && TOKEN=[secret] [C:\\runtime\\node.exe] [C:\\pi\\cli.js] --session [/sessions/child.jsonl] -e [/extensions/one.ts] --model [provider/model:high] --system-prompt [You are focused.] --tools [read,subagent_done,caller_ping] [/skill:review-correctness] [/skill:ponytail] [do the work]; echo '__SUBAGENT_DONE_'$?'__'",
+      "cd [/work/project] && TOKEN=[secret] [C:\\runtime\\node.exe] [C:\\pi\\cli.js] --session [/sessions/child.jsonl] -e [/extensions/one.ts] --model [provider/model:high] --system-prompt [You are focused.] --tools [read,subagent_done,caller_ping] [do the work]; echo '__SUBAGENT_DONE_'$?'__'",
     );
   });
 it("uses a native PowerShell launch script on Windows", async () => {
@@ -72,7 +72,8 @@ expect(script).toContain("& 'C:\\runtime\\node.exe' @arguments");
     expect(script).toContain("'C:\\pi\\cli.js'");
     expect(script).toContain("'--session'");
     expect(script).toContain("'/sessions/child.jsonl'");
-    expect(script).toContain("'/skill:review-correctness'");
+    expect(script).not.toContain("'/skill:review-correctness'");
+    expect(script).not.toContain("'/skill:ponytail'");
     expect(script).toContain("'do the work'");
     expect(script).toContain("Write-Output \"__SUBAGENT_DONE_${exitCode}__\"");
 expect(script).toContain("Remove-Item -LiteralPath $PSCommandPath");

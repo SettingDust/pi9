@@ -86,7 +86,7 @@ test("spawns a pane-owned run with a seeded child session under the parent", asy
     prompt: expect.stringContaining("call the subagent_done tool"),
     systemPrompt: "BASE",
     skills: ["review"],
-    env: expect.objectContaining({ PI_SUBAGENT_SESSION: f.childSession }),
+    env: expect.objectContaining({ PI_SUBAGENT_SESSION: f.childSession, PI_SUBAGENT_SKILLS: JSON.stringify(["review"]) }),
 piInvocation: { command: "C:\\runtime\\node.exe", args: ["C:\\pi\\cli.js"] },
   }));
   expect(f.observePaneCompletion).toHaveBeenCalledWith({ handle: f.handle, onTick: expect.any(Function) });

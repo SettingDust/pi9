@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -23,8 +23,9 @@ function fixture() {
     on: vi.fn((event: string, handler: (value?: any, ctx?: any) => void) => {
       handlers.set(event, [...(handlers.get(event) ?? []), handler]);
     }),
-    registerTool: vi.fn((tool: any) => tools.set(tool.name, tool)),
+registerTool: vi.fn((tool: any) => tools.set(tool.name, tool)),
     sendUserMessage: vi.fn(),
+    getCommands: vi.fn(() => []) as any,
   };
   process.env.PI_SUBAGENT_COMPLETION_FILE = "completion.exit";
   process.env.PI_SUBAGENT_RUN_ID = "run-1";
@@ -38,8 +39,40 @@ function fixture() {
     tools,
     emit,
     readActivity: () => JSON.parse(readFileSync(activityFile, "utf8")),
-  };
+    handlers,
+};
 }
+
+describe("pane child completion rendering", () => {
+  it("renders the supplied subagent_done result", () => {
+    const { tools } = fixture();
+    const renderCall = tools.get("subagent_done")?.renderCall;
+    expect(renderCall({ result: { summary: "finished" } }, {} as any, {} as any).text).toContain("summary");
+    expect(tools.get("caller_ping")?.renderCall).toBeUndefined();
+  });
+
+  it("loads all requested skills into every turn without extra prompt turns", () => {
+    const f = fixture();
+    const skillA = join(tmpdir(), `pi9-skill-a-${Date.now()}.md`);
+    const skillB = join(tmpdir(), `pi9-skill-b-${Date.now()}.md`);
+    writeFileSync(skillA, "---\nname: skill-a\ndescription: A\n---\nA instructions");
+    writeFileSync(skillB, "---\nname: skill-b\ndescription: B\n---\nB instructions");
+    fixtureCleanups.push(() => { rmSync(skillA, { force: true }); rmSync(skillB, { force: true }); });
+    f.pi.getCommands.mockReturnValue([
+      { name: "skill:skill-a", source: "skill", sourceInfo: { path: skillA, baseDir: tmpdir() } },
+      { name: "skill:skill-b", source: "skill", sourceInfo: { path: skillB, baseDir: tmpdir() } },
+    ]);
+    process.env.PI_SUBAGENT_SKILLS = JSON.stringify(["skill-a", "skill-b"]);
+    const event: any = [...(f.handlers.get("before_agent_start") ?? [])][0]({ systemPrompt: "base" });
+    expect(event.systemPrompt).toContain("A instructions");
+    expect(event.systemPrompt).toContain("B instructions");
+    expect(event.systemPrompt.match(/<skill /g)).toHaveLength(2);
+const followUp: any = [...(f.handlers.get("before_agent_start") ?? [])][0]({ systemPrompt: "next" });
+    expect(followUp.systemPrompt).toContain("A instructions");
+    expect(followUp.systemPrompt).toContain("B instructions");
+    expect(f.pi.getCommands).toHaveBeenCalledOnce();
+  });
+});
 
 describe("pane child activity", () => {
   it("forwards only assistant message usage", () => {
