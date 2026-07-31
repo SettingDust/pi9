@@ -10,7 +10,7 @@ import type { SpawnRequest, ResumeRequest } from "./schema.js";
 import { timingStart } from "./timing.js";
 
 const paneChildExtensionPath = fileURLToPath(new URL("./pane-child.ts", import.meta.url));
-const MAX_RETAINED_TERMINAL_PANES = 3;
+const TOTAL_RETAINED_PANE_BUDGET = 3;
 
 /**
  * Lets a queued task voluntarily yield its slot while awaiting work that itself
@@ -609,6 +609,13 @@ export class SubagentRuntime {
         });
         continue;
       }
+      if (agent.isStopping) {
+        errors.push({
+          conversationId: id,
+          error: `Conversation ${id} is still settling cancelled run ${agent.latestRunId}. Retry removal after cancellation finishes.`,
+        });
+        continue;
+      }
       this.forgetRetainedTerminalPane(agent.conversationId);
       this.retainedTerminalRunIds.delete(agent.conversationId);
       this.contractOwnership(agent);
@@ -653,15 +660,18 @@ export class SubagentRuntime {
     this.retainedTerminalRunIds.set(agent.conversationId, agent.latestRunId);
     this.forgetRetainedTerminalPane(agent.conversationId);
     this.retainedTerminalPanes.push(agent.conversationId);
-    while (this.retainedTerminalPanes.length > MAX_RETAINED_TERMINAL_PANES) {
+    this.trimRetainedTerminalPanes();
+  }
+
+  private trimRetainedTerminalPanes(): void {
+    const activePaneCount = [...this.conversations.values()]
+      .filter(agent => agent.retainedControl && (agent.hasCurrentRun || agent.isStopping))
+      .length;
+    const completedBudget = Math.max(0, TOTAL_RETAINED_PANE_BUDGET - activePaneCount);
+    while (this.retainedTerminalPanes.length > completedBudget) {
       const oldestId = this.retainedTerminalPanes.shift()!;
       const oldest = this.conversations.get(oldestId);
-      if (oldest?.isStopping) {
-        this.forgetRetainedTerminalPane(oldestId);
-        this.retainedTerminalRunIds.delete(oldestId);
-        continue;
-      }
-      if (!oldest || oldest.hasCurrentRun || oldest.status.kind !== "done") continue;
+      if (!oldest || oldest.hasCurrentRun || oldest.isStopping || oldest.status.kind !== "done") continue;
       try { oldest.retainedControl?.close(); } catch { /* pane may already have been closed manually */ }
     }
   }
@@ -674,6 +684,7 @@ export class SubagentRuntime {
     if (kind === "status") {
       if (!agent.hasCurrentRun && agent.status.kind === "done" && agent.retainedControl) this.retainTerminalPane(agent);
       else if (agent.hasCurrentRun || !agent.retainedControl) this.forgetRetainedTerminalPane(agent.conversationId);
+      this.trimRetainedTerminalPanes();
     }
     for (const listener of this.listeners) listener(agent, kind);
   }

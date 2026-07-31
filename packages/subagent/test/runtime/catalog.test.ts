@@ -382,6 +382,48 @@ test("removal rejects active conversations without changing their runs", async (
   await start.completion;
 });
 
+test("removal waits for cancelled execution to settle before closing its retained pane", async () => {
+  let releaseExecution!: () => void;
+  const executionGate = new Promise<void>(done => { releaseExecution = done; });
+  const close = vi.fn();
+  const controlled = async (_ctx: any, agent: any, attempt: any) => {
+    agent.bindExecution({ send() {}, interrupt() {}, close });
+    await executionGate;
+    return completedRun(agent, attempt.runId, attempt.prompt);
+  };
+  const manager = new SubagentRuntime(registry, 1, controlled);
+  const started = manager.startRun(ctx, [{ kind: "spawn", agent: "worker", prompt: "stop" }] as any);
+  const identity = started.starts[0] as any;
+  await new Promise(done => setImmediate(done));
+
+  await manager.cancelRun(identity.runId);
+  await expect(manager.removeConversations([identity.conversationId])).resolves.toEqual({
+    removed: 0,
+    conversationIds: [],
+    errors: [{
+      conversationId: identity.conversationId,
+      error: `Conversation ${identity.conversationId} is still settling cancelled run ${identity.runId}. Retry removal after cancellation finishes.`,
+    }],
+  });
+  expect(manager.conversation(identity.conversationId).runs).toHaveLength(1);
+  expect(manager.inspectRuns([identity.runId])[0]).toMatchObject({
+    conversationId: identity.conversationId,
+    snapshot: { runId: identity.runId, status: { kind: "done", outcome: "aborted" } },
+  });
+  expect(close).not.toHaveBeenCalled();
+
+  releaseExecution();
+  await started.completion;
+  await expect(manager.removeConversation(identity.conversationId)).resolves.toEqual({
+    removed: 1,
+    conversationIds: [identity.conversationId],
+    errors: [],
+  });
+  expect(manager.listConversations()).toEqual([]);
+  expect(() => manager.runSnapshot(identity.runId)).toThrow(`Unknown run: ${identity.runId}.`);
+  expect(close).toHaveBeenCalledOnce();
+});
+
 test("removing an intermediate conversation reparents descendant ownership", async () => {
   const releases = new Map<string, () => void>();
   const controlled = async (_ctx: any, agent: any, attempt: any) => {
@@ -1181,7 +1223,7 @@ test("resume and remove close a reopened pane through normal ownership cleanup",
   expect(removedFixture.reopened.close).toHaveBeenCalledOnce();
 });
 
-test("terminal pane retention waits for stopping execution, keeps the latest three, and ignores duplicate terminal status", async () => {
+test("terminal pane retention budgets around active and stopping panes without reopening evictions", async () => {
   let releaseActive!: () => void;
   let releaseStopping!: () => void;
   const activeGate = new Promise<void>(resolve => { releaseActive = resolve; });
@@ -1207,6 +1249,7 @@ test("terminal pane retention waits for stopping execution, keeps the latest thr
     if (kind === "status") statusUpdates.push(agent.conversationId);
   });
   const active = manager.startRun(ctx, [{ kind: "spawn", agent: "worker", prompt: "active" }] as any);
+  const activeIdentity = active.starts[0] as any;
   await new Promise(resolve => setImmediate(resolve));
   const first = manager.startRun(ctx, [{ kind: "spawn", agent: "worker", prompt: "one" }] as any);
   const firstIdentity = first.starts[0] as any;
@@ -1220,29 +1263,81 @@ test("terminal pane retention waits for stopping execution, keeps the latest thr
   }
 
   expect(statusUpdates.filter(id => id === firstIdentity.conversationId)).toHaveLength(stoppingStatusCount);
-  expect(panes.get("one")!.close).not.toHaveBeenCalled();
-  expect(panes.get("two")!.close).not.toHaveBeenCalled();
-  expect(panes.get("three")!.close).not.toHaveBeenCalled();
-  expect(panes.get("four")!.close).not.toHaveBeenCalled();
-  expect(panes.get("active")!.close).not.toHaveBeenCalled();
-  expect(closeOrder).toEqual([]);
-
-  releaseStopping();
-  await first.completion;
-  expect(statusUpdates.filter(id => id === firstIdentity.conversationId)).toHaveLength(stoppingStatusCount + 1);
-  expect(panes.get("one")!.close).not.toHaveBeenCalled();
-  expect(panes.get("two")!.close).toHaveBeenCalledOnce();
-  expect(panes.get("three")!.close).not.toHaveBeenCalled();
-  expect(closeOrder).toEqual(["two"]);
-
-  releaseActive();
-  await active.completion;
+  expect(manager.conversation(activeIdentity.conversationId).runs.at(-1)!.status.kind).toBe("running");
+  expect(manager.conversation(firstIdentity.conversationId).runs.at(-1)!.status).toMatchObject({ kind: "done", outcome: "aborted" });
   expect(panes.get("one")!.close).not.toHaveBeenCalled();
   expect(panes.get("two")!.close).toHaveBeenCalledOnce();
   expect(panes.get("three")!.close).toHaveBeenCalledOnce();
   expect(panes.get("four")!.close).not.toHaveBeenCalled();
   expect(panes.get("active")!.close).not.toHaveBeenCalled();
   expect(closeOrder).toEqual(["two", "three"]);
+
+  releaseStopping();
+  await first.completion;
+  expect(statusUpdates.filter(id => id === firstIdentity.conversationId)).toHaveLength(stoppingStatusCount + 1);
+  expect(panes.get("one")!.close).not.toHaveBeenCalled();
+  expect(panes.get("two")!.close).toHaveBeenCalledOnce();
+  expect(panes.get("three")!.close).toHaveBeenCalledOnce();
+  expect(panes.get("four")!.close).not.toHaveBeenCalled();
+  expect(closeOrder).toEqual(["two", "three"]);
+
+  releaseActive();
+  await active.completion;
+  expect(manager.conversation(activeIdentity.conversationId).runs.at(-1)!.status).toMatchObject({ kind: "done", outcome: "completed" });
+  expect(panes.get("active")!.close).not.toHaveBeenCalled();
+  expect(closeOrder).toEqual(["two", "three"]);
+});
+
+test("terminal pane budget tracks active pane counts zero through four", async () => {
+  const releases = new Map<string, () => void>();
+  const closeOrder: string[] = [];
+  const panes = new Map<string, { surface: string; send: ReturnType<typeof vi.fn>; interrupt: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> }>();
+  const controlled = async (_ctx: any, agent: any, attempt: any) => {
+    const pane = {
+      surface: `surface-${attempt.prompt}`,
+      send: vi.fn(),
+      interrupt: vi.fn(),
+      close: vi.fn(() => { closeOrder.push(attempt.prompt); }),
+    };
+    panes.set(attempt.prompt, pane);
+    agent.bindExecution(pane);
+    if (attempt.prompt.startsWith("active-")) {
+      await new Promise<void>(resolve => { releases.set(attempt.prompt, resolve); });
+    }
+    return completedRun(agent, attempt.runId, attempt.prompt);
+  };
+  const manager = new SubagentRuntime(registry, 8, controlled);
+
+  for (const prompt of ["completed-one", "completed-two", "completed-three"]) {
+    const started = manager.startRun(ctx, [{ kind: "spawn", agent: "worker", prompt }] as any);
+    await started.completion;
+  }
+  expect(closeOrder).toEqual([]);
+
+  const activeRuns: Array<{ prompt: string; handle: ReturnType<SubagentRuntime["startRun"]>; identity: any }> = [];
+  for (const [index, prompt] of ["active-one", "active-two", "active-three", "active-four"].entries()) {
+    const handle = manager.startRun(ctx, [{ kind: "spawn", agent: "worker", prompt }] as any);
+    const identity = handle.starts[0] as any;
+    activeRuns.push({ prompt, handle, identity });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(manager.conversation(identity.conversationId).runs.at(-1)!.status.kind).toBe("running");
+    expect(closeOrder).toEqual(["completed-one", "completed-two", "completed-three"].slice(0, Math.min(index + 1, 3)));
+    for (const active of activeRuns) expect(panes.get(active.prompt)!.close).not.toHaveBeenCalled();
+  }
+
+  for (const active of [...activeRuns].reverse()) {
+    releases.get(active.prompt)!();
+    await active.handle.completion;
+    expect(manager.conversation(active.identity.conversationId).runs.at(-1)!.status).toMatchObject({ kind: "done", outcome: "completed" });
+  }
+
+  expect(closeOrder).toEqual(["completed-one", "completed-two", "completed-three", "active-four"]);
+  for (const prompt of ["completed-one", "completed-two", "completed-three", "active-four"]) {
+    expect(panes.get(prompt)!.close).toHaveBeenCalledOnce();
+  }
+  for (const prompt of ["active-one", "active-two", "active-three"]) {
+    expect(panes.get(prompt)!.close).not.toHaveBeenCalled();
+  }
 });
 
 test("opening an evicted terminal pane refreshes recency and closes the oldest retained pane", async () => {
