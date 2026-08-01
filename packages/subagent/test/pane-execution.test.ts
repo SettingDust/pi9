@@ -34,13 +34,14 @@ function ctx(tmp: string) {
   } as any;
 }
 
-test("unix launcher sends a script path and keeps multiline prompt as one argv", async () => {
+test("unix launcher stores prompt as one bash argv array element", async () => {
   const fakeMux = mux();
   const sessionFile = path.join(await mkdtemp(path.join(tmpdir(), "pane-launch-")), "child.jsonl");
+  const prompt = "handoff:\n  objective: review correctness\n  details: keep words together";
   await launchPaneExecution({
     cwd: path.dirname(sessionFile),
     sessionFile,
-    prompt: "handoff:\n  objective: review",
+    prompt,
     extensionPaths: [],
     env: {},
     piInvocation: { command: "pi", args: [] },
@@ -52,8 +53,11 @@ test("unix launcher sends a script path and keeps multiline prompt as one argv",
   expect(surface).toBe("pane-1");
   expect(options.scriptPath).toBe(`${sessionFile}.launch.sh`);
   expect(options.scriptPreamble).toContain("cd ");
+  expect(options.scriptPreamble).toContain("__args=(");
+  expect(options.scriptPreamble).toContain(prompt);
+  expect(command).toContain('(\"${__args[@]}\")');
   expect(command).toContain("__code=$?");
-  expect(command).toContain("handoff:\n  objective: review");
+  expect(command).not.toContain(prompt);
   expect(command).not.toContain("/skill");
 });
 
@@ -108,12 +112,14 @@ test("pane Generation executor launches one child prompt and projects activity",
   const result = await executor(ctx(tmp), conversation, conversation.latestGeneration);
 
   expect(result.status).toMatchObject({ kind: "done", outcome: "completed", output: "done" });
-  const [, command] = fakeMux.sendLongCommand.mock.calls[0] as unknown as [string, string];
-expect(command).toContain("node");
-  expect(command).toContain("/current/pi.js");
+  const [, command, options] = fakeMux.sendLongCommand.mock.calls[0] as unknown as [string, string, { scriptPreamble: string }];
+  expect(options.scriptPreamble).toContain("'node'");
+  expect(options.scriptPreamble).toContain("'/current/pi.js'");
   expect(command).not.toContain(" pi ");
-  expect(command).toContain("handoff:\n  objective: review");
-  expect(command).toContain("When finished, call the subagent_done tool");
+  expect(options.scriptPreamble).toContain("handoff:\n  objective: review");
+  expect(options.scriptPreamble).toContain("When finished, call the subagent_done tool");
+  expect(command).toContain('("${__args[@]}")');
+  expect(command).not.toContain("handoff:\n  objective: review");
   expect(command).not.toContain("/skill");
   expect(result.activity.turns).toBe(1);
 });
@@ -131,9 +137,11 @@ test("pane Generation executor resumes with the retained child session file", as
   await executor(ctx(tmp), conversation, resume);
 
   expect(conversation.sessionFileForResume()).toBe(retained);
-  const secondCommand = (fakeMux.sendLongCommand.mock.calls as unknown as [string, string][])[1]![1];
-  expect(secondCommand).toContain(`${retained}`);
-  expect(secondCommand).toContain("continue");
+  const [, secondCommand, secondOptions] = (fakeMux.sendLongCommand.mock.calls as unknown as [string, string, { scriptPreamble: string }][])[1]!;
+  expect(secondOptions.scriptPreamble).toContain(`${retained}`);
+  expect(secondOptions.scriptPreamble).toContain("continue");
+  expect(secondCommand).toContain('("${__args[@]}")');
+  expect(secondCommand).not.toContain("continue");
 });
 async function runPane(fakeMux: ReturnType<typeof mux>, prompt: string, suffix = prompt) {
   const tmp = await mkdtemp(path.join(tmpdir(), `pane-${suffix.replace(/\W/g, "")}-`));

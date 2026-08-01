@@ -101,28 +101,27 @@ export function resetPaneExecutionStateForTests(): void {
 export async function launchPaneExecution(options: PaneExecutionOptions): Promise<PaneExecutionHandle> {
   const invocation = options.piInvocation ?? resolveCurrentPiInvocation();
   const args = [...(invocation.args ?? []), "--session", options.sessionFile];
-  const unixArgs: PiArgument[] = (invocation.args ?? []).map(value => ({ value, escaped: true }));
-  unixArgs.push({ value: "--session", escaped: false }, { value: options.sessionFile, escaped: true });
+  const unixArgs = [...(invocation.args ?? []), "--session", options.sessionFile];
   for (const extensionPath of options.extensionPaths) {
     args.push("-e", extensionPath);
-    unixArgs.push({ value: "-e", escaped: false }, { value: extensionPath, escaped: true });
+    unixArgs.push("-e", extensionPath);
   }
   if (options.model) {
     const model = options.thinking ? `${options.model}:${options.thinking}` : options.model;
     args.push("--model", model);
-    unixArgs.push({ value: "--model", escaped: false }, { value: model, escaped: true });
+    unixArgs.push("--model", model);
   }
   if (options.systemPrompt?.trim()) {
     args.push("--system-prompt", options.systemPrompt);
-    unixArgs.push({ value: "--system-prompt", escaped: false }, { value: options.systemPrompt, escaped: true });
+    unixArgs.push("--system-prompt", options.systemPrompt);
   }
   if (options.tools?.length) {
     const tools = [...new Set([...options.tools, "caller_ping", "subagent_done"])].join(",");
     args.push("--tools", tools);
-    unixArgs.push({ value: "--tools", escaped: false }, { value: tools, escaped: true });
+    unixArgs.push("--tools", tools);
   }
   args.push(options.prompt);
-  unixArgs.push({ value: options.prompt, escaped: true });
+  unixArgs.push(options.prompt);
 
   return launchPiPane({
     cwd: options.cwd,
@@ -149,11 +148,10 @@ export async function reopenPaneExecution(options: ReopenPaneExecutionOptions): 
   }
   const invocation = options.piInvocation ?? resolveCurrentPiInvocation();
   const args = [...(invocation.args ?? []), "--session", options.sessionFile];
-  const unixArgs: PiArgument[] = (invocation.args ?? []).map(value => ({ value, escaped: true }));
-  unixArgs.push({ value: "--session", escaped: false }, { value: options.sessionFile, escaped: true });
+  const unixArgs = [...(invocation.args ?? []), "--session", options.sessionFile];
   for (const extensionPath of options.extensionPaths ?? []) {
     args.push("-e", extensionPath);
-    unixArgs.push({ value: "-e", escaped: false }, { value: extensionPath, escaped: true });
+    unixArgs.push("-e", extensionPath);
   }
   return launchPiPane({
     cwd: options.cwd,
@@ -265,7 +263,6 @@ export function createPaneGenerationExecutor(dependencies: PaneExecutionDependen
   };
 }
 
-interface PiArgument { value: string; escaped: boolean }
 interface PiPaneLaunchOptions {
   cwd: string;
   sessionFile: string;
@@ -273,7 +270,7 @@ interface PiPaneLaunchOptions {
   env: Readonly<Record<string, string>>;
   invocation: { command: string; args?: readonly string[] };
   args: readonly string[];
-  unixArgs: readonly PiArgument[];
+  unixArgs: readonly string[];
   dependencies?: PaneExecutionDependencies;
 }
 
@@ -339,10 +336,14 @@ function launchPiTransport(mux: TerminalMux, surface: string, options: PiPaneLau
     return;
   }
 
-  const parts = [mux.shellEscape(options.invocation.command), ...options.unixArgs.map(argument => argument.escaped ? mux.shellEscape(argument.value) : argument.value)];
   const exitFile = mux.shellEscape(`${options.sessionFile}.exit`);
-  const preamble = [`cd ${mux.shellEscape(options.cwd)}`, ...Object.entries(options.env).map(([key, value]) => `export ${key}=${mux.shellEscape(value)}`)].join("\n");
-  mux.sendLongCommand(surface, `(${parts.join(" ")}); __code=$?; if [ ! -e ${exitFile} ]; then printf '{"type":"failed","exitCode":%s}' "$__code" > ${exitFile}; fi; echo '__SUBAGENT_DONE_'$__code'__'`, {
+  const argAssignments = [mux.shellEscape(options.invocation.command), ...options.unixArgs.map(mux.shellEscape)].join(" ");
+  const preamble = [
+    `cd ${mux.shellEscape(options.cwd)}`,
+    ...Object.entries(options.env).map(([key, value]) => `export ${key}=${mux.shellEscape(value)}`),
+    `__args=(${argAssignments})`,
+  ].join("\n");
+  mux.sendLongCommand(surface, `("${"${__args[@]}"}"); __code=$?; if [ ! -e ${exitFile} ]; then printf '{"type":"failed","exitCode":%s}' "$__code" > ${exitFile}; fi; echo '__SUBAGENT_DONE_'$__code'__'`, {
     scriptPath: `${options.sessionFile}.launch.sh`,
     scriptPreamble: preamble,
   });
