@@ -37,7 +37,7 @@ piInvocation: { command: "C:\\runtime\\node.exe", args: ["C:\\pi\\cli.js"] },
 });
 
 describe("pane execution launcher", () => {
-  it("starts one pane-owned Pi session with upstream-compatible arguments", async () => {
+it("starts one pane-owned Pi session with upstream-compatible arguments", async () => {
 const mux = fakeMux();
     const sleep = vi.fn(async () => {});
     const handle = await launchPaneExecution(options(mux, undefined, sleep));
@@ -45,10 +45,17 @@ const mux = fakeMux();
     expect(handle.surface).toBe("surface-1");
     expect(mux.createSurface).toHaveBeenCalledOnce();
 expect(sleep).toHaveBeenCalledWith(500);
-    expect(mux.sendLongCommand).toHaveBeenCalledWith(
-      "surface-1",
-      "cd [/work/project] && TOKEN=[secret] [C:\\runtime\\node.exe] [C:\\pi\\cli.js] --session [/sessions/child.jsonl] -e [/extensions/one.ts] --model [provider/model:high] --system-prompt [You are focused.] --tools [read,subagent_done,caller_ping] [do the work]; echo '__SUBAGENT_DONE_'$?'__'",
-    );
+    expect(mux.sendLongCommand).toHaveBeenCalledOnce();
+    const [surface, command] = mux.sendLongCommand.mock.calls[0] as unknown as [string, string];
+    expect(surface).toBe("surface-1");
+    expect(command).toContain("cd [/work/project]");
+    expect(command).toContain("[C:\\runtime\\node.exe] [C:\\pi\\cli.js]");
+    expect(command).toContain("--session [/sessions/child.jsonl]");
+    expect(command).toContain("[do the work]");
+    expect(command).toContain("__code=$?");
+    expect(command).toContain("/sessions/child.jsonl.exit");
+    expect(command).toContain("printf");
+    expect(command).toContain("__SUBAGENT_DONE_");
   });
 it("uses a native PowerShell launch script on Windows", async () => {
     const mux = fakeMux();
@@ -75,7 +82,8 @@ expect(script).toContain("& 'C:\\runtime\\node.exe' @arguments");
     expect(script).not.toContain("'/skill:review-correctness'");
     expect(script).not.toContain("'/skill:ponytail'");
     expect(script).toContain("'do the work'");
-    expect(script).toContain("Write-Output \"__SUBAGENT_DONE_${exitCode}__\"");
+    expect(script).toContain("$completionFile = '/sessions/child.jsonl.exit'");
+expect(script).toContain("Set-Content -LiteralPath $completionFile");
 expect(script).toContain("Remove-Item -LiteralPath $PSCommandPath");
     expect(script).not.toMatch(/bash|\.sh|\$\?|TOKEN=/i);
   });
