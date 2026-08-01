@@ -16,7 +16,7 @@ interface TerminalMux {
   isMuxAvailable(): boolean;
   sendCommand(surface: string, text: string): void;
   sendEscape(surface: string): void;
-  sendLongCommand(surface: string, command: string, options?: { scriptPath?: string }): string;
+  sendLongCommand(surface: string, command: string, options?: { scriptPath?: string; scriptPreamble?: string }): string;
   shellEscape(value: string): string;
   pollForExit(
     surface: string,
@@ -276,11 +276,16 @@ function launchPiTransport(mux: TerminalMux, surface: string, options: PiPaneLau
     return;
   }
 
-  const parts = [mux.shellEscape(options.invocation.command), ...options.unixArgs.map(argument => argument.escaped ? mux.shellEscape(argument.value) : argument.value)];
-  const env = Object.entries(options.env).map(([key, value]) => `${key}=${mux.shellEscape(value)}`).join(" ");
-const exitFile = mux.shellEscape(`${options.sessionFile}.exit`);
-  const piCommand = `cd ${mux.shellEscape(options.cwd)} && ${env ? `${env} ` : ""}${parts.join(" ")}`;
-  mux.sendLongCommand(surface, `(${piCommand}); __code=$?; if [ ! -e ${exitFile} ]; then printf '{"type":"failed","exitCode":%s}' "$__code" > ${exitFile}; fi; echo '__SUBAGENT_DONE_'$__code'__'`);
+const parts = [mux.shellEscape(options.invocation.command), ...options.unixArgs.map(argument => argument.escaped ? mux.shellEscape(argument.value) : argument.value)];
+  const exitFile = mux.shellEscape(`${options.sessionFile}.exit`);
+  const preamble = [
+    `cd ${mux.shellEscape(options.cwd)}`,
+    ...Object.entries(options.env).map(([key, value]) => `export ${key}=${mux.shellEscape(value)}`),
+  ].join("\n");
+  mux.sendLongCommand(surface, `(${parts.join(" ")}); __code=$?; if [ ! -e ${exitFile} ]; then printf '{"type":"failed","exitCode":%s}' "$__code" > ${exitFile}; fi; echo '__SUBAGENT_DONE_'$__code'__'`, {
+    scriptPath: `${options.sessionFile}.launch.sh`,
+    scriptPreamble: preamble,
+  });
 }
 
 function sanitizeDisplayName(value: string | undefined): string {
