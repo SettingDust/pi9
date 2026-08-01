@@ -11,6 +11,16 @@ Pi9 is a collection of extensions for the [Pi coding agent](https://github.com/b
 - [`@pi9/todo`](./packages/todo) — phased, session-aware task planning with immutable task names and atomic status transitions.
 - [`@pi9/whisper`](./packages/whisper) — local agent-to-agent communication.
 
+## Downstream Subagent Differences
+
+This branch uses the upstream Generation-based Subagent runtime as the baseline. Downstream changes are kept as narrow adapters so future upstream syncs can preserve upstream files by default.
+
+- Package agents: discover standard `pi.agents` manifests through Pi's package manager.
+- Dynamic schema: refresh `spawn.agent` and `spawn.model` enums from discovered agents and available/scoped models; runtime validation remains authoritative.
+- Pane execution: run child generations in mux panes through `pane-execution.ts`, with launcher-owned failure sidecars, atomic prompt argv handling, native child skill loading, activity sidecars, steer/cancel controls, resume via retained child session files, and bounded completed-pane retention.
+- Upstream hooks: core changes are limited to generic generation controls, external activity observation, retained session-file resume, and dispose callbacks for retained resources.
+- Deferred: do not restore old Run-based pane files or UI affordances directly; any completed-pane reopen UI should attach through the pane adapter without reintroducing Run architecture.
+
 ## Development
 
 ```bash

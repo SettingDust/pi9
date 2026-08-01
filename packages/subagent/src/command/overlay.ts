@@ -37,6 +37,7 @@ export interface OverlayOptions {
   onStart(agent: string, prompt: string): string | undefined;
   onResume(conversationId: string, prompt: string): void;
   onCollect?(subagentId: string): Promise<void> | void;
+  onOpenPane?(conversationId: string): Promise<void> | void;
   onCancel?(subagentId: string): void;
   onRemove?(conversationId: string): void;
 }
@@ -108,6 +109,7 @@ export class SubagentOverlayComponent implements Component, Focusable {
       if (isCancelKey(data, this.keybindings)) this.detail = undefined;
       else if (data.toLowerCase() === "r") this.openResumePrompt(this.detail.conversationId);
       else if (data.toLowerCase() === "g") void this.collectResult(this.detail.conversationId);
+      else if (data.toLowerCase() === "o") void this.openPane(this.detail.conversationId);
       else if (data.toLowerCase() === "c") this.cancelGeneration(this.detail.conversationId, this.detail.generation);
       else if (data.toLowerCase() === "x") this.removeConversation(this.detail.conversationId);
       this.requestRender();
@@ -353,7 +355,7 @@ export class SubagentOverlayComponent implements Component, Focusable {
       }
     }
 
-    lines.push("", this.muted(`enter inspect${generation.status.kind === "queued" || generation.status.kind === "running" ? " · c cancel" : ""}${this.isCollectAvailable(conversation) ? " · g collect" : ""}${this.isResumeAvailable(conversation) ? " · r resume" : ""} · x remove`));
+    lines.push("", this.muted(`enter inspect${generation.status.kind === "queued" || generation.status.kind === "running" ? " · c cancel" : ""}${this.isCollectAvailable(conversation) ? " · g collect" : ""}${this.isResumeAvailable(conversation) ? " · r resume" : ""}${conversation.paneOpenable ? " · o open" : ""} · x remove`));
     if (this.promptTarget?.kind === "resume") lines.push("", this.accent("Resume conversation"), ...this.renderPrompt(width));
     if (this.actionError) lines.push(this.error(this.actionError));
     return lines;
@@ -428,6 +430,7 @@ export class SubagentOverlayComponent implements Component, Focusable {
     } else if (data.toLowerCase() === "r") this.openResumePrompt(conversation.conversationId);
     else if (data.toLowerCase() === "g") void this.collectResult(conversation.conversationId);
     else if (data.toLowerCase() === "c") this.cancelGeneration(conversation.conversationId);
+    else if (data.toLowerCase() === "o") void this.openPane(conversation.conversationId);
     else if (data.toLowerCase() === "x") this.removeConversation(conversation.conversationId);
     this.requestRender();
   }
@@ -479,6 +482,18 @@ export class SubagentOverlayComponent implements Component, Focusable {
     this.actionError = "";
     try {
       await this.options.onCollect(conversation.conversationId);
+    } catch (error) {
+      this.actionError = error instanceof Error ? error.message : String(error);
+      this.options.notify(this.actionError, "warning");
+    }
+    this.requestRender();
+  }
+  private async openPane(conversationId: string): Promise<void> {
+    const conversation = this.findConversation(conversationId);
+    if (!conversation?.paneOpenable || !this.options.onOpenPane) return;
+    this.actionError = "";
+    try {
+      await this.options.onOpenPane(conversation.conversationId);
     } catch (error) {
       this.actionError = error instanceof Error ? error.message : String(error);
       this.options.notify(this.actionError, "warning");

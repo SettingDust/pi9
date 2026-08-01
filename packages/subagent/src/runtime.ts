@@ -51,10 +51,24 @@ export type RemoveOutcome =
   | { readonly ok: true; readonly conversationId: ConversationId; readonly label: string; readonly removedIds: readonly ConversationId[] }
   | { readonly ok: false; readonly conversationId: string; readonly error: string };
 export interface SteerResult extends GenerationRef { readonly steer: SteerReceipt }
+export type OpenConversationPaneResult = { readonly status: "already-open" | "reopened" };
 
 interface GenerationRecord { readonly conversation: Conversation; readonly generation: Generation }
 interface BoundRecord { readonly conversationId: ConversationId; readonly binding: GenerationBinding }
 type Reservation = GenerationRecord | { readonly error: string };
+export interface OpenConversationPaneHandle { readonly surface: string; close(): void }
+export interface OpenConversationPaneRequest { cwd: string; sessionFile: string; displayName?: string; piInvocation?: { command: string; args?: readonly string[] } }
+export interface OpenConversationPaneDependencies {
+  retainedPaneExists(surface: string): Promise<boolean | undefined>;
+  reopenPaneExecution(options: OpenConversationPaneRequest): Promise<OpenConversationPaneHandle>;
+  getPiInvocation(): { command: string; args: string[] };
+}
+
+const DEFAULT_OPEN_CONVERSATION_PANE_DEPENDENCIES: OpenConversationPaneDependencies = {
+  retainedPaneExists: async () => undefined,
+  reopenPaneExecution: async () => { throw new Error("Pane reopening is not configured."); },
+  getPiInvocation: () => { throw new Error("Pane reopening is not configured."); },
+};
 
 /** Owns retained conversations. Generations are addressed internally by their object identity. */
 export class SubagentRuntime {
@@ -71,6 +85,7 @@ export class SubagentRuntime {
     executor?: GenerationExecutor,
     private maximumConversations = 100,
     private readonly cancellationSettlementMs = 5_000,
+    private readonly openPaneDependencies: OpenConversationPaneDependencies = DEFAULT_OPEN_CONVERSATION_PANE_DEPENDENCIES,
   ) {
     this.executionScheduler = new GenerationScheduler({ maxExecuting, ...(executor ? { executor } : {}), isTracked: conversation => this.conversations.get(conversation.conversationId) === conversation });
   }
@@ -261,6 +276,28 @@ export class SubagentRuntime {
         },
       };
     });
+}
+
+  async openConversationPane(ctx: ExtensionContext, conversationId: string): Promise<OpenConversationPaneResult> {
+    const conversation = this.requireConversation(conversationId);
+    if (conversation.hasActiveExecution || conversation.isStopping) throw new Error(`Subagent ${conversationId} is active and cannot be reopened.`);
+    const sessionFile = conversation.sessionFileForResume();
+    if (!conversation.isPaneOpenable || !sessionFile) throw new Error(`Subagent ${conversationId} does not have a retained pane session.`);
+    const retained = conversation.retainedPaneSurface();
+    if (!retained) throw new Error(`Subagent ${conversationId} has no retained pane handle.`);
+    const exists = await this.openPaneDependencies.retainedPaneExists(retained);
+    if (exists === undefined) throw new Error("Cannot safely reopen a pane on this multiplexer backend.");
+    if (exists === true) return { status: "already-open" };
+    const cwd = resolveTaskCwd(ctx.cwd, conversation.requestedConfig.cwd);
+    if (!cwd.ok) throw new Error(cwd.error);
+    const execution = await this.openPaneDependencies.reopenPaneExecution({
+      cwd: cwd.value,
+      sessionFile,
+      displayName: conversation.label || conversation.agentName,
+      piInvocation: this.openPaneDependencies.getPiInvocation(),
+    });
+    conversation.retainPaneSurface(execution.surface, () => execution.close());
+    return { status: "reopened" };
   }
 
   generationSnapshot(reference: GenerationRef): GenerationSnapshot {
@@ -396,6 +433,7 @@ export class SubagentRuntime {
         continue;
       }
       for (const conversation of [...subtree].reverse()) {
+        conversation.disposeRetainedResources();
         this.conversations.delete(conversation.conversationId);
         removed.add(conversation.conversationId);
         removedConversations.push(conversation);

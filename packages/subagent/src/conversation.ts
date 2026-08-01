@@ -110,14 +110,20 @@ export interface ConversationSnapshot {
   readonly generations: readonly GenerationSnapshot[];
   readonly currentGeneration?: GenerationSnapshot;
   readonly resumeAllowed: boolean;
+  readonly paneOpenable?: boolean;
   readonly isStopping?: true;
   readonly effectiveConfig?: EffectiveExecutionConfig;
   readonly requestedOverrides?: ExecutionOverrides;
 }
 
+export interface GenerationControl {
+  steer(prompt: string): Promise<void>;
+  abort(): Promise<void>;
+}
+
 export type GenerationState =
   | { readonly kind: "queued" }
-  | { readonly kind: "running"; readonly session: AgentSession; readonly startedAt: number }
+  | { readonly kind: "running"; readonly session?: AgentSession; readonly control?: GenerationControl; readonly startedAt: number }
   | { readonly kind: "done"; readonly outcome: GenerationOutcomeStatus; readonly startedAt?: number; readonly completedAt: number; readonly output?: string; readonly error?: string };
 
 /** One append-only execution generation within a conversation. Object identity is its exact internal key. */
@@ -150,6 +156,11 @@ export class Generation {
     if (this.state.kind !== "queued") throw new Error(`Cannot attach a session to a generation that is ${this.state.kind}.`);
     this.sessionMessageStart = Array.isArray(session.messages) ? session.messages.length : 0;
     this.state = { kind: "running", session, startedAt: Date.now() };
+  }
+
+  attachControl(control: GenerationControl): void {
+    if (this.state.kind !== "queued") throw new Error(`Cannot attach a control to a generation that is ${this.state.kind}.`);
+    this.state = { kind: "running", control, startedAt: Date.now() };
   }
 
   acceptSteer(deliveryText: string): SteerReceipt {
@@ -250,6 +261,9 @@ export class Conversation {
   private steerTail: Promise<void> = Promise.resolve();
   private unsubscribe?: () => void;
   private effectiveConfig?: EffectiveExecutionConfig;
+  private retainedSessionFile?: string;
+  private retainedPane?: { surface: string; dispose: () => void };
+  private readonly disposables: Array<() => void> = [];
 
   constructor(
     readonly conversationId: ConversationId,
@@ -279,7 +293,7 @@ export class Conversation {
   get latestResultJoined(): boolean { return this.latestGeneration.state.kind === "done" && this.latestGeneration.joined; }
   get hasRetainedResumableSession(): boolean {
     const latest = this.latestGeneration;
-    return latest.state.kind === "done" && this.session !== undefined && ["completed", "interrupted", "aborted"].includes(latest.state.outcome);
+    return latest.state.kind === "done" && (this.session !== undefined || this.retainedSessionFile !== undefined) && ["completed", "interrupted", "aborted"].includes(latest.state.outcome);
   }
   get isResumeAllowed(): boolean {
     const latest = this.latestGeneration;
@@ -315,6 +329,23 @@ export class Conversation {
     this.listener(this, "status");
   }
   sessionForResume(): AgentSession | undefined { return this.session; }
+  retainSessionFile(file: string): void { this.retainedSessionFile = file; }
+  sessionFileForResume(): string | undefined { return this.retainedSessionFile; }
+  get isPaneOpenable(): boolean {
+    const latest = this.latestGeneration;
+    return !this.stopping && latest.state.kind === "done" && this.retainedSessionFile !== undefined && this.retainedPane !== undefined;
+  }
+  retainPaneSurface(surface: string, dispose: () => void): void {
+    this.retainedPane?.dispose();
+    this.retainedPane = { surface, dispose };
+    this.retainDisposable(dispose);
+  }
+  retainedPaneSurface(): string | undefined { return this.retainedPane?.surface; }
+  retainDisposable(dispose: () => void): void { this.disposables.push(dispose); }
+  disposeRetainedResources(): void {
+    const disposables = this.disposables.splice(0);
+    for (const dispose of disposables) try { dispose(); } catch {}
+  }
 
   executionSettled(generation: Generation): void {
     if (this.stopping?.generation !== generation) return;
@@ -331,8 +362,11 @@ export class Conversation {
         throw new GenerationSteerError(generation.number, status);
       }
       const session = generation.state.session;
-      await session.steer(prompt);
-      const deliveryText = session.getSteeringMessages?.().at(-1) ?? prompt;
+      const control = generation.state.control;
+      if (control) await control.steer(prompt);
+      else if (session) await session.steer(prompt);
+      else throw new Error(`Generation ${generation.number} has no execution control.`);
+      const deliveryText = session?.getSteeringMessages?.().at(-1) ?? prompt;
       if (this.stopping) clearSessionQueue(session);
       const receipt = generation.acceptSteer(deliveryText);
       this.listener(this, "steer");
@@ -368,10 +402,11 @@ export class Conversation {
     const generation = this.latestGeneration;
     this.stopping = { generation, abortSettled: false, executionSettled: false };
     const runningSession = generation.state.kind === "running" ? generation.state.session : undefined;
+    const runningControl = generation.state.kind === "running" ? generation.state.control : undefined;
     clearSessionQueue(runningSession);
     const partialOutput = latestAssistantText(runningSession, generation.sessionMessageStart);
     this.settle(generation, "aborted", { error: reason, ...(partialOutput ? { output: partialOutput } : {}) });
-    const aborting = Promise.resolve(runningSession?.abort()).catch(() => undefined);
+    const aborting = Promise.resolve(runningControl ? runningControl.abort() : runningSession?.abort()).catch(() => undefined);
     await this.steerTail;
     clearSessionQueue(runningSession);
     await aborting;
@@ -423,6 +458,7 @@ export class Conversation {
       generations,
       ...(currentGeneration ? { currentGeneration } : {}),
       resumeAllowed: this.isResumeAllowed,
+      ...(this.isPaneOpenable ? { paneOpenable: true as const } : {}),
       ...(this.stopping ? { isStopping: true as const } : {}),
       ...(this.effectiveConfig ? { effectiveConfig: this.effectiveConfig } : {}),
       ...(this.requestedOverrides ? { requestedOverrides: this.requestedOverrides } : {}),

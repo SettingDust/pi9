@@ -1,4 +1,4 @@
-import { readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -76,6 +76,14 @@ export const DEFAULT_EXECUTE_GENERATION_DEPENDENCIES: ExecuteGenerationDependenc
   readSkillFile: readFileSync,
   loadExtensionPaths: discoverInheritedExtensionPaths,
 };
+export function resolveCurrentPiInvocation(): { command: string; args: string[] } {
+  const currentScript = process.argv[1];
+  const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
+  if (currentScript && !isBunVirtualScript && existsSync(currentScript)) return { command: process.execPath, args: [currentScript] };
+  const execName = path.basename(process.execPath).toLowerCase();
+  if (!/^(node|bun)(\.exe)?$/.test(execName)) return { command: process.execPath, args: [] };
+  return { command: "pi", args: [] };
+}
 
 export async function executeGeneration(
   ctx: ExtensionContext,

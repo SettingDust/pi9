@@ -37,6 +37,15 @@ export class GenerationActivity {
       toolHistory: this._toolHistory.map(tool => ({ ...tool })),
     };
   }
+  observe(snapshot: GenerationActivitySnapshot, usage?: Usage): void {
+    this._phase = snapshot.phase;
+    this._message = snapshot.messageSnippet ?? this._message;
+    this._turns = Math.max(this._turns, snapshot.turns);
+    this._compactions = Math.max(this._compactions, snapshot.compactions);
+    this._toolHistory = snapshot.toolHistory.map(tool => ({ ...tool }));
+    if (usage) this._latestUsage = usage;
+    this.onChange("phase");
+  }
 
   subscribe(session: AgentSession): () => void {
     return session.subscribe(event => {

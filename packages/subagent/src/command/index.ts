@@ -91,6 +91,15 @@ export function registerSubagentsCommand(
                 updateSubagentWidget(ctx, runtime.listConversations(), settings);
               }
             },
+            onOpenPane: async conversationId => {
+              try {
+                const result = await runtime.openConversationPane(ctx, conversationId);
+                notify(ctx, result.status === "already-open" ? "Subagent pane is already open." : "Reopened subagent pane.", "info");
+              } catch (error) {
+                notify(ctx, errorMessage(error), "warning");
+              }
+              updateSubagentWidget(ctx, runtime.listConversations(), settings);
+            },
             onCancel: async subagentId => {
               try {
                 await runtime.cancelSubagent(subagentId as SubagentId);

@@ -15,6 +15,8 @@ import { defineSubagentTool, makeChildSubagentTool } from "./tool.js";
 import { SubagentSettingsStore, DEFAULT_SUBAGENT_SETTINGS, prepareSubagentRuntime, type SubagentSettings } from "./settings.js";
 import { registerSubagentsCommand } from "./command/index.js";
 import { registerSubagentWidgetLifecycle, updateSubagentWidget } from "./widget.js";
+import { resolveCurrentPiInvocation } from "./execute.js";
+import { createPaneGenerationExecutor, reopenPaneExecution, retainedPaneExists } from "./pane-execution.js";
 
 export type { CanonicalFinishedSubagent, CanonicalLiveSubagent, SubagentIdentity } from "./contract.js";
 export type { SubagentAction, SubagentStatus } from "./schema.js";
@@ -31,8 +33,10 @@ export default function subagentExtension(pi: ExtensionAPI, dependencies: Subage
   const runtime = dependencies.runtime ?? new SubagentRuntime(
     agentRegistry,
     DEFAULT_SUBAGENT_SETTINGS.runtime.maxConcurrentSubagents,
-    undefined,
+    createPaneGenerationExecutor(),
     DEFAULT_SUBAGENT_SETTINGS.runtime.maxConversations,
+    undefined,
+    { retainedPaneExists, reopenPaneExecution, getPiInvocation: resolveCurrentPiInvocation },
   );
   const settingsStore = dependencies.settingsStore ?? new SubagentSettingsStore();
 

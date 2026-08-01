@@ -220,6 +220,69 @@ test("removal completes before notifying listeners and isolates listener failure
     expect(() => manager.generationSnapshot(identity)).toThrow(`Subagent ${identity.conversationId} was not found.`);
   }
 });
+test("removal disposes retained conversation resources", async () => {
+  const disposed: string[] = [];
+  const disposableExecutor = async (_ctx: any, conversation: any, generation: any) => {
+    conversation.retainDisposable(() => disposed.push(conversation.conversationId));
+    return completedGeneration(conversation, generation, generation.prompt);
+  };
+  const manager = new SubagentRuntime(registry, 2, disposableExecutor);
+  const start = manager.startTasks(ctx, [{ kind: "spawn", agent: "worker", prompt: "root", label: "root" }] as any);
+  await start.completion;
+  const root = start.starts[0] as any;
+
+  await expect(manager.removeConversation(root.conversationId)).resolves.toMatchObject({ ok: true, conversationId: root.conversationId });
+  expect(disposed).toEqual([root.conversationId]);
+});
+test("completed pane conversations reopen only after retained pane is gone", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "subagent-open-"));
+  const closed: string[] = [];
+  const paneExecutor = async (_ctx: any, conversation: any, generation: any) => {
+    conversation.retainSessionFile(path.join(tmp, "child.jsonl"));
+    conversation.retainPaneSurface("old-pane", () => closed.push("old-pane"));
+    return completedGeneration(conversation, generation, generation.prompt);
+  };
+  const reopenCalls: string[] = [];
+  const manager = new SubagentRuntime(registry, 1, paneExecutor, 100, 5_000, {
+    retainedPaneExists: async surface => surface === "old-pane" ? false : true,
+    reopenPaneExecution: async options => {
+      reopenCalls.push(options.sessionFile);
+      return { surface: "new-pane", send() {}, interrupt() {}, close: () => closed.push("new-pane"), wait: async () => ({ reason: "done", exitCode: 0 }) } as any;
+    },
+    getPiInvocation: () => ({ command: "pi", args: [] }),
+  });
+  const start = manager.startTasks(ctx, [{ kind: "spawn", agent: "worker", prompt: "done", label: "done" }] as any);
+  await start.completion;
+  const identity = start.starts[0] as any;
+
+  await expect(manager.openConversationPane(ctx, identity.conversationId)).resolves.toEqual({ status: "reopened" });
+  await expect(manager.openConversationPane(ctx, identity.conversationId)).resolves.toEqual({ status: "already-open" });
+  expect(reopenCalls).toEqual([path.join(tmp, "child.jsonl")]);
+  expect(closed).toEqual(["old-pane"]);
+});
+
+test("open pane rejects active or unsafe retained panes", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(done => { release = done; });
+  const activeExecutor = async (_ctx: any, conversation: any, generation: any) => {
+    conversation.retainSessionFile("/tmp/child.jsonl");
+    conversation.retainPaneSurface("pane", () => {});
+    await gate;
+    return completedGeneration(conversation, generation, generation.prompt);
+  };
+  const manager = new SubagentRuntime(registry, 1, activeExecutor, 100, 5_000, {
+    retainedPaneExists: async () => undefined,
+    reopenPaneExecution: async () => { throw new Error("should not reopen"); },
+    getPiInvocation: () => ({ command: "pi", args: [] }),
+  });
+  const start = manager.startTasks(ctx, [{ kind: "spawn", agent: "worker", prompt: "active", label: "active" }] as any);
+  const identity = start.starts[0] as any;
+  await new Promise(done => setImmediate(done));
+  await expect(manager.openConversationPane(ctx, identity.conversationId)).rejects.toThrow("active");
+  release();
+  await start.completion;
+  await expect(manager.openConversationPane(ctx, identity.conversationId)).rejects.toThrow("Cannot safely reopen");
+});
 
 test("removal rejects an entire subtree when a descendant is active", async () => {
   let release!: () => void;

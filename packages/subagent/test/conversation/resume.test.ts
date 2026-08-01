@@ -46,3 +46,22 @@ test("resume eligibility requires a retained terminal, joined, unobserved genera
   binding.release();
   assert.equal(observed.isResumeAllowed, true);
 });
+test("control-backed generations can steer and abort without an SDK session", async () => {
+  const events: string[] = [];
+  const controlled = conversation();
+  const generation = controlled.latestGeneration;
+  const control = {
+    async steer(prompt: string) { events.push(`steer:${prompt}`); },
+    async abort() { events.push("abort"); },
+  };
+
+  generation.attachControl(control);
+  const receipt = await controlled.steer(generation, "follow up");
+  assert.equal(receipt.state, "queued");
+  assert.deepEqual(events, ["steer:follow up"]);
+
+  await controlled.abort("stop");
+  assert.deepEqual(events, ["steer:follow up", "abort"]);
+  assert.deepEqual(controlled.snapshot().currentGeneration?.status, undefined);
+  assert.equal(controlled.snapshot().generations.at(-1)?.status.kind, "done");
+});
