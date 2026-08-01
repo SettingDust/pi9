@@ -330,8 +330,11 @@ async function launchPiPane(options: PiPaneLaunchOptions): Promise<PaneExecution
 function launchPiTransport(mux: TerminalMux, surface: string, options: PiPaneLaunchOptions): void {
   if ((options.dependencies?.platform ?? process.platform) === "win32") {
     const scriptPath = `${options.sessionFile}.launch.ps1`;
+    const bootstrapPath = `${options.sessionFile}.launch.cjs`;
+    const completionFile = `${options.sessionFile}.exit`;
     const writeFile = options.dependencies?.writeFile ?? writeFileSync;
-    writeFile(scriptPath, `\ufeff${buildPowerShellLaunchScript(options.cwd, options.env, options.invocation.command, options.args, `${options.sessionFile}.exit`)}`, "utf8");
+    writeFile(bootstrapPath, buildNodeLaunchScript(options.cwd, options.env, options.invocation.command, options.args, completionFile, bootstrapPath), "utf8");
+    writeFile(scriptPath, `\ufeff${buildPowerShellLaunchScript(resolveBootstrapRuntime(), bootstrapPath, completionFile)}`, "utf8");
     mux.sendCommand(surface, `powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File ${windowsCommandLineQuote(scriptPath)}`);
     return;
   }
@@ -349,30 +352,53 @@ function launchPiTransport(mux: TerminalMux, surface: string, options: PiPaneLau
   });
 }
 
-function buildPowerShellLaunchScript(cwd: string, env: Readonly<Record<string, string>>, command: string, args: readonly string[], completionFile: string): string {
+function buildNodeLaunchScript(cwd: string, env: Readonly<Record<string, string>>, command: string, args: readonly string[], completionFile: string, bootstrapFile: string): string {
+  const spec = Buffer.from(JSON.stringify({ cwd, env, command, args, completionFile, bootstrapFile }), "utf8").toString("base64");
+  return [
+    `const { existsSync, unlinkSync, writeFileSync } = require("node:fs");`,
+    `const { spawnSync } = require("node:child_process");`,
+    `const spec = JSON.parse(Buffer.from(${JSON.stringify(spec)}, "base64").toString("utf8"));`,
+    `let exitCode = 1;`,
+    `try {`,
+    `  const result = spawnSync(spec.command, spec.args, { cwd: spec.cwd, env: { ...process.env, ...spec.env }, stdio: "inherit" });`,
+    `  if (result.error) throw result.error;`,
+    `  exitCode = result.status ?? 1;`,
+    `} catch (error) {`,
+    `  console.error(error instanceof Error ? error.stack ?? error.message : String(error));`,
+    `} finally {`,
+    `  if (!existsSync(spec.completionFile)) writeFileSync(spec.completionFile, JSON.stringify({ type: "failed", exitCode }));`,
+    `  try { unlinkSync(spec.bootstrapFile); } catch {}`,
+    `}`,
+    `process.exit(exitCode);`,
+    ``,
+  ].join("\r\n");
+}
+
+function buildPowerShellLaunchScript(runtime: string, bootstrapFile: string, completionFile: string): string {
   return [
     `$ErrorActionPreference = 'Stop'`,
-    `Set-Location -LiteralPath ${powerShellLiteral(cwd)}`,
-    ...Object.entries(env).map(([key, value]) => `[Environment]::SetEnvironmentVariable(${powerShellLiteral(key)}, ${powerShellLiteral(value)}, 'Process')`),
-    `$arguments = @(${args.map(powerShellLiteral).join(", ")})`,
     `$completionFile = ${powerShellLiteral(completionFile)}`,
+    `$bootstrapFile = ${powerShellLiteral(bootstrapFile)}`,
     `$exitCode = 1`,
     `try {`,
-    `  & ${powerShellLiteral(command)} @arguments`,
+    `  & ${powerShellLiteral(runtime)} $bootstrapFile`,
     `  $exitCode = if ($null -eq $LASTEXITCODE) { 0 } else { $LASTEXITCODE }`,
     `} catch {`,
     `  [Console]::Error.WriteLine($_.ToString())`,
-    `  $exitCode = 1`,
     `} finally {`,
     `  if (-not (Test-Path -LiteralPath $completionFile)) {`,
     `    Set-Content -LiteralPath $completionFile -Value ('{"type":"failed","exitCode":' + $exitCode + '}') -NoNewline -Encoding UTF8`,
     `  }`,
+    `  Remove-Item -LiteralPath $bootstrapFile -Force -ErrorAction SilentlyContinue`,
     `  Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue`,
     `}`,
     `Write-Output "__SUBAGENT_DONE_${"${exitCode}"}__"`,
     `exit $exitCode`,
     ``,
   ].join("\r\n");
+}
+function resolveBootstrapRuntime(): string {
+  return /^(node|bun)(\.exe)?$/i.test(path.basename(process.execPath)) ? process.execPath : "node";
 }
 
 async function observePaneCompletion(options: { handle: PaneExecutionHandle; signal?: AbortSignal; onTick?: (elapsed: number) => void }): Promise<PaneCompletionOutcome> {

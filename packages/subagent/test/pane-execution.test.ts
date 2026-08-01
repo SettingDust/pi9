@@ -1,6 +1,7 @@
-import { mkdir, mkdtemp } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { beforeEach, expect, test, vi } from "vitest";
 import { launchPaneExecution, createPaneGenerationExecutor, resetPaneExecutionStateForTests } from "../src/pane-execution.js";
 import { Conversation } from "../src/conversation.js";
@@ -61,30 +62,38 @@ test("unix launcher stores prompt as one bash argv array element", async () => {
   expect(command).not.toContain("/skill");
 });
 
-test("windows launcher writes a script that creates a failed sidecar on startup failure", async () => {
+test("windows launcher keeps large prompts out of PowerShell native argv", async () => {
   const fakeMux = mux();
-  const writes = new Map<string, string>();
-  const sessionFile = path.join(await mkdtemp(path.join(tmpdir(), "pane-win-")), "child.jsonl");
+  const directory = await mkdtemp(path.join(tmpdir(), "pane-win-"));
+  const sessionFile = path.join(directory, "child.jsonl");
+  const captureFile = path.join(directory, "argv.json");
+  const captureScript = path.join(directory, "capture.cjs");
+  const prompt = JSON.stringify({ handoff: { objective: "Repair only Markdown lint defects", task: "word ".repeat(400) } });
+  await writeFile(captureScript, `require("node:fs").writeFileSync(process.argv[2], JSON.stringify(process.argv.slice(3)))\n`);
   await launchPaneExecution({
-    cwd: path.dirname(sessionFile),
+    cwd: directory,
     sessionFile,
-    prompt: "review task",
-    extensionPaths: [],
+    prompt,
+    extensionPaths: Array.from({ length: 20 }, (_, index) => path.join(directory, `package-${index}`, "extension.ts")),
+    systemPrompt: "System ".repeat(800),
     env: {},
-    piInvocation: { command: "pi", args: [] },
-    dependencies: {
-      mux: fakeMux as any,
-      sleep: async () => undefined,
-      platform: "win32",
-      writeFile: ((file: string, content: string) => writes.set(file, content)) as any,
-    },
+    piInvocation: { command: process.execPath, args: [captureScript, captureFile] },
+    dependencies: { mux: fakeMux as any, sleep: async () => undefined, platform: "win32" },
   });
 
-  const script = writes.get(`${sessionFile}.launch.ps1`)!;
-  expect(script.charCodeAt(0)).toBe(0xfeff);
-  expect(script).toContain("$completionFile");
-  expect(script).toContain("Test-Path -LiteralPath $completionFile");
-  expect(script).toContain('"type":"failed"');
+  const powerShellScript = await readFile(`${sessionFile}.launch.ps1`, "utf8");
+  const nodeScript = await readFile(`${sessionFile}.launch.cjs`, "utf8");
+  expect(powerShellScript.charCodeAt(0)).toBe(0xfeff);
+  expect(powerShellScript).not.toContain(prompt);
+  expect(powerShellScript).toContain(".launch.cjs");
+  expect(nodeScript).toContain("spawnSync");
+  expect(nodeScript).toContain("completionFile");
+  execFileSync("powershell.exe", ["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", `${sessionFile}.launch.ps1`]);
+  const argv = JSON.parse(await readFile(captureFile, "utf8")) as string[];
+  expect(argv.at(-1)).toBe(prompt);
+  expect(argv.filter(argument => argument === prompt)).toHaveLength(1);
+expect(JSON.parse(await readFile(`${sessionFile}.exit`, "utf8"))).toEqual({ type: "failed", exitCode: 0 });
+await expect(readFile(`${sessionFile}.launch.cjs`, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   expect(fakeMux.sendCommand.mock.calls[0]?.[1]).toContain("powershell.exe");
 });
 
