@@ -4,7 +4,7 @@ import { listAgentDefinitions, type AgentRegistry } from "./agents.js";
 import type { ConversationId, RunId } from "./identifiers.js";
 import { runElapsedMs } from "./run-format.js";
 import type { JoinBinding, NestedJoinBinding, SubagentRuntime } from "./runtime.js";
-import { parseSubagentInvocation, prepareSubagentInvocationArguments, SubagentParams, type RunRequest, type RunStatus, type SteerRequest, type SubagentAction, type SubagentInvocation, type SubagentInvocationParseError } from "./schema.js";
+import { createSubagentParamsSchema, parseSubagentInvocation, prepareSubagentInvocationArguments, SubagentParams, type RunRequest, type RunStatus, type SteerRequest, type SubagentAction, type SubagentInvocation, type SubagentInvocationParseError } from "./schema.js";
 import type { SubagentSettings } from "./settings.js";
 import {
   renderSubagentCall,
@@ -594,6 +594,10 @@ export interface SubagentToolDeps {
   prepareInvocation: (ctx: ExtensionContext) => Promise<SubagentSettings>;
   /** Set on child factories; links spawned conversations and suspends its queue slot while joining. */
   parent?: { conversationId: ConversationId; runId: () => RunId };
+/** Names exposed to the model; runtime registry validation remains authoritative. */
+  agentNames?: readonly string[];
+  /** Canonical provider/model IDs exposed to the model; runtime validation remains authoritative. */
+  modelIds?: readonly string[];
 }
 
 
@@ -615,7 +619,7 @@ export function defineSubagentTool(deps: SubagentToolDeps) {
       "  resume(resumes): Continue existing subagent conversations asynchronously.",
       "  steer(messages): Send messages to running subagents.",
       "  inspect(runIds): Check run status and progress without waiting.",
-      "  join(runIds): Return full outcomes for terminal runs; active targets block until all settle. When completion notifications are enabled, prefer notifications over using join as a generic wait: wait for a notification, do independent work, or end the turn; use join to retrieve terminal outcomes or when you explicitly need to wait for all targets.",
+      "  join(runIds): Return full outcomes for terminal runs; active targets block until all settle. Do not join active runs just to wait. Each completion triggers a new turn; then join that terminal run if needed. Block only when you must wait for all targets.",
       "  cancel(runIds): Abort active runs while retaining their conversations and outcomes.",
       "  remove(conversationIds): Delete terminal conversations and their runs. Surviving children are reparented.",
     ].join("\n"),
@@ -624,12 +628,12 @@ export function defineSubagentTool(deps: SubagentToolDeps) {
       "Delegate bounded, self-contained units of work to subagent — work that parallelizes cleanly, deserves a specialist, or benefits from a fresh context.",
       "Skip subagent when delegating costs more than doing, or when you couldn't verify or use the result without repeating the work.",
       "Write each subagent prompt as if to a stranger sharing only your filesystem: every input, path, and constraint, plus what to report back or produce.",
-      "When completion notifications are enabled, prefer notifications over joining active runs just to wait: wait for completion notifications, do independent work, or end the turn; use inspect only when status could affect your next step, and join only for terminal outcomes or when you explicitly need to wait for all targets.",
-      "Use join when you need a terminal run's full outcome or explicitly need to wait for all targets. After a completion notification, resume its conversationId for follow-up or correction; steer applies only while a run is active.",
+      "Do not join active runs just to wait. Each completion triggers a new turn; then join that terminal run if needed. Block only when you must wait for all targets.",
+      "After a completion notification, join for its result or resume the conversation for follow-up; steer only while active.",
       "Resume a retained subagent when its context helps the follow-up, spawn fresh when it wouldn't help or would mislead, and permanently remove terminal conversations you no longer need.",
       //"Call subagent action=agents before choosing an agent unless the user named one explicitly or definitions were already listed.",
     ],
-    parameters: SubagentParams,
+    parameters: createSubagentParamsSchema({ agentNames: deps.agentNames, modelIds: deps.modelIds }),
     prepareArguments: prepareSubagentInvocationArguments,
     constrainedSampling: { type: "json_schema", strict: "prefer" },
     renderCall(args, theme) {

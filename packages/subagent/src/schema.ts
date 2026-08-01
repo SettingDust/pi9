@@ -8,15 +8,21 @@ export { isModelThinkingLevel, MODEL_THINKING_LEVELS } from "./agents.js";
 
 const Nullable = <T extends TSchema>(schema: T) => Type.Union([Type.Null(), schema]);
 
-const SpawnTaskFields = {
-  agent: Nullable(Type.String()),
+export interface DynamicSpawnSchemaOptions {
+  agentNames?: readonly string[];
+  modelIds?: readonly string[];
+}
+
+const spawnTaskFields = ({ agentNames = [], modelIds = [] }: DynamicSpawnSchemaOptions = {}) => ({
+  agent: Nullable(agentNames.length ? StringEnum(agentNames) : Type.String()),
   prompt: Nullable(Type.String()),
   label: Nullable(Type.String()),
   skills: Nullable(Type.Array(Type.String())),
-  model: Nullable(Type.String()),
+  model: Nullable(modelIds.length ? StringEnum(modelIds) : Type.String()),
   thinking: Nullable(StringEnum(MODEL_THINKING_LEVELS)),
   cwd: Nullable(Type.String()),
-};
+});
+const SpawnTaskFields = spawnTaskFields();
 const ResumeTaskFields = {
   conversationId: Nullable(Type.String()),
   prompt: Nullable(Type.String()),
@@ -28,10 +34,11 @@ const SteerMessageFields = {
 
 // All fields are required-but-nullable for provider strict mode. The parser removes
 // nulls and keeps semantic failures isolated to their batch item.
-export const SpawnTaskSchema = Type.Object(SpawnTaskFields, {
+export const createSpawnTaskSchema = (options: DynamicSpawnSchemaOptions = {}) => Type.Object(spawnTaskFields(options), {
   additionalProperties: false,
   description: "Spawn item: { agent, prompt, label?, skills?, model?, thinking?, cwd? }.",
 });
+export const SpawnTaskSchema = createSpawnTaskSchema();
 export const ResumeTaskSchema = Type.Object(ResumeTaskFields, {
   additionalProperties: false,
   description: "Resume item: { conversationId, prompt }.",
@@ -46,15 +53,16 @@ export const RUN_STATUSES = [
   "queued", "running", "completed", "error", "aborted", "interrupted", "skipped",
 ] as const;
 
-export const SubagentParams = Type.Object({
+export const createSubagentParamsSchema = (options: DynamicSpawnSchemaOptions = {}) => Type.Object({
   action: StringEnum(SUBAGENT_ACTIONS),
   status: Nullable(Type.Array(StringEnum(RUN_STATUSES), { minItems: 1 })),
-  spawns: Nullable(Type.Array(SpawnTaskSchema, { minItems: 1 })),
+  spawns: Nullable(Type.Array(createSpawnTaskSchema(options), { minItems: 1 })),
   resumes: Nullable(Type.Array(ResumeTaskSchema, { minItems: 1 })),
   messages: Nullable(Type.Array(SteerMessageSchema, { minItems: 1 })),
   runIds: Nullable(Type.Array(Type.String(), { minItems: 1 })),
   conversationIds: Nullable(Type.Array(Type.String(), { minItems: 1 })),
 }, { additionalProperties: false });
+export const SubagentParams = createSubagentParamsSchema();
 
 export function prepareSubagentInvocationArguments(raw: unknown): SubagentParams {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw as SubagentParams;

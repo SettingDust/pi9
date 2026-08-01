@@ -2,6 +2,7 @@ import { test } from "vitest";
 import assert from "node:assert/strict";
 import { Check } from "typebox/value";
 import {
+  createSubagentParamsSchema,
   parseResumeTask,
   parseSpawnTask,
   parseSteerMessage,
@@ -32,6 +33,22 @@ test("public schema exposes strict-provider-compatible typed actions", () => {
   });
   assert.equal(Check(ResumeTaskSchema, { conversationId, prompt: "continue" }), true);
   assert.equal(Check(SteerMessageSchema, { runId, message: "redirect" }), true);
+});
+test("dynamic spawn schema exposes available agents and canonical models", () => {
+  const schema: any = createSubagentParamsSchema({ agentNames: ["handler", "reviewer"], modelIds: ["provider/alpha", "provider/beta"] });
+  const model = schema.properties.spawns.anyOf[1].items.properties.model;
+  const agent = schema.properties.spawns.anyOf[1].items.properties.agent;
+  assert.equal(agent.anyOf[0].type, "null");
+  assert.deepEqual(agent.anyOf[1].enum, ["handler", "reviewer"]);
+  assert.equal(model.anyOf[0].type, "null");
+  assert.deepEqual(model.anyOf[1].enum, ["provider/alpha", "provider/beta"]);
+  assert.equal(Check(schema, prepareSubagentInvocationArguments({ action: "spawn", spawns: [{ agent: "handler", prompt: "work", model: "provider/alpha" }] })), true);
+  assert.equal(Check(schema, prepareSubagentInvocationArguments({ action: "spawn", spawns: [{ agent: "handler", prompt: "work", model: "missing/model" }] })), false);
+  assert.equal(Check(schema, prepareSubagentInvocationArguments({ action: "spawn", spawns: [{ agent: "missing", prompt: "work", model: "provider/alpha" }] })), false);
+
+  const fallback: any = createSubagentParamsSchema();
+  assert.equal(fallback.properties.spawns.anyOf[1].items.properties.model.anyOf[1].type, "string");
+  assert.equal(fallback.properties.spawns.anyOf[1].items.properties.agent.anyOf[1].type, "string");
 });
 
 test("spawn fields are validated and preserved", () => {

@@ -82,12 +82,12 @@ test("description names typed action inputs without restating task unions", () =
   assert.doesNotMatch(description, /Spawn:|Resume:|Steer:|union/);
   assert.match(description, /inspect\(runIds\): Check run status and progress without waiting/);
   assert.match(description, /join\(runIds\): Return full outcomes for terminal runs/);
-  assert.match(description, /completion notifications.*prefer notifications over using join as a generic wait/);
+  assert.match(description, /Do not join active runs just to wait/);
   const guidelines = tool.promptGuidelines?.join("\n") ?? "";
-  assert.match(guidelines, /completion notifications.*joining active runs just to wait/);
-  assert.match(guidelines, /inspect only when status could affect your next step/);
-  assert.match(guidelines, /join when you need a terminal run's full outcome/);
-  assert.match(guidelines, /resume its conversationId for follow-up or correction/);
+  assert.match(guidelines, /Do not join active runs just to wait/);
+  assert.match(guidelines, /Each completion triggers a new turn/);
+  assert.match(guidelines, /Block only when you must wait for all targets/);
+  assert.match(guidelines, /After a completion notification, join for its result or resume the conversation for follow-up/);
   const properties = (tool.parameters as any).properties;
   const nonNull = (schema: any) => schema.anyOf.find((branch: any) => branch.type !== "null");
   assert.deepEqual(Object.keys(properties), ["action", "status", "spawns", "resumes", "messages", "runIds", "conversationIds"]);

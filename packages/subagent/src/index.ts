@@ -55,20 +55,37 @@ export default function subagentExtension(pi: ExtensionAPI, dependencies: Subage
     });
   } catch { }
 
-  pi.registerTool(defineSubagentTool({
+  const prepareInvocation = async (ctx: ExtensionContext) => {
+    const settings = await timingAsync(
+      "tool.prepareRuntime",
+      { hasUI: ctx.hasUI, cwd: ctx.cwd },
+      () => prepareSubagentRuntime({ ctx, settingsStore, runtime, agentRegistry }),
+    );
+    currentSettings = settings;
+    updateSubagentWidget(ctx, runtime.listConversations(), settings);
+    return settings;
+  };
+  const registerTool = (agentNames: readonly string[] = [], modelIds: readonly string[] = []) => pi.registerTool(defineSubagentTool({
     runtime,
     agentRegistry,
-    prepareInvocation: async (ctx: ExtensionContext) => {
-      const settings = await timingAsync(
-        "tool.prepareRuntime",
-        { hasUI: ctx.hasUI, cwd: ctx.cwd },
-        () => prepareSubagentRuntime({ ctx, settingsStore, runtime, agentRegistry }),
-      );
-      currentSettings = settings;
-      updateSubagentWidget(ctx, runtime.listConversations(), settings);
-      return settings;
-    },
+    prepareInvocation,
+    agentNames,
+    modelIds,
   }));
+  registerTool();
+  pi.on("session_start", async (_event, ctx) => {
+    await prepareInvocation(ctx);
+    registerTool([...agentRegistry.agents.keys()], availableModelIds(ctx));
+  });
+}
+interface ModelSchemaContext {
+  modelRegistry: { getAvailable(): Array<{ provider: string; id: string }> };
+  scopedModels?: readonly { model: { provider: string; id: string } }[];
+}
+
+export function availableModelIds(ctx: ModelSchemaContext): string[] {
+  const models = ctx.scopedModels?.length ? ctx.scopedModels.map(entry => entry.model) : ctx.modelRegistry.getAvailable();
+  return [...new Set(models.map(model => `${model.provider}/${model.id}`))];
 }
 
 export interface SubagentEventBus { emit(event: string, data: unknown): void }
