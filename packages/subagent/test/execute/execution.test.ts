@@ -204,6 +204,33 @@ test("resolves requested skills and reports discovery and read failures", () => 
     readSkillFile: () => { throw new Error("permission denied"); },
   })).toEqual({ ok: false, error: "Could not load requested skill: permission denied" });
 });
+test("injects requested skills into the system prompt without splitting the task prompt", async () => {
+  const prompts: string[] = [];
+  let capturedSystemPrompt = "";
+  const session = {
+    messages: [{ role: "assistant", content: [{ type: "text", text: "done" }] }],
+    subscribe: () => () => {},
+    prompt: vi.fn(async (prompt: string) => { prompts.push(prompt); }),
+    abort: vi.fn(),
+  } as any;
+  const agent = new Conversation("amber-acorn" as any, { ...config, skills: ["review"] }, { kind: "spawn", agent: "worker", prompt: "handoff:\n  objective: review", label: "review" }, () => {});
+  await executeGeneration({ cwd: "/work", modelRegistry: registry(), model: undefined } as any, agent, agent.requireCurrentGeneration(), undefined, {
+    ...DEFAULT_EXECUTE_GENERATION_DEPENDENCIES,
+    getAgentDir: () => "/agent",
+    loadExtensionPaths: async () => [],
+    loadSkills: () => ({ skills: [{ name: "review", filePath: "/skills/review/SKILL.md", baseDir: "/skills/review" }] }),
+    readSkillFile: () => "---\nname: review\n---\nReview carefully.",
+    ResourceLoader: class {
+      constructor(options: any) { capturedSystemPrompt = options.systemPromptOverride(); }
+      async reload() {}
+    } as any,
+    createAgentSession: async () => ({ session }),
+  } as any);
+
+  expect(prompts).toEqual(["handoff:\n  objective: review"]);
+  expect(capturedSystemPrompt).toContain("<skill name=\"review\"");
+  expect(capturedSystemPrompt).toContain("Review carefully.");
+});
 
 test("resolves and validates relative and absolute requested working directories", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "generation-cwd-"));

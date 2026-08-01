@@ -58,11 +58,7 @@
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
-    "typebox": "*",
-    "pi-terminal-mux": "^0.2.2"
-  },
-  "peerDependenciesMeta": {
-    "pi-terminal-mux": { "optional": true }
+    "typebox": "*"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "^0.82.1",
@@ -70,7 +66,6 @@
     "@earendil-works/pi-tui": "^0.82.1",
     "typebox": "^1.1.38",
     "typescript": "~6.0.3",
-    "vitest": "^4.1.6",
-    "pi-terminal-mux": "^0.2.2"
+    "vitest": "^4.1.6"
   }
 }

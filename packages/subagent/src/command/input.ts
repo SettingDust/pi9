@@ -9,13 +9,7 @@ export function clamp(value: number, min: number, max: number) {
 function keybindingsMatch(
   keybindings: SubagentKeybindings,
   data: string,
-  keybinding:
-    | "tui.select.cancel"
-    | "tui.select.confirm"
-    | "tui.select.up"
-    | "tui.select.down"
-    | "tui.select.pageUp"
-    | "tui.select.pageDown",
+  keybinding: "tui.select.cancel" | "tui.select.confirm" | "tui.select.up" | "tui.select.down",
 ) {
   try {
     return keybindings?.matches(data, keybinding) ?? false;
@@ -38,14 +32,6 @@ export function isUpKey(data: string, keybindings?: SubagentKeybindings) {
 
 export function isDownKey(data: string, keybindings?: SubagentKeybindings) {
   return keybindingsMatch(keybindings, data, "tui.select.down") || matchesKey(data, "down") || data === "\x1b[B" || data === "j" || data === "J";
-}
-
-export function isPageUpKey(data: string, keybindings?: SubagentKeybindings) {
-  return keybindingsMatch(keybindings, data, "tui.select.pageUp") || matchesKey(data, "pageUp");
-}
-
-export function isPageDownKey(data: string, keybindings?: SubagentKeybindings) {
-  return keybindingsMatch(keybindings, data, "tui.select.pageDown") || matchesKey(data, "pageDown");
 }
 
 export function isShiftTabKey(data: string) {
