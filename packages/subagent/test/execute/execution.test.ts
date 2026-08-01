@@ -90,6 +90,10 @@ test("spawns a pane-owned run with a seeded child session under the parent", asy
 piInvocation: { command: "C:\\runtime\\node.exe", args: ["C:\\pi\\cli.js"] },
   }));
   expect(f.observePaneCompletion).toHaveBeenCalledWith({ handle: f.handle, onTick: expect.any(Function) });
+  const launchOptions = (f.launchPaneExecution.mock.calls as any)[0][0];
+  expect(launchOptions.piInvocation.args).toEqual(["C:\\pi\\cli.js"]);
+  expect(launchOptions.piInvocation.args.join(" ")).not.toContain("/skill");
+  expect(launchOptions.piInvocation.args.join(" ")).not.toContain("review");
 });
 test("consumes final pane activity when completion resolves before the first tick", async () => {
   const f = await paneFixture();
