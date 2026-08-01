@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { beforeEach, expect, test, vi } from "vitest";
-import { launchPaneExecution, createPaneGenerationExecutor, resetPaneExecutionStateForTests } from "../src/pane-execution.js";
+import { launchPaneExecution, createPaneGenerationExecutor, reopenPaneExecution, resetPaneExecutionStateForTests } from "../src/pane-execution.js";
 import { Conversation } from "../src/conversation.js";
 
 beforeEach(() => resetPaneExecutionStateForTests());
@@ -96,6 +96,27 @@ expect(JSON.parse(await readFile(`${sessionFile}.exit`, "utf8"))).toEqual({ type
 await expect(readFile(`${sessionFile}.launch.cjs`, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   expect(fakeMux.sendCommand.mock.calls[0]?.[1]).toContain("powershell.exe");
 });
+test("reopened panes load the read-only child extension in a separate pane", async () => {
+  const fakeMux = mux();
+  const sessionFile = path.join(await mkdtemp(path.join(tmpdir(), "pane-viewer-")), "child.jsonl");
+  await writeFile(sessionFile, "", "utf8");
+
+  await reopenPaneExecution({
+    cwd: path.dirname(sessionFile),
+    sessionFile,
+    extensionPaths: ["ignored-extension.ts"],
+    env: { OTHER: "value" },
+    piInvocation: { command: "pi", args: [] },
+    dependencies: { mux: fakeMux as any, sleep: async () => undefined, platform: "linux" },
+  });
+
+  const [, command, options] = fakeMux.sendLongCommand.mock.calls[0] as unknown as [string, string, { scriptPreamble: string }];
+  expect(options.scriptPreamble).toContain("PI_SUBAGENT_READONLY='1'");
+  expect(options.scriptPreamble).toContain("pane-child.ts");
+expect(options.scriptPreamble).not.toContain("'--no-extensions'");
+  expect(options.scriptPreamble).toContain("ignored-extension.ts");
+  expect(command).not.toContain("pane-child.ts");
+});
 
 test("pane Generation executor launches one child prompt and projects activity", async () => {
   const tmp = await mkdtemp(path.join(tmpdir(), "pane-exec-"));
@@ -132,6 +153,26 @@ test("pane Generation executor launches one child prompt and projects activity",
   expect(command).not.toContain("/skill");
   expect(result.activity.turns).toBe(1);
 });
+test("completed pane closes after child session shutdown is recorded", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "pane-shutdown-"));
+  const fakeMux = mux();
+  (fakeMux.pollForExit as any).mockResolvedValue({ reason: "structured_output", exitCode: 0, structuredOutput: "done" });
+  const activityFile = path.join(tmp, "parent", "tasks", "shutdown-g1.jsonl.activity.json");
+  const executor = createPaneGenerationExecutor({
+    mux: fakeMux as any,
+    platform: "linux",
+    loadExtensionPaths: async () => [],
+    sleep: async () => {
+      expect(fakeMux.closeSurface).not.toHaveBeenCalled();
+      await writeFile(activityFile, JSON.stringify({ version: 1, runningChildId: "shutdown:1", sequence: 1, updatedAt: Date.now(), latestEvent: "session_shutdown", phase: "done" }));
+    },
+  });
+  const conversation = new Conversation("shutdown" as any, definition, { kind: "spawn", agent: "worker", prompt: "done", label: "done" }, () => {});
+
+  await executor(ctx(tmp), conversation, conversation.latestGeneration);
+
+  expect(fakeMux.closeSurface).toHaveBeenCalledWith("pane-1");
+});
 test("pane Generation executor resumes with the retained child session file", async () => {
   const tmp = await mkdtemp(path.join(tmpdir(), "pane-resume-"));
   const fakeMux = mux();
@@ -159,33 +200,15 @@ async function runPane(fakeMux: ReturnType<typeof mux>, prompt: string, suffix =
   return executor(ctx(tmp), conversation, conversation.latestGeneration);
 }
 
-test("completed pane retention keeps a total budget of three child panes", async () => {
+test("terminal pane generations close automatically", async () => {
   const fakeMux = mux();
   let nextSurface = 0;
   fakeMux.createSurface.mockImplementation(() => `pane-${++nextSurface}`);
 
   for (let i = 0; i < 4; i++) await runPane(fakeMux, `done ${i}`, String(i));
 
-  expect(fakeMux.closeSurface).toHaveBeenCalledTimes(1);
-  expect(fakeMux.closeSurface).toHaveBeenCalledWith("pane-1");
-});
-
-test("active panes immediately trim retained completed allowance", async () => {
-  const fakeMux = mux();
-  let nextSurface = 0;
-  fakeMux.createSurface.mockImplementation(() => `active-${++nextSurface}`);
-
-  for (let i = 0; i < 3; i++) await runPane(fakeMux, `done ${i}`, `complete-${i}`);
-  expect(fakeMux.closeSurface).not.toHaveBeenCalled();
-
-  let releaseActive!: () => void;
-  fakeMux.pollForExit.mockImplementationOnce(() => new Promise(resolve => { releaseActive = () => resolve({ reason: "done", exitCode: 0 }); }));
-  const activePromise = runPane(fakeMux, "wait", "active");
-  await vi.waitFor(() => expect(releaseActive).toBeTypeOf("function"));
-
-  expect(fakeMux.closeSurface).toHaveBeenCalledWith("active-1");
-  releaseActive();
-  await activePromise;
+  expect(fakeMux.closeSurface).toHaveBeenCalledTimes(4);
+  expect(fakeMux.closeSurface.mock.calls.map(call => call[0])).toEqual(["pane-1", "pane-2", "pane-3", "pane-4"]);
 });
 test("cancelled pane generations are closed instead of retained", async () => {
   const tmp = await mkdtemp(path.join(tmpdir(), "pane-cancel-"));

@@ -7,7 +7,7 @@ import { completedGeneration, errorGeneration, interruptedGeneration, skippedGen
 import { discoverInheritedExtensionPaths, resolveCurrentPiInvocation, resolveModel, resolveRequestedSkills, resolveTaskCwd } from "./execute.js";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { projectPaneActivity, readPaneActivity } from "./pane-activity.js";
-const paneChildExtensionPath = fileURLToPath(new URL("./pane-child.ts", import.meta.url));
+export const paneChildExtensionPath = fileURLToPath(new URL("./pane-child.ts", import.meta.url));
 
 interface PollResult {
   reason: "done" | "ping" | "structured_output" | "sentinel";
@@ -86,14 +86,10 @@ export type PaneCompletionOutcome =
 
 const herdrSurfaces: string[] = [];
 let herdrNextDirection: "right" | "down" = "right";
-const MAX_RETAINED_CHILD_PANES = 3;
 const activePaneHandles = new Set<PaneExecutionHandle>();
-const completedPaneHandles: PaneExecutionHandle[] = [];
 export function resetPaneExecutionStateForTests(): void {
   for (const handle of activePaneHandles) handle.close();
-  for (const handle of completedPaneHandles) handle.close();
   activePaneHandles.clear();
-  completedPaneHandles.length = 0;
   herdrSurfaces.length = 0;
   herdrNextDirection = "right";
 }
@@ -147,9 +143,9 @@ export async function reopenPaneExecution(options: ReopenPaneExecutionOptions): 
     throw new Error(`Cannot reopen pane; session file is missing or inaccessible: ${options.sessionFile}`);
   }
   const invocation = options.piInvocation ?? resolveCurrentPiInvocation();
-  const args = [...(invocation.args ?? []), "--session", options.sessionFile];
+const args = [...(invocation.args ?? []), "--session", options.sessionFile];
   const unixArgs = [...(invocation.args ?? []), "--session", options.sessionFile];
-  for (const extensionPath of options.extensionPaths ?? []) {
+  for (const extensionPath of [...(options.extensionPaths ?? []), paneChildExtensionPath]) {
     args.push("-e", extensionPath);
     unixArgs.push("-e", extensionPath);
   }
@@ -157,7 +153,7 @@ export async function reopenPaneExecution(options: ReopenPaneExecutionOptions): 
     cwd: options.cwd,
     sessionFile: options.sessionFile,
     displayName: options.displayName,
-    env: options.env ?? {},
+    env: { ...options.env, PI_SUBAGENT_READONLY: "1" },
     invocation,
     args,
     unixArgs,
@@ -233,7 +229,6 @@ export function createPaneGenerationExecutor(dependencies: PaneExecutionDependen
       abort: async () => handle.interrupt(),
     });
     activePaneHandles.add(handle);
-    trimCompletedPaneHandles();
     conversation.retainPaneSurface(handle.surface, () => handle.close());
 
     const observe = () => {
@@ -242,15 +237,18 @@ export function createPaneGenerationExecutor(dependencies: PaneExecutionDependen
       if (snapshot) generation.activity.observe(snapshot, state?.usage);
     };
     conversation.retainSessionFile(sessionFile);
-    conversation.retainDisposable(() => handle.close());
 
     let outcome: PaneCompletionOutcome;
     try {
       outcome = await observePaneCompletion({ handle, signal, onTick: observe });
       observe();
-      releaseActivePane(handle, outcome.status === "completed" && generation.state.kind === "running");
+      if (outcome.status === "completed") await waitForPaneShutdown(activityFile, childId, dependencies.sleep ?? sleep);
+      observe();
+      releaseActivePane(handle);
+      conversation.clearRetainedPaneSurface(handle.surface);
     } catch (error) {
-      releaseActivePane(handle, false);
+      releaseActivePane(handle);
+      conversation.clearRetainedPaneSurface(handle.surface);
       throw error;
     }
     if (outcome.status === "cancelled") return interruptedGeneration(conversation, generation, "Agent interrupted.");
@@ -413,6 +411,12 @@ async function observePaneCompletion(options: { handle: PaneExecutionHandle; sig
     throw error;
   }
 }
+async function waitForPaneShutdown(activityFile: string, childId: string, wait: (milliseconds: number) => Promise<void>): Promise<void> {
+  for (let attempt = 0; attempt < 40; attempt++) {
+    if (readPaneActivity(activityFile, childId)?.latestEvent === "session_shutdown") return;
+    await wait(25);
+  }
+}
 
 async function loadMux(): Promise<TerminalMux> {
   const packageName = "pi-terminal-mux";
@@ -429,14 +433,8 @@ function powerShellLiteral(value: string): string { return `'${value.replaceAll(
 function windowsCommandLineQuote(value: string): string { return `"${value.replaceAll('"', '\\"')}"`; }
 function isMissingPaneError(error: unknown): boolean { const message = error instanceof Error ? error.message : String(error); return message.includes("pane_not_found") || message.includes("pane not found"); }
 function clearCompletionSidecar(file: string): void { if (existsSync(file)) try { unlinkSync(file); } catch {} }
-function releaseActivePane(handle: PaneExecutionHandle, retainCompleted: boolean): void {
+function releaseActivePane(handle: PaneExecutionHandle): void {
   activePaneHandles.delete(handle);
-  if (retainCompleted) completedPaneHandles.push(handle);
-  else handle.close();
-  trimCompletedPaneHandles();
-}
-function trimCompletedPaneHandles(): void {
-  const allowance = Math.max(0, MAX_RETAINED_CHILD_PANES - activePaneHandles.size);
-  while (completedPaneHandles.length > allowance) completedPaneHandles.shift()?.close();
+  handle.close();
 }
 function sleep(milliseconds: number): Promise<void> { return new Promise(resolve => setTimeout(resolve, milliseconds)); }

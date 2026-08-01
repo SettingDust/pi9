@@ -47,8 +47,13 @@ function renderDoneCall(args: { result?: unknown }, _theme: Theme): Component {
   catch { text = String(args.result); }
   return new Text(`subagent_done: ${text}`, 0, 0);
 }
+function enableReadOnlyViewer(pi: ExtensionAPI): void {
+  const on = pi.on.bind(pi) as (event: string, handler: (value: any) => any) => void;
+  on("input", () => ({ action: "handled" }));
+}
 
 export default function paneChild(pi: ExtensionAPI) {
+  if (process.env.PI_SUBAGENT_READONLY === "1") { enableReadOnlyViewer(pi); return; }
   const completionFile = process.env.PI_SUBAGENT_COMPLETION_FILE;
   if (!completionFile) return;
   const recorder = createPaneActivityRecorder(process.env.PI_SUBAGENT_RUN_ID, process.env.PI_SUBAGENT_ACTIVITY_FILE);

@@ -21,6 +21,7 @@ beforeEach(() => {
   delete process.env.PI_SUBAGENT_SKILLS;
   delete process.env.PI_SUBAGENT_RUN_ID;
   delete process.env.PI_SUBAGENT_ACTIVITY_FILE;
+delete process.env.PI_SUBAGENT_READONLY;
 });
 
 test("injects requested native skills into every child agent start", async () => {
@@ -49,4 +50,15 @@ test("missing requested skills inject a fatal caller_ping instruction instead of
   expect(result.systemPrompt).toContain("Fatal subagent setup error");
   expect(result.systemPrompt).toContain("Requested skill is unavailable: missing-skill");
   expect(result.systemPrompt).toContain("caller_ping");
+});
+test("read-only viewer handles every input without registering execution tools", () => {
+  process.env.PI_SUBAGENT_READONLY = "1";
+  const { pi, handlers, tools } = fixture();
+
+  paneChild(pi);
+  const input = handlers.get("input")![0]!;
+  expect(input({ text: "hello", source: "interactive" })).toEqual({ action: "handled" });
+  expect(input({ text: "resume", source: "rpc" })).toEqual({ action: "handled" });
+  expect(input({ text: "steer", source: "extension" })).toEqual({ action: "handled" });
+  expect(tools).toHaveLength(0);
 });

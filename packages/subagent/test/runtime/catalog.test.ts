@@ -234,20 +234,18 @@ test("removal disposes retained conversation resources", async () => {
   await expect(manager.removeConversation(root.conversationId)).resolves.toMatchObject({ ok: true, conversationId: root.conversationId });
   expect(disposed).toEqual([root.conversationId]);
 });
-test("completed pane conversations reopen only after retained pane is gone", async () => {
+test("completed pane conversations open a read-only viewer from the retained session", async () => {
   const tmp = await mkdtemp(path.join(tmpdir(), "subagent-open-"));
-  const closed: string[] = [];
   const paneExecutor = async (_ctx: any, conversation: any, generation: any) => {
     conversation.retainSessionFile(path.join(tmp, "child.jsonl"));
-    conversation.retainPaneSurface("old-pane", () => closed.push("old-pane"));
     return completedGeneration(conversation, generation, generation.prompt);
   };
   const reopenCalls: string[] = [];
   const manager = new SubagentRuntime(registry, 1, paneExecutor, 100, 5_000, {
-    retainedPaneExists: async surface => surface === "old-pane" ? false : true,
+    retainedPaneExists: async () => true,
     reopenPaneExecution: async options => {
       reopenCalls.push(options.sessionFile);
-      return { surface: "new-pane", send() {}, interrupt() {}, close: () => closed.push("new-pane"), wait: async () => ({ reason: "done", exitCode: 0 }) } as any;
+      return { surface: "viewer-pane", send() {}, interrupt() {}, close() {}, wait: async () => ({ reason: "done", exitCode: 0 }) } as any;
     },
     getPiInvocation: () => ({ command: "pi", args: [] }),
   });
@@ -258,21 +256,44 @@ test("completed pane conversations reopen only after retained pane is gone", asy
   await expect(manager.openConversationPane(ctx, identity.conversationId)).resolves.toEqual({ status: "reopened" });
   await expect(manager.openConversationPane(ctx, identity.conversationId)).resolves.toEqual({ status: "already-open" });
   expect(reopenCalls).toEqual([path.join(tmp, "child.jsonl")]);
-  expect(closed).toEqual(["old-pane"]);
+});
+test("read-only viewer reopens safely when pane liveness is unavailable", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "subagent-viewer-"));
+  const closed: string[] = [];
+  let viewer = 0;
+  const manager = new SubagentRuntime(registry, 1, async (_ctx, conversation, generation) => {
+    conversation.retainSessionFile(path.join(tmp, "child.jsonl"));
+    return completedGeneration(conversation, generation, generation.prompt);
+  }, 100, 5_000, {
+    retainedPaneExists: async () => undefined,
+    reopenPaneExecution: async () => {
+      const surface = `viewer-${++viewer}`;
+      return { surface, close: () => closed.push(surface) };
+    },
+    getPiInvocation: () => ({ command: "pi", args: [] }),
+  });
+  const start = manager.startTasks(ctx, [{ kind: "spawn", agent: "worker", prompt: "done", label: "done" }] as any);
+  await start.completion;
+  const identity = start.starts[0] as any;
+
+  await manager.openConversationPane(ctx, identity.conversationId);
+  await manager.openConversationPane(ctx, identity.conversationId);
+
+  expect(closed).toEqual(["viewer-1"]);
+  expect(manager.conversation(identity.conversationId).paneOpenable).toBe(true);
 });
 
-test("open pane rejects active or unsafe retained panes", async () => {
+test("open pane rejects active conversations", async () => {
   let release!: () => void;
   const gate = new Promise<void>(done => { release = done; });
   const activeExecutor = async (_ctx: any, conversation: any, generation: any) => {
     conversation.retainSessionFile("/tmp/child.jsonl");
-    conversation.retainPaneSurface("pane", () => {});
     await gate;
     return completedGeneration(conversation, generation, generation.prompt);
   };
   const manager = new SubagentRuntime(registry, 1, activeExecutor, 100, 5_000, {
-    retainedPaneExists: async () => undefined,
-    reopenPaneExecution: async () => { throw new Error("should not reopen"); },
+    retainedPaneExists: async () => true,
+    reopenPaneExecution: async () => ({ surface: "viewer", close() {} }),
     getPiInvocation: () => ({ command: "pi", args: [] }),
   });
   const start = manager.startTasks(ctx, [{ kind: "spawn", agent: "worker", prompt: "active", label: "active" }] as any);
@@ -281,7 +302,6 @@ test("open pane rejects active or unsafe retained panes", async () => {
   await expect(manager.openConversationPane(ctx, identity.conversationId)).rejects.toThrow("active");
   release();
   await start.completion;
-  await expect(manager.openConversationPane(ctx, identity.conversationId)).rejects.toThrow("Cannot safely reopen");
 });
 
 test("removal rejects an entire subtree when a descendant is active", async () => {

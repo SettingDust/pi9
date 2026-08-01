@@ -333,12 +333,21 @@ export class Conversation {
   sessionFileForResume(): string | undefined { return this.retainedSessionFile; }
   get isPaneOpenable(): boolean {
     const latest = this.latestGeneration;
-    return !this.stopping && latest.state.kind === "done" && this.retainedSessionFile !== undefined && this.retainedPane !== undefined;
+    return !this.stopping && latest.state.kind === "done" && this.retainedSessionFile !== undefined;
   }
   retainPaneSurface(surface: string, dispose: () => void): void {
     this.retainedPane?.dispose();
     this.retainedPane = { surface, dispose };
     this.retainDisposable(dispose);
+  }
+  clearRetainedPaneSurface(surface: string): void {
+    if (this.retainedPane?.surface === surface) this.retainedPane = undefined;
+  }
+  disposeRetainedPaneSurface(surface: string): void {
+    if (this.retainedPane?.surface !== surface) return;
+    const retained = this.retainedPane;
+    this.retainedPane = undefined;
+    retained.dispose();
   }
   retainedPaneSurface(): string | undefined { return this.retainedPane?.surface; }
   retainDisposable(dispose: () => void): void { this.disposables.push(dispose); }

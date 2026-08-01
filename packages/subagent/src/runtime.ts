@@ -284,10 +284,12 @@ export class SubagentRuntime {
     const sessionFile = conversation.sessionFileForResume();
     if (!conversation.isPaneOpenable || !sessionFile) throw new Error(`Subagent ${conversationId} does not have a retained pane session.`);
     const retained = conversation.retainedPaneSurface();
-    if (!retained) throw new Error(`Subagent ${conversationId} has no retained pane handle.`);
-    const exists = await this.openPaneDependencies.retainedPaneExists(retained);
-    if (exists === undefined) throw new Error("Cannot safely reopen a pane on this multiplexer backend.");
-    if (exists === true) return { status: "already-open" };
+    if (retained) {
+      const exists = await this.openPaneDependencies.retainedPaneExists(retained);
+      if (exists === true) return { status: "already-open" };
+      if (exists === undefined) conversation.disposeRetainedPaneSurface(retained);
+      else conversation.clearRetainedPaneSurface(retained);
+    }
     const cwd = resolveTaskCwd(ctx.cwd, conversation.requestedConfig.cwd);
     if (!cwd.ok) throw new Error(cwd.error);
     const execution = await this.openPaneDependencies.reopenPaneExecution({
