@@ -1,19 +1,17 @@
 # @pi9/subagent
 
-Delegate focused work from Pi to context-isolated child conversations. The single `subagent` tool provides agent discovery, side-effect-free inventory and inspection, asynchronous runs, live steering, blocking retrieval, explicit cleanup, recursive delegation, and live progress.
+Delegate focused work from Pi to context-isolated child conversations. The `subagent` tool provides agent discovery, asynchronous delegation, live steering and inspection, blocking result collection, recursive delegation, cancellation, and explicit cleanup.
 
-![The complete subagent workflow: discover agents, start and list parallel runs, join their results, and remove their conversations](media/subagent-overview.png)
+![The complete subagent workflow](media/subagent-overview.png)
 
 ## Feature overview
 
-- **Retained conversations** preserve child context for follow-up runs until the parent explicitly removes the conversation.
-- **Asynchronous runs and exact joins** let the parent continue working after spawning or resuming work, then wait for and retrieve specific runs by ID.
-- **Bounded inspection, steering, and cancellation** let the parent check progress, redirect an active run, or stop it while retaining its outcome.
-- **Recursive delegation** lets subagents run, inspect, steer, cancel, and join their own descendants under tree-wide ownership and concurrency rules.
-- **Live progress** shows queued and running work, recent tool activity, recursive children, and completed answers in tool and widget views.
-- **Unified conversation management** provides live status, completed output, follow-up prompts, agent discovery, cleanup, and settings through `/subagents`.
-- **Focused tool actions** separate agent discovery, side-effect-free inventory, task execution, blocking retrieval, and cleanup without adding multiple tools to the parent context.
-- **Minimal tool prompt size** keeps delegation overhead low and reduces context bloat in the parent conversation.
+- **Parallel, non-blocking delegation** lets Pi hand off focused tasks and keep working while they run.
+- **Stateful follow-ups** preserve each subagent's context so completed work can continue without starting over.
+- **Live visibility and control** provide progress, recent activity, steering, and cancellation while work is running.
+- **Recursive delegation** lets subagents coordinate their own children under shared ownership and concurrency limits.
+- **Context-efficient tooling** uses a compact, purpose-built schema for precise delegation and lifecycle control with minimal context overhead.
+- **Built-in management** brings status, results, follow-ups, cleanup, and settings together in `/subagents`.
 
 ## Install
 
@@ -23,9 +21,7 @@ pi install npm:@pi9/subagent
 
 ## Define agents
 
-Agent markdown is discovered from Pi-managed packages, the user `${PI_AGENT_DIR ?? ~/.pi/agent}/agents` directory, and the nearest project `.pi/agents`. Packages declare recursive agent directories with the standard `pi.agents` array in `package.json` (for example, `"pi": { "agents": ["./agents"] }`). Project definitions override same-named user and package definitions by default; user definitions override package definitions.
-
-For example, `.pi/agents/scout.md` defines a project-local read-only agent:
+Agent markdown is discovered from `${PI_AGENT_DIR ?? ~/.pi/agent}/agents` and the nearest project `.pi/agents`. Project definitions override same-named user definitions.
 
 ```markdown
 ---
@@ -41,106 +37,82 @@ Inspect the repository and return concise, evidence-backed findings.
 | Frontmatter | Required | Meaning |
 | --- | --- | --- |
 | `name` | yes | Runtime agent name. |
-| `description` | yes | Non-blank discovery summary. |
-| `model` | no | `provider/model` or an unambiguous model id. |
+| `description` | yes | Nonblank discovery summary. |
+| `model` | no | `provider/model` or an unambiguous model ID. |
 | `thinking` | no | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. |
 | `tools` | no | Comma-separated allowlist; include `subagent` for recursive delegation. |
-| `skills` | no | Comma-separated default skills. A spawn-task value replaces this list. |
+| `skills` | no | Comma-separated default skills. A spawn value replaces this list. |
 
-The body becomes the child system prompt. `spawn` accepts a `spawns` array whose entries require `agent` and `prompt`; `label` is optional, and entries may override supported execution options such as model, thinking, working directory, and skills. A model requested by either the task or agent definition must resolve; an unknown or malformed value fails that task instead of falling back. When neither specifies a model, the child inherits the parent's model. An explicit task `cwd` is resolved relative to the parent's working directory and must identify an existing directory. `resume` accepts a `resumes` array whose entries identify a conversation and create another run with the supplied prompt; the conversation's agent and execution context remain fixed. `messages` entries identify an active run and queue the supplied `message` through Pi's steering boundary without creating another run. `cancel` targets exact queued or running runs by `runId`.
+The body becomes the child system prompt. Every spawn requires `agent`, `prompt`, and a nonblank `label`. Duplicate labels are allowed; `subagentId` remains the unique handle. Entries may override model, thinking, working directory, and skills.
 
 ## Tool actions
 
 | Action | Behavior |
 | --- | --- |
-| `agents` | Discover agent definitions and their resolved defaults. |
-| `list` | Return a lightweight inventory of conversations and runs, including recursive lineage, without run output. It is pure: it acknowledges nothing and changes no lifecycle state. |
-| `spawn` | Start the ordered `spawns` batch asynchronously. Each accepted task creates a conversation and its first run. |
-| `resume` | Start the ordered `resumes` batch asynchronously. Each accepted task creates another run in an existing conversation. |
-| `steer` | Send `messages` to existing running runs and return ordered lifecycle receipts after Pi accepts each message. |
-| `cancel` | Abort exact queued or running runs while retaining their conversations and aborted outcomes for `inspect` and `join`. Malformed, unknown, terminal, or unauthorized targets become ordered per-target errors. |
-| `inspect` | Return bounded status, recursive lineage, requested overrides, effective execution configuration, running phase, current message, recent tool activity, steer receipts, and terminal error diagnostics for exact runs without waiting or acknowledging them. Invalid targets become ordered per-target errors. Terminal output is omitted. |
-| `join` | Block until every valid explicitly requested exact run settles, then return and acknowledge those runs. Malformed, unknown, or unauthorized targets become ordered per-target errors without hiding valid sibling outcomes. There is no timeout. Cancelling `join` stops only the wait; it does not stop the underlying runs. |
-| `remove` | Permanently delete terminal conversations and all their run records. Active conversations are rejected with the active `runId`; cancel and join that run before removal. |
+| `agents` | List available agent definitions. |
+| `list` | List direct children, with a minimal read-only descendant tree. Filter direct children with `statuses` and/or `joined`. |
+| `spawn` | Start an ordered batch of labelled subagents asynchronously. |
+| `resume` | Continue a joined subagent that retained a resumable session. |
+| `steer` | Send messages to running direct children. |
+| `cancel` | Idempotently settle direct children as cancelled while retaining context and partial results. |
+| `inspect` | Return bounded current status, configuration, and progress for any descendant without waiting. |
+| `join` | Wait for and collect a direct child's result. It blocks while active and is idempotent after completion. |
+| `remove` | Permanently remove inactive direct-child subtrees. An active descendant rejects removal. |
 
-Parallel runs stream their current status and recent tool activity independently:
+Live-subagent results include the latest one-based `generation` and `actionHints`: snapshot-derived suggestions that may become stale as the subagent changes state. `status` and `joined` describe that generation; resuming keeps the same `subagentId`, increments `generation`, and resets `joined` for the new result.
 
-![Two parallel subagent runs with one completed and one still exploring the codebase](media/live-parallel-runs.png)
+A caller can inspect any subagent in its descendant tree, but can mutate only its direct children. Top-level subagents belong to the main Pi session, while recursively delegated work remains under its immediate parent.
 
-Every processed invocation returns `{ action, results }`; a command-level failure returns `{ action, error }`. Provider-level schema violations can reject a tool call before execution, and settings-preparation failures can prevent an envelope from being produced.
+## How subagents work
 
-`agents` and `list` return their discovered entities directly in `results`. For `spawn`, `resume`, `steer`, `cancel`, `inspect`, `join`, and `remove`, every requested item produces one ordered result: `{ ok: true, data }` when that item was processed or `{ ok: false, error }` when it failed. Item-level failures do not prevent valid siblings from proceeding. Streaming `join` updates use the same envelope as its final result.
+Subagents are context-isolated Pi conversations created from reusable agent definitions. They share the working filesystem with the main session, but keep their own prompts, tools, and conversation history.
 
-Invalid outer invocations—including a missing or unknown action, absent or empty inputs, and batch-limit violations—return a command-level `error`. Malformed target IDs remain ordered item failures rather than rejecting valid siblings.
+### Parallel delegation
 
-Successful steer outcomes include a `steer` receipt with a per-run numeric ID, state, and timestamps. Receipt states advance from `queued` when Pi accepts the message, to `delivered` when the steering user message enters the child turn, and to `processed` when the assistant begins responding with that message in context. `processed` does not mean the requested work succeeded. A run that terminates before a queued or delivered steer is processed marks that receipt `discarded`.
+Delegated work starts asynchronously, allowing Pi to launch several focused tasks and continue working while they run. Each task streams its own progress and recent activity. When a result is needed, Pi joins that specific subagent and waits for its current work to finish.
 
-For example, a `spawn` call returns one result for each entry in `spawns`:
+![Two parallel subagents](media/live-parallel-subagents.png)
 
-```json
-{
-  "action": "spawn",
-  "results": [
-    {
-      "ok": true,
-      "data": { "label": "auth map", "conversationId": "quiet-otter", "runId": "search-boldly" }
-    },
-    { "ok": false, "error": "Unknown agent: missing." }
-  ]
-}
-```
+### Follow-up work
 
-Rejected spawn tasks receive no allocated `conversationId` or `runId`; failed resume and steer items may echo the requested target identity. Accepted spawn and resume tasks enter the run lifecycle; accepted steer messages return the existing target identities and do not create lifecycle records.
+A subagent keeps the same identity and conversation context after finishing. Once its result has been joined, Pi can resume it with a follow-up prompt instead of explaining the task again or creating a replacement. Follow-ups appear as successive generations in the subagent's history.
 
-A run belongs to one conversation. Spawning creates both; a follow-up creates another run in an existing conversation. Every conversation remains available in the runtime inventory until explicitly removed, including after successful, failed, or interrupted work.
+### Live progress and control
 
-`canResume` becomes true after a completed, interrupted, or cancelled run when the conversation session remains available and all execution cleanup has settled. It remains false while work is queued, active, or still stopping, and after failures that did not preserve context.
+Running work can be inspected without interrupting it. Pi can also steer a subagent with an additional message or cancel work that is no longer needed. Cancellation retains any reusable context and partial diagnostics, but cannot undo external side effects that have already occurred.
 
-`inspect`, steer messages, `cancel`, and `join` are keyed by `runId`, not merely by conversation. `list` and successful inspections expose `rootRunId`, `depth`, and `parentRunId` when a run was recursively spawned, so callers can reconstruct delegation trees without parsing labels or output. Top-level runs and resumed runs without a spawning parent are roots with `depth: 0`. Inspection is pure and bounded; it preserves input order, and malformed, duplicate, unknown, or unauthorized targets return `{ ok: false, error }` in their matching result positions without hiding valid sibling snapshots. A running snapshot keeps `status: "running"` for compatibility and adds a finer `phase`: `starting`, `thinking`, `processing_steer`, `responding`, `executing_tool`, or `settling`. It also includes explicit `requestedOverrides` when present and `effectiveConfig` after the child session resolves its model, thinking level, working directory, skills, and tools. Terminal failures include a compact `errorSnippet` capped at 500 characters, but terminal output remains exclusive to `join`; inspection neither waits for nor acknowledges outcomes. Inspection also includes the five most recent steer receipts. Steering is accepted only while the exact target is running and takes effect after its current assistant turn finishes executing tool calls. A root/top-level join waits for, returns, and acknowledges each valid requested run, even when one of its conversations has newer work. Join preserves input order; malformed, duplicate, unknown, or unauthorized targets return `{ ok: false, error }` entries while valid siblings still complete normally. An inspect, steer, cancel, or join issued by a child may target only runs spawned anywhere beneath that child's exact owner run; sibling, ancestor, and unrelated runs become per-target errors.
+### Recursive delegation
 
-Only descendants named in an explicit nested join block that caller. Unjoined descendants continue independently and detach when their parent finishes. Nested answers are returned directly to the child that joined them, but their output is omitted from ancestor tree rendering; ancestor views retain lifecycle and identity context without copying target answers. Nested join-attempt history is runtime-local and is not restored after restart or extension reload.
+Subagents can delegate work to children of their own. Ownership follows the delegation tree, and concurrency is shared across the entire tree so nested work follows the same limits as top-level work.
 
-![A technical-lead subagent joining two nested investigations with live tool activity](media/recursive-delegation.png)
+![Recursive delegation](media/recursive-delegation.png)
 
-Cancellation settles a queued or running run as `aborted` and preserves its conversation and exact run record, so the caller can inspect or join the outcome. Queued runs are removed before execution. Once pane interruption and execution cleanup have both settled, a preserved conversation becomes resumable. Removal accepts only terminal conversations and permanently deletes the conversation, child session state, and every associated run record; removed IDs can no longer be resumed, inspected, joined, steered, or cancelled. Surviving descendants are reparented to the nearest retained ancestor so recursive ownership and reported lineage remain operational.
+### Results and cleanup
 
-## Capacity and concurrency
+Joining collects a finished result and is safe to repeat. Every final joined result includes `output`, using `null` when the generation produced no text. Removal is a separate, explicit step that permanently deletes an inactive subagent and all of its descendants. If any work in the subtree is still active, removal is rejected until that work finishes or is cancelled.
 
-Concurrency is shared across the entire recursive delegation tree. `maxConversations` defaults to `100`. Once that many conversations are present, new spawns are rejected until one or more conversations are removed; existing conversations can still be inspected, joined, or cleaned up.
+## Capacity and UI
 
-Settings are stored at `${PI_AGENT_DIR ?? ~/.pi/agent}/subagent/settings.json`. The widget defaults to **summary** mode, a one-line count of running, queued, and all retained conversations; **progress** mode instead shows active queued/running rows and respects the `Progress rows` limit in `/subagents settings`. Retained conversations remain counted after they settle until explicit `remove`. Existing `widgetLayout: "columns"` or `"stacked"` settings migrate to progress mode, while `"auto"` (or no legacy value) becomes summary; saved settings use `widgetMode`.
+Concurrency is shared across the recursive tree. `maxConversations` defaults to `100`; new spawns are rejected at capacity until subagents are removed. Existing subagents can still be inspected, joined, resumed when eligible, or removed.
 
-## Notifications, UI, and lifecycle
+Settings are stored at `${PI_AGENT_DIR ?? ~/.pi/agent}/subagent/settings.json`. `/subagents` opens the inventory, agent browser, and settings UI. The overlay retains a **Previous generations** section, while `inspect` exposes the same generation-native history with bounded metadata and without outputs.
 
-Completion notifications alert the parent to terminal outcomes it has not otherwise observed. Their status-neutral header says subagents “finished,” while each entry retains its exact terminal status. A terminal `inspect` or successful `cancel` suppresses a later notification for that run without retrieving or acknowledging its outcome; inspecting an active run does not suppress notification if it settles later. `list` remains pure and does not suppress notifications. Joining a run retrieves and acknowledges that exact outcome, while cleanup clears notifications associated with removed conversations. Delivery waits through a fixed grace window and tool-call-scoped inspect, cancel, or join claims shared across root and recursive agents, so immediate lifecycle handling can finish before notifications are coalesced and sent.
+The widget defaults to summary mode. Progress mode shows queued/running rows up to the configured limit.
 
-`/subagents` opens the conversation, agent, and settings UI. It provides live pane-backed status and progress, cancellation of queued or running work, access to completed output, follow-up prompts when `canResume` is true, and permanent terminal-conversation cleanup. Spawn and resume create a dedicated terminal surface whose Pi process exclusively executes and writes that child session; the parent observes activity and completion sidecars instead of opening a second process on the same JSONL. A completed pane remains open for inspection. Resuming that conversation replaces its retained pane, and removing the conversation closes it.
+## Notifications
 
-Pane execution requires `pi-terminal-mux` and a supported active terminal multiplexer. Install the package beside this one with `npm install --legacy-peer-deps pi-terminal-mux@^0.2.2`. It remains an optional peer because its current `pi-extensions-i18n` dependency declares a stale Pi `<0.81` peer range; installing it transitively would pull a duplicate legacy Pi runtime into current hosts. Without a steer-capable mux surface, a run fails explicitly instead of silently falling back to a headless process that cannot receive `steer` messages.
-Managed pane placement uses the mux backend's breadth-first alternating split layout: the first child splits to the right of the main Pi pane, then later children split right/down within the child region. This keeps the left-side main conversation as the largest stable pane instead of repeatedly splitting it.
+Pi notifies you when delegated work finishes unless the result has already been observed or collected. Cancelling work also suppresses a redundant completion notification. Listing subagents does not acknowledge their results.
+## Pi9 downstream migration notes
 
-The package emits lifecycle updates for queued, started, and completed work. Nested join changes emit `subagent:updated` with `kind: "nestedJoin"` and the owner conversation snapshot; they do not create additional queued, started, or completed milestones. Identifiers, run records, child conversation context, and nested join-attempt history are runtime-local only. They are not restored after a process restart or extension reload.
+This package tracks upstream `@pi9/subagent` closely. During upstream syncs, keep upstream files as the baseline and migrate only the downstream capabilities that still have no upstream equivalent.
 
-Spawn and resume tasks remain asynchronous regardless of recursive delegation. Steer messages are sent to the running pane and return after the mux accepts them; they do not wait for the target to act. Cancel waits for in-flight steering, sends Escape, and completes through the pane sidecar/polling lifecycle.
+| Downstream capability | Upstream status | Migration decision |
+| --- | --- | --- |
+| Package agent discovery via standard `package.json` `pi.agents` | Not present upstream; upstream discovers user and project agents only. | Keep. Reapply through `AgentRegistry` without changing public lifecycle semantics. |
+| Dynamic `spawn.agent` and `spawn.model` schemas | Not present upstream. Upstream keeps compact string fields and validates at runtime. | Keep. Re-register the tool at `session_start` with discovered agent names and available/scoped canonical model IDs; retain runtime `Unknown agent/model` checks. |
+| Native multi-skill startup with the delegated task as the first prompt | Upstream still uses ordinary lifecycle execution. | Keep when pane execution is migrated. Requested skills must flow through child environment/system prompt injection, not extra positional `/skill` prompts. |
+| `subagent_done` result rendering and completion-reminder wording | Upstream has completion notifications and generation-native output handling. | Re-evaluate. Preserve only user-visible improvements that are not already covered by upstream output/result rendering. |
+| Pane-owned execution, Herdr placement, retained completed panes, closed-pane reopen, launcher failure sidecars, and atomic launcher prompts | Not present upstream; upstream executes through generation runtime boundaries. The current upstream launcher command form would reintroduce prompt splitting and infinite waits on early script failure. | Migrate separately after the Generation baseline is stable. Do not reintroduce old Run types; adapt pane ownership to generations and preserve launcher sidecar/atomic-prompt guarantees. |
+| Total child-pane retention budget of three | Not present upstream and depends on pane-owned execution. | Defer until pane execution is migrated. |
 
-## Major-version migration
-
-There is no compatibility layer for the previous lifecycle API.
-
-| Previous term or behavior | New contract |
-| --- | --- |
-| `dispatch` or `run` action | Use `spawn`, `resume`, or `steer`; there is no compatibility alias. |
-| `foreground` / `background` dispatch | Spawn and resume tasks always start asynchronously; use `join` when blocking retrieval is needed. |
-| `results` action | `join` waits for and retrieves an exact run. |
-| `sessionId` | Use `conversationId` for conversation lifecycle and `runId` for exact-run retrieval. |
-| `retainConversation` | Every conversation remains in the runtime until explicit `remove`. |
-| `widgetLayout` | Use `widgetMode`: legacy `columns`/`stacked` becomes `progress`; `auto` becomes the default `summary`. |
-
-## Architecture
-
-- `src/agents.ts` owns agent definitions, discovery, parsing, and requested configuration.
-- `src/conversation.ts` and `src/activity.ts` own persistent conversations, exact runs, retained pane controls, lifecycle state, and live activity.
-- `src/runtime.ts` owns the conversation catalog, cancellation, joining, scheduling, queue limits, cleanup, and exact run records; `src/execute.ts` and `src/pane-*.ts` own pane-backed child execution, sidecars, and completion observation.
-- `src/schema.ts` and `src/tool.ts` own provider-facing validation and tool actions.
-- `src/notifications.ts`, `src/widget.ts`, and `src/command/` own the three user-facing presentation surfaces.
-- `src/settings.ts`, `src/identifiers.ts`, and `src/index.ts` own configuration, runtime-local identifiers, and Pi extension composition respectively.
+Migration gates: each migrated capability needs focused tests, package typecheck, Subagent tests, `git diff --check`, and an independent correctness review before merging back to `main`.

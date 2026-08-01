@@ -2,7 +2,6 @@ import type { Theme, ThemeColor } from "@earendil-works/pi-coding-agent";
 import {
   Input,
   Markdown,
-  matchesKey,
   type Component,
   type Focusable,
   type MarkdownTheme,
@@ -11,12 +10,12 @@ import {
   visibleWidth,
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import type { AgentConfig } from "../agents.js";
-import { effectiveStatus, type ConversationSnapshot, type RunSnapshot } from "../conversation.js";
-import { formatElapsed, formatTokens, runElapsedMs } from "../run-format.js";
+import type { AgentDefinition } from "../agents.js";
+import { effectiveStatus, type ConversationSnapshot, type GenerationSnapshot } from "../conversation.js";
+import { formatElapsed, formatTokens, generationElapsedMs, statusColor } from "../generation-format.js";
 import type { SubagentRuntime } from "../runtime.js";
 import { DEFAULT_SUBAGENT_SETTINGS, type SubagentSettings } from "../settings.js";
-import { clamp, isCancelKey, isDownKey, isEnterKey, isPageDownKey, isPageUpKey, isShiftTabKey, isUpKey, type SubagentKeybindings } from "./input.js";
+import { clamp, isCancelKey, isDownKey, isEnterKey, isShiftTabKey, isUpKey, type SubagentKeybindings } from "./input.js";
 import { filterAgents, projectConversations, type ConversationLayoutMode } from "./overlay-model.js";
 import { SubagentSettingsComponent, type SubagentSettingsChange } from "./settings.js";
 
@@ -31,14 +30,14 @@ const OVERLAY_CHROME_HEIGHT = 6;
 
 export interface OverlayOptions {
   initialPage: SubagentOverlayPage;
-  agents: readonly AgentConfig[];
+  agents: readonly AgentDefinition[];
   settings: SubagentSettings;
   notify(message: string, level?: string): void;
   onSettingsChange(change: SubagentSettingsChange): SubagentSettings | void;
   onStart(agent: string, prompt: string): string | undefined;
   onResume(conversationId: string, prompt: string): void;
-  onOpenPane?(conversationId: string): void;
-  onCancel?(runId: string): void;
+  onCollect?(subagentId: string): Promise<void> | void;
+  onCancel?(subagentId: string): void;
   onRemove?(conversationId: string): void;
 }
 
@@ -53,17 +52,11 @@ export class SubagentOverlayComponent implements Component, Focusable {
   private readonly filters = { conversations: new Input(), agents: new Input() };
   private readonly prompt = new Input();
   private promptTarget?: PromptTarget;
-  private detail?: { conversationId: string; runId?: string };
+  private detail?: { conversationId: string; generation?: number };
   private actionError = "";
   private readonly settings: SubagentSettingsComponent;
   private readonly unsubscribe: () => void;
-  private chronologyOffset = 0;
-  private lastRenderWidth = 80;
-
-  private get bodyHeight(): number {
-    const rows = this.tui.terminal?.rows;
-    return rows === undefined ? DEFAULT_BODY_HEIGHT : Math.max(1, Math.floor(rows * 0.8) - OVERLAY_CHROME_HEIGHT);
-  }
+  private readonly bodyHeight: number;
 
   constructor(
     private readonly manager: SubagentRuntime,
@@ -74,6 +67,7 @@ export class SubagentOverlayComponent implements Component, Focusable {
     private readonly options: OverlayOptions,
   ) {
     this.page = options.initialPage;
+    this.bodyHeight = tui.terminal ? Math.max(1, Math.floor(tui.terminal.rows * 0.8) - OVERLAY_CHROME_HEIGHT) : DEFAULT_BODY_HEIGHT;
     const settings = options.settings?.runtime && options.settings?.display ? options.settings : DEFAULT_SUBAGENT_SETTINGS;
     this.settings = new SubagentSettingsComponent(
       settings,
@@ -111,15 +105,11 @@ export class SubagentOverlayComponent implements Component, Focusable {
       return;
     }
     if (this.detail) {
-      const command = data.toLowerCase();
       if (isCancelKey(data, this.keybindings)) this.detail = undefined;
-      else if (command === "r") this.openResumePrompt(this.detail.conversationId);
-      else if (command === "o") this.openPane(this.detail.conversationId);
-      else if (command === "c") this.cancelRun(this.detail.conversationId, this.detail.runId);
-      else if (command === "x") this.removeConversation(this.detail.conversationId);
-      else if (this.handleChronologyScroll(data)) return;
-      else if (isUpKey(data, this.keybindings)) { this.moveDetailRun(-1); return; }
-      else if (isDownKey(data, this.keybindings)) { this.moveDetailRun(1); return; }
+      else if (data.toLowerCase() === "r") this.openResumePrompt(this.detail.conversationId);
+      else if (data.toLowerCase() === "g") void this.collectResult(this.detail.conversationId);
+      else if (data.toLowerCase() === "c") this.cancelGeneration(this.detail.conversationId, this.detail.generation);
+      else if (data.toLowerCase() === "x") this.removeConversation(this.detail.conversationId);
       this.requestRender();
       return;
     }
@@ -129,7 +119,6 @@ export class SubagentOverlayComponent implements Component, Focusable {
     if (isShiftTabKey(data)) { this.switchPage(-1); return; }
     if ((this.page === "conversations" || this.page === "agents") && data === "/") { this.setFocus("filter"); return; }
     if (this.page === "settings") { this.settings.handleInput(data); return; }
-    if (this.page === "conversations" && !["t", "c", "r", "x", "o"].includes(data.toLowerCase()) && this.handleChronologyScroll(data)) return;
     if (isUpKey(data, this.keybindings)) { this.moveSelection(-1); return; }
     if (isDownKey(data, this.keybindings)) { this.moveSelection(1); return; }
     if (this.page === "agents") this.handleAgentAction(data);
@@ -137,7 +126,6 @@ export class SubagentOverlayComponent implements Component, Focusable {
   }
 
   render(width: number): string[] {
-    this.lastRenderWidth = width;
     const innerWidth = Math.max(1, width - 2);
     const header = this.detail ? this.renderDetailTitle(innerWidth) : this.renderTabs(innerWidth);
     const body = this.detail
@@ -181,8 +169,8 @@ export class SubagentOverlayComponent implements Component, Focusable {
 
   private renderDetailTitle(width: number): string {
     const conversation = this.findConversation(this.detail!.conversationId);
-    const run = conversation && this.findRun(conversation, this.detail!.runId);
-    const title = conversation ? `${conversation.config.name} · ${conversation.conversationId}${run ? ` · ${run.runId}` : ""}` : "Conversation unavailable";
+    const generation = conversation && this.findGeneration(conversation, this.detail!.generation);
+    const title = conversation ? `${conversation.agent.name} · ${conversation.conversationId}${generation ? ` · generation ${generation.generation}` : ""}` : "Conversation unavailable";
     return truncateToWidth(` ${this.accent("Subagents")}  ${title}`, width, "");
   }
 
@@ -209,14 +197,14 @@ export class SubagentOverlayComponent implements Component, Focusable {
         ...fitHeight(this.renderListViewport(list, listHeight, Math.max(1, leftWidth - 2)), listHeight),
         ` ${filter}`,
         this.border("─".repeat(width)),
-        ...this.chronologyViewport(inspector, inspectorHeight),
+        ...fitHeight(compactViewport(inspector, inspectorHeight), inspectorHeight),
       ];
     }
 
     const topPadding = this.bodyHeight > 1 ? 1 : 0;
     const listHeight = Math.max(0, this.bodyHeight - topPadding - 1);
     const left = [...(topPadding ? [""] : []), ...fitHeight(this.renderListViewport(list, listHeight, Math.max(1, leftWidth - 2)), listHeight), filter];
-    const right = fitHeight([...(topPadding ? [""] : []), ...this.chronologyViewport(inspector, Math.max(0, this.bodyHeight - topPadding))], this.bodyHeight);
+    const right = fitHeight([...(topPadding ? [""] : []), ...compactViewport(inspector, Math.max(0, this.bodyHeight - topPadding))], this.bodyHeight);
     return left.map((line, index) => `${pad(` ${line}`, leftWidth)} ${this.border("│")} ${pad(` ${right[index] ?? ""}`, rightWidth)}`);
   }
 
@@ -260,23 +248,23 @@ export class SubagentOverlayComponent implements Component, Focusable {
     const selected = this.selectedConversation(rows);
     return rows.flatMap((row, index) => {
       const conversation = row.conversation;
-      const run = conversation.currentRun ?? conversation.runs.at(-1);
+      const generation = conversation.currentGeneration ?? conversation.generations.at(-1);
       const isSelected = index === selected;
       const firstPrefix = `${isSelected ? this.accent("┃ ") : "  "}${this.muted(row.treePrefix ?? "")}`;
       const continuationPrefix = `${isSelected ? this.accent("┃ ") : "  "}${this.muted(row.treeContinuation ?? "")}`;
-      const identity = conversation.label || conversation.config.name;
+      const identity = conversation.label || conversation.agent.name;
       const name = isSelected ? this.accent(identity) : identity;
-      const agent = conversation.label ? ` · ${conversation.config.name}` : "";
+      const agent = conversation.label ? ` · ${conversation.agent.name}` : "";
       const config = requestedConfigLabel(conversation);
       const title = `${name}${this.muted(`${agent}${config ? ` (${config})` : ""}`)}`;
-      const status = run ? effectiveStatus(run.status) : "idle";
-      const elapsed = run ? formatElapsed(runElapsedMs(run)) : "0ms";
-      const tokens = run ? formatTokens(run.usage.totalTokens) : "0 tokens";
-      const timeline = run ? runRecency(run) : "idle";
-      const activity = `${run?.activity.turns ?? 0} ${plural(run?.activity.turns ?? 0, "turn")} · ${run?.activity.toolHistory.length ?? 0} ${plural(run?.activity.toolHistory.length ?? 0, "tool")}`;
+      const status = generation ? effectiveStatus(generation.status) : "idle";
+      const elapsed = generation ? formatElapsed(generationElapsedMs(generation)) : "0ms";
+      const tokens = generation ? formatTokens(generation.usage.totalTokens) : "0 tokens";
+      const timeline = generation ? generationRecency(generation) : "idle";
+      const activity = `${generation?.activity.turns ?? 0} ${plural(generation?.activity.turns ?? 0, "turn")} · ${generation?.activity.toolHistory.length ?? 0} ${plural(generation?.activity.toolHistory.length ?? 0, "tool")}`;
       return [
         truncateToWidth(`${firstPrefix}${title}`, width, "…"),
-        truncateToWidth(`${continuationPrefix}${run ? this.statusText(run, status) : this.muted(status)} ${this.muted(`· ${elapsed} · ${tokens}`)}`, width, "…"),
+        truncateToWidth(`${continuationPrefix}${generation ? this.statusText(generation, status) : this.muted(status)} ${this.muted(`· ${elapsed} · ${tokens}`)}`, width, "…"),
         truncateToWidth(`${continuationPrefix}${this.muted(`${row.contextOnly ? "ancestor context · " : ""}${timeline} · ${activity} · ${conversation.conversationId}`)}`, width, "…"),
         row.treeContinuation ? `  ${this.muted(row.treeContinuation)}` : "",
       ];
@@ -293,11 +281,11 @@ export class SubagentOverlayComponent implements Component, Focusable {
     const rows = this.conversationRows;
     const conversation = rows[this.selectedConversation(rows)]?.conversation;
     if (!conversation) return [];
-    const latest = conversation.currentRun ?? conversation.runs.at(-1);
+    const latest = conversation.currentGeneration ?? conversation.generations.at(-1);
     return latest ? this.renderConversationChronology(conversation, latest, width) : [];
   }
 
-  private renderAgentInspector(agent: AgentConfig, width: number): string[] {
+  private renderAgentInspector(agent: AgentDefinition, width: number): string[] {
     const lines = [
       `${this.accent(agent.name)} ${this.muted(`· ${agent.source}`)}`,
       "",
@@ -315,27 +303,27 @@ export class SubagentOverlayComponent implements Component, Focusable {
     return pinBottom(lines, action, Math.max(1, this.bodyHeight - 1));
   }
 
-  private renderConversationChronology(conversation: ConversationSnapshot, run: RunSnapshot, width: number): string[] {
-    const runIndex = conversation.runs.findIndex(candidate => candidate.runId === run.runId);
-    const previousRuns = conversation.runs.slice(0, Math.max(0, runIndex));
-    const status = effectiveStatus(run.status);
+  private renderConversationChronology(conversation: ConversationSnapshot, generation: GenerationSnapshot, width: number): string[] {
+    const generationIndex = conversation.generations.findIndex(candidate => candidate.generation === generation.generation);
+    const previousGenerations = conversation.generations.slice(0, Math.max(0, generationIndex));
+    const status = effectiveStatus(generation.status);
     const lines = [
-      `${this.accent(conversation.label || conversation.config.name)} ${this.muted(`· ${conversation.config.name} · ${status}`)}`,
+      `${this.accent(conversation.label || conversation.agent.name)} ${this.muted(`· ${conversation.agent.name} · ${status}`)}`,
       "",
-      `${this.tag("conversation", conversation.conversationId)} ${this.muted("·")} ${this.tag("run", run.runId)}`,
-      `${this.tag("model", conversation.effectiveConfig?.model ?? conversation.config.model ?? "default")} ${this.muted("·")} ${this.tag("thinking", conversation.effectiveConfig?.thinking ?? conversation.config.thinking ?? "default")}`,
+      `${this.tag("conversation", conversation.conversationId)} ${this.muted("·")} ${this.tag("generation", `#${generation.generation}`)}`,
+      `${this.tag("model", conversation.effectiveConfig?.model ?? conversation.requestedConfig.model ?? "default")} ${this.muted("·")} ${this.tag("thinking", conversation.effectiveConfig?.thinking ?? conversation.requestedConfig.thinking ?? "default")}`,
       ...(conversation.effectiveConfig ? [this.tag("cwd", conversation.effectiveConfig.cwd)] : []),
       "",
     ];
 
-    if (previousRuns.length) {
-      lines.push(`${this.muted("◆")} ${this.accent("Previous runs")}`);
-      for (const previous of previousRuns) {
+    if (previousGenerations.length) {
+      lines.push(`${this.muted("◆")} ${this.accent("Previous generations")}`);
+      for (const previous of previousGenerations) {
         const label = conversation.label || compact(previous.prompt);
         const failure = previous.status.kind === "done" && previous.status.outcome !== "completed"
           ? ` ${this.statusText(previous, `[${previous.status.outcome}]`)}`
           : "";
-        const summary = `${label}${failure} ${this.muted(`· ${previous.runId} · ${activitySummary(previous)} · ${formatTokens(previous.usage.totalTokens)}`)}`;
+        const summary = `${label}${failure} ${this.muted(`· generation #${previous.generation} · ${activitySummary(previous)} · ${formatTokens(previous.usage.totalTokens)}`)}`;
         lines.push(`  ${truncateToWidth(summary, Math.max(1, width - 2), "…")}`);
       }
       lines.push(this.muted("│"));
@@ -343,61 +331,65 @@ export class SubagentOverlayComponent implements Component, Focusable {
 
     lines.push(
       `${this.muted("◆")} ${this.accent("Current prompt")}`,
-      ...wrapTextWithAnsi(run.prompt, Math.max(1, width - 2)).map(line => `  ${line}`),
+      ...wrapTextWithAnsi(generation.prompt, Math.max(1, width - 2)).map(line => `  ${line}`),
       this.muted("│"),
-      `${this.statusAccent(run, "●")} ${this.accent("Activity")}`,
-      `  ${this.muted(`${activitySummary(run)} · ${formatElapsed(runElapsedMs(run))} · ${formatTokens(run.usage.totalTokens)}`)}`,
+      `${this.statusAccent(generation, "●")} ${this.accent("Activity")}`,
+      `  ${this.muted(`${activitySummary(generation)} · ${formatElapsed(generationElapsedMs(generation))} · ${formatTokens(generation.usage.totalTokens)}`)}`,
     );
-    if (run.status.kind !== "done" && run.activity.messageSnippet) {
-      lines.push(`  ${this.dim(truncateToWidth(compact(run.activity.messageSnippet), Math.max(1, width - 2), "…"))}`);
+    if (generation.status.kind !== "done" && generation.activity.messageSnippet) {
+      lines.push(`  ${this.dim(truncateToWidth(compact(generation.activity.messageSnippet), Math.max(1, width - 2), "…"))}`);
     }
-    const nested = this.renderNestedConversationTree(conversation, run, Math.max(1, width - 2));
+    const nested = this.renderNestedConversationTree(conversation, generation, Math.max(1, width - 2));
     if (nested.length) lines.push(`  ${this.muted("subagents")}`, ...nested.map(line => `  ${line}`));
 
-    if (run.status.kind === "done") {
-      const output = run.status.output || run.status.error;
+    if (generation.status.kind === "done") {
+      const output = generation.status.output || generation.status.error;
       if (output) {
         lines.push(
           this.muted("│"),
-          `${run.status.error ? this.error("◆") : this.success("◆")} ${this.accent(run.status.error ? "Error" : "Final output")}`,
+          `${generation.status.error ? this.error("◆") : this.success("◆")} ${this.accent(generation.status.error ? "Error" : "Final output")}`,
           ...new Markdown(output, 2, 0, markdownTheme(this.theme)).render(width),
         );
       }
     }
 
-    lines.push("", this.muted(`enter inspect${run.status.kind === "queued" || run.status.kind === "running" ? " · c cancel" : ""}${this.canResumeConversation(conversation) ? " · r resume" : ""} · x remove`));
+    lines.push("", this.muted(`enter inspect${generation.status.kind === "queued" || generation.status.kind === "running" ? " · c cancel" : ""}${this.isCollectAvailable(conversation) ? " · g collect" : ""}${this.isResumeAvailable(conversation) ? " · r resume" : ""} · x remove`));
     if (this.promptTarget?.kind === "resume") lines.push("", this.accent("Resume conversation"), ...this.renderPrompt(width));
     if (this.actionError) lines.push(this.error(this.actionError));
     return lines;
   }
 
-  private renderNestedConversationTree(conversation: ConversationSnapshot, run: RunSnapshot, width: number): string[] {
-    const ownerKey = (conversationId: string, runId: string) => `${conversationId}\0${runId}`;
-    const children = new Map<string, ConversationSnapshot[]>();
+  private renderNestedConversationTree(conversation: ConversationSnapshot, generation: GenerationSnapshot, width: number): string[] {
+    type LineageNode = { conversation: ConversationSnapshot; generation: GenerationSnapshot };
+    const children = new Map<string, LineageNode[]>();
+    const lineageKey = (conversationId: string, generationNumber: number) => `${conversationId}\u0000${generationNumber}`;
     for (const candidate of this.manager.listConversations()) {
-      if (!candidate.parent) continue;
-      const key = ownerKey(candidate.parent.conversationId, candidate.parent.runId);
-      const siblings = children.get(key) ?? [];
-      siblings.push(candidate);
-      children.set(key, siblings);
+      if (!candidate.parentConversationId) continue;
+      for (const candidateGeneration of candidate.generations) {
+        if (candidateGeneration.startedInParentGeneration === undefined) continue;
+        const key = lineageKey(candidate.parentConversationId, candidateGeneration.startedInParentGeneration);
+        const siblings = children.get(key) ?? [];
+        siblings.push({ conversation: candidate, generation: candidateGeneration });
+        children.set(key, siblings);
+      }
     }
 
     const lines: string[] = [];
     const seen = new Set<string>();
-    const visit = (siblings: readonly ConversationSnapshot[], prefix: string) => siblings.forEach((child, index) => {
-      if (seen.has(child.conversationId)) return;
-      seen.add(child.conversationId);
+    const visit = (siblings: readonly LineageNode[], prefix: string) => siblings.forEach((child, index) => {
+      const childKey = lineageKey(child.conversation.conversationId, child.generation.generation);
+      if (seen.has(childKey)) return;
+      seen.add(childKey);
       const last = index === siblings.length - 1;
-      const childRun = child.runs[0];
-      const label = child.label || child.config.name;
-      const agent = child.label ? ` · ${child.config.name}` : "";
-      const status = childRun ? effectiveStatus(childRun.status) : "idle";
+      const label = child.conversation.label || child.conversation.agent.name;
+      const agent = child.conversation.label ? ` · ${child.conversation.agent.name}` : "";
+      const status = effectiveStatus(child.generation.status);
       const connector = `${prefix}${last ? "╰─" : "├─"}`;
-      const content = `${this.muted(connector)} ${this.text(label)}${this.muted(agent)} ${this.muted("·")} ${childRun ? this.statusText(childRun, status) : this.muted(status)}`;
+      const content = `${this.muted(connector)} ${this.text(label)}${this.muted(agent)} ${this.muted("·")} ${this.statusText(child.generation, status)}`;
       lines.push(truncateToWidth(content, width, "…"));
-      if (childRun) visit(children.get(ownerKey(child.conversationId, childRun.runId)) ?? [], `${prefix}${last ? "   " : `${this.muted("│")}  `}`);
+      visit(children.get(childKey) ?? [], `${prefix}${last ? "   " : `${this.muted("│")}  `}`);
     });
-    visit(children.get(ownerKey(conversation.conversationId, run.runId)) ?? [], "");
+    visit(children.get(lineageKey(conversation.conversationId, generation.generation)) ?? [], "");
     return lines;
   }
 
@@ -413,9 +405,9 @@ export class SubagentOverlayComponent implements Component, Focusable {
   private renderDetail(width: number): string[] {
     const conversation = this.findConversation(this.detail!.conversationId);
     if (!conversation) return fitHeight([this.error("Conversation is no longer available.")], this.bodyHeight);
-    const run = this.findRun(conversation, this.detail!.runId);
-    if (!run) return fitHeight([this.muted("This conversation has no runs.")], this.bodyHeight);
-    return fitHeight(this.chronologyViewport(this.renderConversationChronology(conversation, run, width), this.bodyHeight), this.bodyHeight);
+    const generation = this.findGeneration(conversation, this.detail!.generation);
+    if (!generation) return fitHeight([this.muted("Generation is no longer available.")], this.bodyHeight);
+    return fitHeight(compactViewport(this.renderConversationChronology(conversation, generation, width), this.bodyHeight), this.bodyHeight);
   }
 
   private handleAgentAction(data: string): void {
@@ -431,19 +423,18 @@ export class SubagentOverlayComponent implements Component, Focusable {
     if (data.toLowerCase() === "t") { this.conversationMode = this.conversationMode === "flat" ? "tree" : "flat"; this.resetSelection(); this.requestRender(); return; }
     if (!conversation) return;
     if (isEnterKey(data, this.keybindings)) {
-      const run = conversation.currentRun ?? conversation.runs.at(-1);
-      this.chronologyOffset = 0;
-      this.detail = { conversationId: conversation.conversationId, ...(run ? { runId: run.runId } : {}) };
+      const generation = conversation.currentGeneration ?? conversation.generations.at(-1);
+      this.detail = { conversationId: conversation.conversationId, ...(generation ? { generation: generation.generation } : {}) };
     } else if (data.toLowerCase() === "r") this.openResumePrompt(conversation.conversationId);
-    else if (data.toLowerCase() === "o") this.openPane(conversation.conversationId);
-    else if (data.toLowerCase() === "c") this.cancelRun(conversation.conversationId);
+    else if (data.toLowerCase() === "g") void this.collectResult(conversation.conversationId);
+    else if (data.toLowerCase() === "c") this.cancelGeneration(conversation.conversationId);
     else if (data.toLowerCase() === "x") this.removeConversation(conversation.conversationId);
     this.requestRender();
   }
 
   private openResumePrompt(conversationId: string): void {
     const conversation = this.findConversation(conversationId);
-    if (!conversation || !this.canResumeConversation(conversation)) return;
+    if (!conversation || !this.isResumeAvailable(conversation)) return;
     this.openPrompt({ kind: "resume", conversationId });
   }
 
@@ -471,7 +462,7 @@ export class SubagentOverlayComponent implements Component, Focusable {
         this.options.onStart(target.name, prompt);
       } else {
         const conversation = this.findConversation(target.conversationId);
-        if (!conversation || !this.canResumeConversation(conversation)) throw new Error("Conversation is no longer available to resume.");
+        if (!conversation || !this.isResumeAvailable(conversation)) throw new Error("Conversation is no longer available to resume.");
         this.options.onResume(target.conversationId, prompt);
       }
       this.closePrompt();
@@ -482,38 +473,30 @@ export class SubagentOverlayComponent implements Component, Focusable {
     }
   }
 
-  private cancelRun(conversationId: string, runId?: string): void {
+  private async collectResult(conversationId: string): Promise<void> {
+    const conversation = this.findConversation(conversationId);
+    if (!conversation || !this.isCollectAvailable(conversation) || !this.options.onCollect) return;
+    this.actionError = "";
+    try {
+      await this.options.onCollect(conversation.conversationId);
+    } catch (error) {
+      this.actionError = error instanceof Error ? error.message : String(error);
+      this.options.notify(this.actionError, "warning");
+    }
+    this.requestRender();
+  }
+
+  private cancelGeneration(conversationId: string, generationNumber?: number): void {
     const conversation = this.findConversation(conversationId);
     if (!conversation) return;
-    const run = this.findRun(conversation, runId);
-    if (run?.status.kind === "queued" || run?.status.kind === "running") this.options.onCancel?.(run.runId);
-  }
-private openPane(conversationId: string): void {
-    const conversation = this.findConversation(conversationId);
-    const run = conversation?.currentRun;
-    if (conversation && (!run || (run.status.kind !== "queued" && run.status.kind !== "running"))) {
-      this.options.onOpenPane?.(conversationId);
-    }
+    const generation = this.findGeneration(conversation, generationNumber);
+    if (generation?.status.kind === "queued" || generation?.status.kind === "running") this.options.onCancel?.(conversation.conversationId);
   }
 
   private removeConversation(conversationId: string): void {
     this.options.onRemove?.(conversationId);
     if (this.detail?.conversationId === conversationId) this.detail = undefined;
     if (this.selectedConversationId === conversationId) this.selectedConversationId = undefined;
-  }
-
-
-  private moveDetailRun(delta: number): void {
-    const detail = this.detail;
-    if (!detail) return;
-    const conversation = this.findConversation(detail.conversationId);
-    if (!conversation?.runs.length) return;
-    const current = this.findRun(conversation, detail.runId);
-    const currentIndex = conversation.runs.findIndex(run => run.runId === current?.runId);
-    const index = clamp((currentIndex < 0 ? conversation.runs.length - 1 : currentIndex) + delta, 0, conversation.runs.length - 1);
-    this.detail = { conversationId: conversation.conversationId, runId: conversation.runs[index].runId };
-    this.chronologyOffset = 0;
-    this.requestRender();
   }
 
   private moveSelection(delta: number): void {
@@ -527,48 +510,20 @@ private openPane(conversationId: string): void {
       const index = clamp(this.selectedConversation(rows) + delta, 0, Math.max(0, rows.length - 1));
       this.selected.conversations = index;
       this.selectedConversationId = rows[index]?.conversation.conversationId;
-      this.chronologyOffset = 0;
     }
     this.requestRender();
-  }
-
-  private handleChronologyScroll(data: string): boolean {
-    const height = this.detail
-      ? this.bodyHeight
-      : this.lastRenderWidth - 2 >= 80
-        ? this.bodyHeight - 1
-        : Math.max(3, this.bodyHeight - Math.max(4, Math.floor((this.bodyHeight - 2) / 2)) - 2);
-    let next = this.chronologyOffset;
-    if (isPageUpKey(data, this.keybindings)) next -= height;
-    else if (isPageDownKey(data, this.keybindings)) next += height;
-    else if (matchesKey(data, "home")) next = 0;
-    else if (matchesKey(data, "end")) next = Number.MAX_SAFE_INTEGER;
-    else return false;
-    this.chronologyOffset = Math.max(0, next);
-    this.requestRender();
-    return true;
-  }
-
-  private chronologyViewport(lines: string[], height: number): string[] {
-    const maxOffset = Math.max(0, lines.length - height);
-    this.chronologyOffset = clamp(this.chronologyOffset, 0, maxOffset);
-    return lines.slice(this.chronologyOffset, this.chronologyOffset + height);
   }
 
   private switchPage(delta: number): void {
     const index = PAGES.indexOf(this.page);
     this.page = PAGES[(index + delta + PAGES.length) % PAGES.length];
-    this.chronologyOffset = 0;
     this.closePrompt();
   }
 
   private resetSelection(): void {
     this.selected[this.page] = 0;
     if (this.page === "agents") this.selectedAgentName = undefined;
-    if (this.page === "conversations") {
-      this.selectedConversationId = undefined;
-      this.chronologyOffset = 0;
-    }
+    if (this.page === "conversations") this.selectedConversationId = undefined;
   }
 
   private selectedConversation(rows = this.conversationRows): number {
@@ -588,8 +543,13 @@ private openPane(conversationId: string): void {
   }
 
   private renderPrompt(width: number): string[] { return this.prompt.render(Math.max(8, width)); }
-  private canResumeConversation(conversation: ConversationSnapshot): boolean {
-    return conversation.canResume && conversation.runs.at(-1)?.status.kind === "done";
+  private isCollectAvailable(conversation: ConversationSnapshot): boolean {
+    const latest = conversation.generations.at(-1);
+    return !conversation.parentConversationId && !conversation.isStopping
+      && latest?.status.kind === "done" && !latest.joined && latest.observerCount === 0;
+  }
+  private isResumeAvailable(conversation: ConversationSnapshot): boolean {
+    return !conversation.parentConversationId && conversation.resumeAllowed;
   }
   private setFocus(region: FocusRegion): void { this.focusRegion = region; this.syncFocus(); this.requestRender(); }
   private syncFocus(): void {
@@ -600,7 +560,7 @@ private openPane(conversationId: string): void {
   }
   private requestRender(): void { this.tui.requestRender(); }
   private findConversation(id: string): ConversationSnapshot | undefined { return this.manager.listConversations().find(conversation => conversation.conversationId === id); }
-  private findRun(conversation: ConversationSnapshot, runId?: string): RunSnapshot | undefined { return runId ? conversation.runs.find(run => run.runId === runId) : conversation.currentRun ?? conversation.runs.at(-1); }
+  private findGeneration(conversation: ConversationSnapshot, generation?: number): GenerationSnapshot | undefined { return generation ? conversation.generations.find(candidate => candidate.generation === generation) : conversation.currentGeneration ?? conversation.generations.at(-1); }
   private get conversationRows() { return projectConversations(this.manager.listConversations(), { mode: this.conversationMode, query: this.filters.conversations.getValue() }); }
   private get filteredAgents() { return filterAgents(this.options.agents, this.filters.agents.getValue()); }
   private get selectedListLine(): number {
@@ -616,24 +576,16 @@ private openPane(conversationId: string): void {
   private error(text: string): string { return this.theme.fg?.("error", text) ?? text; }
   private border(text: string): string { return this.theme.fg?.("border", text) ?? text; }
   private tag(name: string, value: string): string { return `${this.muted(name)} ${this.theme.fg?.("accent", value) ?? value}`; }
-  private statusText(run: RunSnapshot, text: string): string {
-    if (run.status.kind === "queued" || run.status.kind === "running") return this.theme.fg?.("warning", text) ?? text;
-    if (run.status.outcome === "completed") return this.success(text);
-    if (run.status.outcome === "error") return this.error(text);
-    if (run.status.outcome === "aborted" || run.status.outcome === "interrupted") return this.theme.fg?.("warning", text) ?? text;
-    return this.dim(text);
+  private statusText(generation: GenerationSnapshot, text: string): string {
+    return this.theme.fg?.(statusColor(effectiveStatus(generation.status)), text) ?? text;
   }
-  private statusAccent(run: RunSnapshot, text: string): string { return this.statusText(run, text); }
+  private statusAccent(generation: GenerationSnapshot, text: string): string { return this.statusText(generation, text); }
   private row(content: string, width: number): string { return `${this.border("│")}${pad(content, width)}${this.border("│")}`; }
   private helpText(): string {
     if (this.focusRegion === "prompt") return "enter submit · esc cancel";
-    if (this.detail) {
-return "↑↓ runs · pgup/pgdn scroll · home/end · c cancel · r resume · o open pane · x remove · esc back";
-    }
+    if (this.detail) return "c cancel · g collect · r resume · x remove · esc back";
     if (this.page === "agents") return "↑↓ select · / filter · enter/s start · tab pages · esc close";
-if (this.page === "conversations") {
-      return "↑↓ select · pgup/pgdn scroll · enter inspect · / filter · t flat/tree · c cancel · r resume · o open pane · x remove · tab pages · esc close";
-    }
+    if (this.page === "conversations") return "↑↓ select · enter inspect · / filter · t flat/tree · c cancel · g collect · r resume · x remove · tab pages · esc close";
     return this.settings.isEditing ? "type value · enter save · esc cancel" : "↑↓ select · enter/space change · tab pages · esc close";
   }
 }
@@ -644,12 +596,12 @@ function requestedConfigLabel(conversation: ConversationSnapshot): string {
   if (model) return model;
   return thinking ? `thinking ${thinking}` : "";
 }
-function runRecency(run: RunSnapshot, now = Date.now()): string {
-  if (run.status.kind === "running") return "active now";
-  const timestamp = run.status.kind === "queued" ? run.status.queuedAt : run.status.completedAt;
+function generationRecency(generation: GenerationSnapshot, now = Date.now()): string {
+  if (generation.status.kind === "running") return "active now";
+  const timestamp = generation.status.kind === "queued" ? generation.status.queuedAt : generation.status.completedAt;
   const relative = relativeTime(now - timestamp);
-  if (run.status.kind === "queued") return `queued ${relative}`;
-  const verb = run.status.outcome === "completed" ? "finished" : run.status.outcome === "error" ? "failed" : run.status.outcome;
+  if (generation.status.kind === "queued") return `queued ${relative}`;
+  const verb = generation.status.outcome === "completed" ? "finished" : generation.status.outcome === "error" ? "failed" : generation.status.outcome;
   return `${verb} ${relative}`;
 }
 function relativeTime(milliseconds: number): string {
@@ -663,12 +615,12 @@ function relativeTime(milliseconds: number): string {
   return `${Math.floor(hours / 24)}d ago`;
 }
 function plural(amount: number, noun: string): string { return `${noun}${amount === 1 ? "" : "s"}`; }
-function activitySummary(run: RunSnapshot): string {
+function activitySummary(generation: GenerationSnapshot): string {
   const parts = [
-    `${run.activity.turns} turn${run.activity.turns === 1 ? "" : "s"}`,
-    `${run.activity.toolHistory.length} tool${run.activity.toolHistory.length === 1 ? "" : "s"}`,
+    `${generation.activity.turns} turn${generation.activity.turns === 1 ? "" : "s"}`,
+    `${generation.activity.toolHistory.length} tool${generation.activity.toolHistory.length === 1 ? "" : "s"}`,
   ];
-  if (run.activity.compactions > 0) parts.push(`${run.activity.compactions} compaction${run.activity.compactions === 1 ? "" : "s"}`);
+  if (generation.activity.compactions > 0) parts.push(`${generation.activity.compactions} compaction${generation.activity.compactions === 1 ? "" : "s"}`);
   return parts.join(" · ");
 }
 function wrapParagraphs(text: string, width: number): string[] {
@@ -695,4 +647,10 @@ function viewportAt(lines: string[], height: number, selectedLine: number): stri
   if (lines.length <= height) return lines;
   const start = clamp(selectedLine - Math.floor(height / 2), 0, lines.length - height);
   return lines.slice(start, start + height);
+}
+function compactViewport(lines: string[], height: number): string[] {
+  if (lines.length <= height) return lines;
+  const tail = Math.min(5, Math.max(1, height - 2));
+  const head = Math.max(1, height - tail - 1);
+  return [...lines.slice(0, head), `… ${lines.length - head - tail} more`, ...lines.slice(-tail)];
 }

@@ -1,25 +1,29 @@
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { realpath } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { Model } from "@earendil-works/pi-ai";
+import type { Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import {
+  createAgentSession,
   DefaultPackageManager,
+  DefaultResourceLoader,
   type ExtensionContext,
   getAgentDir,
+  loadSkills,
   SessionManager,
   SettingsManager,
+  stripFrontmatter,
+  type AgentSession,
+  type AgentSessionEvent,
   type ModelRegistry,
+  type Skill,
+  type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import { Conversation, type Run, type RunSnapshot, completedRun, errorRun, interruptedRun, skippedRun } from "./conversation.js";
-import { launchPaneExecution, observePaneCompletion, type PaneCompletion, type PaneExecutionHandle } from "./pane-execution.js";
-import { readPaneActivity } from "./pane-activity.js";
+import { Conversation, type Generation, type GenerationSnapshot, completedGeneration, errorGeneration, interruptedGeneration, skippedGeneration } from "./conversation.js";
+import { timingAsync } from "./timing.js";
 
 const ownExtensionPath = fileURLToPath(new URL("./index.ts", import.meta.url));
-const paneChildExtensionPath = fileURLToPath(new URL("./pane-child.ts", import.meta.url));
-const FINAL_ACTIVITY_DRAIN_INTERVAL_MS = 25;
-const FINAL_ACTIVITY_DRAIN_POLLS = 40;
-const FINAL_ACTIVITY_EVENTS = new Set(["agent_end", "session_shutdown", "subagent_done", "caller_ping"]);
+
 export async function discoverInheritedExtensionPaths(cwd: string, agentDir: string): Promise<string[]> {
   const settingsManager = SettingsManager.create(cwd, agentDir);
   await settingsManager.reload();
@@ -49,242 +53,222 @@ async function canonicalPath(file: string): Promise<string> {
   }
 }
 
-export interface ExecuteRunDependencies {
-getPiInvocation: () => { command: string; args: string[] };
+export interface ExecuteGenerationDependencies {
+  ResourceLoader: typeof DefaultResourceLoader;
   getAgentDir: typeof getAgentDir;
-  sessionManager: typeof SessionManager.create;
+  createAgentSession: typeof createAgentSession;
+  sessionManager: typeof SessionManager.inMemory;
+  settingsManager: typeof SettingsManager.create;
+  loadSkills: typeof loadSkills;
+  readSkillFile: typeof readFileSync;
   loadExtensionPaths: (cwd: string, agentDir: string) => Promise<string[]>;
-  launchPaneExecution: typeof launchPaneExecution;
-  observePaneCompletion: typeof observePaneCompletion;
-  readSessionFile: typeof readFileSync;
-sleep: (milliseconds: number) => Promise<void>;
-  ownExtensionPath: string;
-  [legacyDependency: string]: unknown;
+  childToolFor?: (agent: Conversation) => ToolDefinition;
+  childSessionEvent?: (agent: Conversation, generation: Generation, event: AgentSessionEvent) => void;
 }
 
-export const DEFAULT_EXECUTE_RUN_DEPENDENCIES: ExecuteRunDependencies = {
-getPiInvocation: resolveCurrentPiInvocation,
+export const DEFAULT_EXECUTE_GENERATION_DEPENDENCIES: ExecuteGenerationDependencies = {
+  ResourceLoader: DefaultResourceLoader,
   getAgentDir,
-  sessionManager: SessionManager.create,
+  createAgentSession,
+  sessionManager: SessionManager.inMemory,
+  settingsManager: SettingsManager.create,
+  loadSkills,
+  readSkillFile: readFileSync,
   loadExtensionPaths: discoverInheritedExtensionPaths,
-  launchPaneExecution,
-  observePaneCompletion,
-  readSessionFile: readFileSync,
-sleep: milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)),
-  ownExtensionPath,
 };
-export function resolveCurrentPiInvocation(): { command: string; args: string[] } {
-  const currentScript = process.argv[1];
-  const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
-  if (currentScript && !isBunVirtualScript && existsSync(currentScript)) {
-    return { command: process.execPath, args: [currentScript] };
-  }
 
-  const execName = path.basename(process.execPath).toLowerCase();
-  if (!/^(node|bun)(\.exe)?$/.test(execName)) return { command: process.execPath, args: [] };
-  return { command: "pi", args: [] };
-}
-
-
-export async function executeRun(
+export async function executeGeneration(
   ctx: ExtensionContext,
   agent: Conversation,
-  run: Run,
+  generation: Generation,
   signal?: AbortSignal,
-  dependencies: ExecuteRunDependencies = DEFAULT_EXECUTE_RUN_DEPENDENCIES,
-): Promise<RunSnapshot> {
-  if (signal?.aborted) return skippedRun(agent, run.runId);
+  dependencies: ExecuteGenerationDependencies = DEFAULT_EXECUTE_GENERATION_DEPENDENCIES,
+): Promise<GenerationSnapshot> {
+  if (generation.kind === "resume") {
+    const session = agent.sessionForResume();
+    if (!session) {
+      throw new Error(`Cannot resume an agent without a conversation session.`);
+    }
+    agent.bindSession(generation, session);
+    return promptAgent(session, agent, generation, signal, dependencies.childSessionEvent);
+  }
 
+  if (signal?.aborted) return skippedGeneration(agent, generation);
+
+  const generationData = { agent: agent.agentName, conversationId: agent.conversationId, parentConversationId: agent.parentConversationId, spawnedInGeneration: agent.spawnedInGeneration };
   const requestedConfig = agent.requestedConfig;
   const cwdResolution = resolveTaskCwd(ctx.cwd, requestedConfig.cwd);
-  if (!cwdResolution.ok) return errorRun(agent, run.runId, cwdResolution.error);
+  if (!cwdResolution.ok) return errorGeneration(agent, generation, cwdResolution.error);
   const modelResolution = resolveModel(requestedConfig.model, ctx.model, ctx.modelRegistry);
-  if (!modelResolution.ok) return errorRun(agent, run.runId, modelResolution.error);
+  if (!modelResolution.ok) return errorGeneration(agent, generation, modelResolution.error);
 
   const cwd = cwdResolution.value;
   const selectedModel = modelResolution.value;
   const agentDir = dependencies.getAgentDir();
-  const requestedSkills = [...new Set(requestedConfig.skills ?? [])];
+
+  const requestedSkills = requestedConfig.skills ?? [];
+  let skillBlocks = agent.resolvedSkillBlocks;
+  if (skillBlocks === undefined) {
+    const skillResolution = resolveRequestedSkills(cwd, requestedSkills, dependencies);
+    if (!skillResolution.ok) return errorGeneration(agent, generation, skillResolution.error);
+    skillBlocks = skillResolution.value;
+  }
+  let systemPrompt = agent.definition.systemPrompt;
+  if (skillBlocks.length > 0) {
+    systemPrompt = `${systemPrompt}\n\n${skillBlocks.join("\n\n")}`;
+  }
+
   const inheritedExtensionPaths = await dependencies.loadExtensionPaths(cwd, agentDir);
-  if (signal?.aborted) return skippedRun(agent, run.runId);
+  const childTool = dependencies.childToolFor?.(agent);
 
-  const requestedThinking = requestedConfig.thinking;
-  const parentSession = ctx.sessionManager?.getSessionFile();
-  const childSessionDir = parentSession
-    ? path.join(path.dirname(parentSession), path.basename(parentSession, path.extname(parentSession)), "tasks")
-    : undefined;
-  const childSession = run.kind === "spawn"
-    ? dependencies.sessionManager(cwd, childSessionDir, parentSession ? { parentSession } : undefined)
-    : undefined;
-  const sessionFile = run.kind === "resume" ? agent.snapshot().sessionFile : childSession?.getSessionFile?.();
-  if (!sessionFile) {
-    return errorRun(agent, run.runId, run.kind === "resume"
-      ? "Cannot resume an agent without a conversation session file."
-      : "Could not allocate child session file.");
-  }
-  if (run.kind === "spawn") {
-    const header = childSession?.getHeader?.();
-    if (!header) return errorRun(agent, run.runId, "Could not initialize child session header.");
-mkdirSync(path.dirname(sessionFile), { recursive: true });
-    try {
-      writeFileSync(sessionFile, `${JSON.stringify(header)}\n`, { flag: "wx" });
-    } catch (error) {
-      return errorRun(agent, run.runId, `Could not initialize child session: ${errorMessage(error)}`);
-    }
-  }
-  agent.setSessionFile(sessionFile);
-
-  const extensionPaths = await uniquePaths([...inheritedExtensionPaths, dependencies.ownExtensionPath, paneChildExtensionPath]);
-  const prompt = `${run.prompt}\n\nWhen finished, call the subagent_done tool. If blocked and parent input is required, call caller_ping.`;
-const activityFile = `${sessionFile}.activity.json`;
-  const env = {
-    PI_SUBAGENT_SESSION: sessionFile,
-    PI_SUBAGENT_NAME: agent.agentName,
-    PI_SUBAGENT_CONVERSATION_ID: agent.conversationId,
-    PI_SUBAGENT_RUN_ID: run.runId,
-PI_SUBAGENT_COMPLETION_FILE: `${sessionFile}.exit`,
-    PI_SUBAGENT_ACTIVITY_FILE: activityFile,
-    PI_SUBAGENT_SKILLS: JSON.stringify(requestedSkills),
-    ...(agent.parent ? {
-      PI_SUBAGENT_PARENT_CONVERSATION_ID: agent.parent.conversationId,
-      PI_SUBAGENT_PARENT_RUN_ID: agent.parent.runId,
-    } : {}),
-  };
-if (signal?.aborted) return skippedRun(agent, run.runId);
-
-  agent.setEffectiveConfig({
-    ...(selectedModel ? { model: `${selectedModel.provider}/${selectedModel.id}` } : {}),
-    ...(requestedThinking ? { thinking: requestedThinking } : {}),
+  const resourceLoader = new dependencies.ResourceLoader({
     cwd,
-    skills: requestedSkills,
-    tools: requestedConfig.tools ?? [],
+    agentDir,
+    noExtensions: true,
+    additionalExtensionPaths: inheritedExtensionPaths,
+    noSkills: true,
+    noPromptTemplates: true,
+    noThemes: true,
+    noContextFiles: true,
+    systemPromptOverride: () => systemPrompt,
+    appendSystemPromptOverride: () => [],
   });
 
-  let execution: PaneExecutionHandle;
-  try {
-execution = await dependencies.launchPaneExecution({
-displayName: agent.label?.trim() || agent.agentName,
-      cwd,
-      sessionFile,
-      prompt,
-systemPrompt: agent.config.systemPrompt,
-      skills: requestedSkills,
-      tools: requestedConfig.tools,
-      extensionPaths,
-      ...(selectedModel ? { model: `${selectedModel.provider}/${selectedModel.id}` } : {}),
-      ...(requestedThinking ? { thinking: requestedThinking } : {}),
-      env,
-piInvocation: dependencies.getPiInvocation(),
-    });
-agent.bindExecution(execution);
-  } catch (error) {
-    if (isRunDone(run)) return existingRun(agent, run);
-    return errorRun(agent, run.runId, errorMessage(error));
+  await timingAsync("generation.resourceLoader.reload", { ...generationData, cwd }, () => resourceLoader.reload());
+  if (signal?.aborted) return skippedGeneration(agent, generation);
+
+  const requestedThinking = requestedConfig.thinking;
+  const sessionManager = dependencies.sessionManager(cwd);
+  const settingsManager = dependencies.settingsManager(cwd, agentDir);
+  const { session } = await timingAsync("generation.createAgentSession", { ...generationData, cwd, model: selectedModel ? `${selectedModel.provider}/${selectedModel.id}` : undefined }, () => dependencies.createAgentSession({
+    cwd,
+    agentDir,
+    resourceLoader,
+    model: selectedModel,
+    thinkingLevel: requestedThinking,
+    tools: requestedConfig.tools ? [...requestedConfig.tools] : undefined,
+    customTools: childTool ? [childTool] : [],
+    sessionManager,
+    settingsManager,
+  }));
+
+  const effectiveModel = session.model ?? selectedModel;
+  const effectiveThinking = session.thinkingLevel ?? requestedThinking;
+  const activeTools = typeof session.getActiveToolNames === "function"
+    ? session.getActiveToolNames()
+    : requestedConfig.tools ?? [];
+  agent.setEffectiveConfig({
+    ...(effectiveModel ? { model: `${effectiveModel.provider}/${effectiveModel.id}` } : {}),
+    ...(effectiveThinking ? { thinking: effectiveThinking as ModelThinkingLevel } : {}),
+    cwd,
+    skills: requestedSkills,
+    tools: activeTools,
+  });
+
+  if (signal?.aborted) {
+    await AbortSession(session);
+    return skippedGeneration(agent, generation);
   }
 
+  agent.bindSession(generation, session);
+  return promptAgent(session, agent, generation, signal, dependencies.childSessionEvent);
+}
+
+async function promptAgent(
+  session: AgentSession,
+  agent: Conversation,
+  generation: Generation,
+  signal?: AbortSignal,
+  onSessionEvent?: (agent: Conversation, generation: Generation, event: AgentSessionEvent) => void,
+): Promise<GenerationSnapshot> {
+  const prompt = generation.prompt;
+  const onAbort = () => { void AbortSession(session); }
+
+  if (signal?.aborted) {
+    await AbortSession(session);
+    return interruptedGeneration(agent, generation, "Agent interrupted.");
+  }
+
+  signal?.addEventListener("abort", onAbort, { once: true });
+  const unsubscribe = onSessionEvent ? session.subscribe(event => onSessionEvent(agent, generation, event)) : undefined;
+
   try {
-let activitySequence = 0;
-    const observeActivity = () => {
-      const activity = readPaneActivity(activityFile, run.runId);
-      if (!activity || activity.sequence <= activitySequence) return;
-      activitySequence = activity.sequence;
-      agent.observePaneActivity(run.runId, activity);
-      return activity;
-    };
-    const observation = await dependencies.observePaneCompletion({
-      handle: execution,
-      ...(signal ? { signal } : {}),
-      onTick: observeActivity,
-    });
-    observeActivity();
-    const activitySequenceAtCompletion = activitySequence;
-    if (isRunDone(run)) {
-      await drainFinalActivity(observeActivity, activitySequenceAtCompletion, dependencies.sleep);
-      return existingRun(agent, run);
+    await timingAsync("generation.session.prompt", { agent: agent.agentName, conversationId: agent.conversationId, promptLength: prompt.length }, () => session.prompt(prompt));
+    const finalMessage = GetFinalAssistantMessage(session);
+    if (finalMessage.stopReason === "aborted") {
+      return interruptedGeneration(agent, generation, finalMessage.errorMessage || "Agent interrupted.");
     }
-    if (observation.status === "cancelled") return interruptedRun(agent, run.runId, "Agent interrupted.");
-    return completeFromPane(agent, run, observation.completion, sessionFile, dependencies.readSessionFile);
+    if (finalMessage.stopReason === "error") {
+      return errorGeneration(agent, generation, finalMessage.errorMessage || finalMessage.response || "Agent failed.");
+    }
+
+    return completedGeneration(agent, generation, finalMessage.response);
   } catch (error) {
-    if (isRunDone(run)) return existingRun(agent, run);
+    const message = error instanceof Error ? error.message : String(error);
     return signal?.aborted
-      ? interruptedRun(agent, run.runId, errorMessage(error))
-      : errorRun(agent, run.runId, errorMessage(error));
-  }
-}
-async function drainFinalActivity(
-  observeActivity: () => ReturnType<typeof readPaneActivity>,
-  sequenceAtCompletion: number,
-  sleep: (milliseconds: number) => Promise<void>,
-): Promise<void> {
-  for (let poll = 0; poll < FINAL_ACTIVITY_DRAIN_POLLS; poll++) {
-    await sleep(FINAL_ACTIVITY_DRAIN_INTERVAL_MS);
-    const activity = observeActivity();
-    if (activity && activity.sequence > sequenceAtCompletion && FINAL_ACTIVITY_EVENTS.has(activity.latestEvent)) return;
+      ? interruptedGeneration(agent, generation, message)
+      : errorGeneration(agent, generation, message);
+  } finally {
+    unsubscribe?.();
+    signal?.removeEventListener("abort", onAbort);
   }
 }
 
-function completeFromPane(agent: Conversation, run: Run, completion: PaneCompletion, sessionFile: string, readSessionFile: typeof readFileSync): RunSnapshot {
-  if (completion.type === "structured_output") {
-    return completedRun(agent, run.runId, typeof completion.value === "string" ? completion.value : JSON.stringify(completion.value));
-  }
-  if (completion.type === "ping") return completedRun(agent, run.runId, completion.message);
-if (completion.type === "failed") return errorRun(agent, run.runId, `Pane Pi exited with code ${completion.exitCode}.`);
-  try {
-    return completedRun(agent, run.runId, finalAssistantText(readSessionFile(sessionFile, "utf8")));
-  } catch (error) {
-    return errorRun(agent, run.runId, `Could not read completed pane session: ${errorMessage(error)}`);
-  }
+async function AbortSession(session: AgentSession) {
+  await Promise.resolve(session.abort()).catch(() => undefined);
 }
 
-function finalAssistantText(rawSession: string): string {
-  for (const line of rawSession.trim().split("\n").reverse()) {
-    try {
-      const entry = JSON.parse(line) as { type?: unknown; message?: { role?: unknown; content?: unknown } };
-      if (entry.type !== "message" || entry.message?.role !== "assistant" || !Array.isArray(entry.message.content)) continue;
-      return entry.message.content
-        .filter((part): part is { type: "text"; text: string } => !!part && typeof part === "object" && (part as { type?: unknown }).type === "text" && typeof (part as { text?: unknown }).text === "string")
-        .map(part => part.text)
-        .join("\n")
-        .trim();
-    } catch {}
-  }
-  return "";
-}
-
-
-async function uniquePaths(paths: readonly string[]): Promise<string[]> {
-  const seen = new Set<string>();
-  const result: string[] = [];
-  for (const entry of paths) {
-    const canonical = await canonicalPath(entry);
-    if (seen.has(canonical)) continue;
-    seen.add(canonical);
-    result.push(entry);
-  }
-  return result;
-}
-
-function isRunDone(run: Run): boolean {
-  return run.state.kind === "done";
-}
-
-function existingRun(agent: Conversation, run: Run): RunSnapshot {
-  return agent.runHistory.find(item => item.runId === run.runId)!;
-}
-
-function errorMessage(error: unknown) {
-  return error instanceof Error ? error.message : String(error);
-}
-
-
-export type RunAgentResolution<T> =
+export type GenerationExecutionResolution<T> =
   | { readonly ok: true; readonly value: T }
   | { readonly ok: false; readonly error: string };
+
+type SkillResolutionDependencies = Pick<
+  ExecuteGenerationDependencies,
+  "getAgentDir" | "loadSkills" | "readSkillFile"
+>;
+
+export function resolveRequestedSkills(
+  cwd: string,
+  requestedSkills: readonly string[],
+  dependencies: SkillResolutionDependencies = DEFAULT_EXECUTE_GENERATION_DEPENDENCIES,
+): GenerationExecutionResolution<readonly string[]> {
+  if (requestedSkills.length === 0) return { ok: true, value: [] };
+
+  let available: Skill[];
+  try {
+    const agentDir = dependencies.getAgentDir();
+    available = dependencies.loadSkills({ cwd, agentDir, skillPaths: [], includeDefaults: true }).skills;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { ok: false, error: `Could not discover requested skills: ${message}` };
+  }
+
+  const matched: Skill[] = [];
+  for (const name of requestedSkills) {
+    const found = available.find(skill => skill.name === name);
+    if (!found) return { ok: false, error: `Unknown skill: ${name}` };
+    matched.push({ ...found, disableModelInvocation: false });
+  }
+
+  try {
+    return {
+      ok: true,
+      value: matched.map(skill => {
+        const content = dependencies.readSkillFile(skill.filePath, "utf-8");
+        const body = stripFrontmatter(content).trim();
+        return `<skill name="${skill.name}" location="${skill.filePath}">\nReferences are relative to ${skill.baseDir}.\n\n${body}\n</skill>`;
+      }),
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { ok: false, error: `Could not load requested skill: ${message}` };
+  }
+}
 
 export function resolveTaskCwd(
   parentCwd: string,
   requestedCwd: string | undefined,
-): RunAgentResolution<string> {
+): GenerationExecutionResolution<string> {
   if (requestedCwd === undefined) return { ok: true, value: parentCwd };
 
   const cwd = path.resolve(parentCwd, requestedCwd);
@@ -307,7 +291,7 @@ export function resolveModel(
   requestedModel: string | undefined,
   parentModel: Model<any> | undefined,
   registry: ModelRegistry,
-): RunAgentResolution<Model<any> | undefined> {
+): GenerationExecutionResolution<Model<any> | undefined> {
   if (requestedModel === undefined) return { ok: true, value: parentModel };
 
   const parts = requestedModel.split("/");
@@ -337,3 +321,22 @@ export function resolveModel(
   return { ok: false, error: `Unknown model: ${requestedModel}` };
 }
 
+function GetFinalAssistantMessage(
+  session: AgentSession,
+): { response: string; stopReason?: string; errorMessage?: string } {
+  for (let i = session.messages.length - 1; i >= 0; i--) {
+    const msg = session.messages[i];
+    if (msg.role == "assistant") {
+      return {
+        response: msg.content
+          .filter(part => part.type === "text")
+          .map(part => part.text)
+          .join("\n")
+          .trim() ?? "",
+        stopReason: msg.stopReason,
+        errorMessage: msg.errorMessage,
+      };
+    }
+  }
+  return { response: "" };
+}

@@ -1,5 +1,5 @@
-import type { AgentConfig } from "../agents.js";
-import type { ConversationSnapshot } from "../conversation.js";
+import type { AgentDefinition } from "../agents.js";
+import { effectiveStatus, type ConversationSnapshot } from "../conversation.js";
 
 export type ConversationLayoutMode = "flat" | "tree";
 
@@ -25,12 +25,12 @@ export function projectConversations(
   const allById = new Map(conversations.map(conversation => [conversation.conversationId, conversation]));
   const includedIds = new Set(directMatches.map(conversation => conversation.conversationId));
   for (const match of directMatches) {
-    let parentId = match.parent?.conversationId;
+    let parentId = match.parentConversationId;
     while (parentId) {
       const parent = allById.get(parentId);
       if (!parent || includedIds.has(parent.conversationId)) break;
       includedIds.add(parent.conversationId);
-      parentId = parent.parent?.conversationId;
+      parentId = parent.parentConversationId;
     }
   }
 
@@ -39,7 +39,7 @@ export function projectConversations(
   const byId = new Map(included.map(conversation => [conversation.conversationId, conversation]));
   const children = new Map<string, ConversationSnapshot[]>();
   for (const conversation of included) {
-    const parentId = conversation.parent?.conversationId;
+    const parentId = conversation.parentConversationId;
     if (!parentId || !byId.has(parentId)) continue;
     const siblings = children.get(parentId) ?? [];
     siblings.push(conversation);
@@ -48,7 +48,6 @@ export function projectConversations(
 
   for (const siblings of children.values()) siblings.sort(newestFirst);
 
-  const nested = new Set([...children.values()].flat().map(conversation => conversation.conversationId));
   const rows: ConversationRow[] = [];
   const seen = new Set<string>();
   const visit = (conversation: ConversationSnapshot, depth: number, ancestorLast: readonly boolean[] = [], isLast = true) => {
@@ -68,12 +67,11 @@ export function projectConversations(
     const childAncestors = depth ? [...ancestorLast, isLast] : [];
     descendants.forEach((child, index) => visit(child, depth + 1, childAncestors, index === descendants.length - 1));
   };
-  for (const conversation of included.filter(conversation => !nested.has(conversation.conversationId)).sort(newestFirst)) visit(conversation, 0);
-  for (const conversation of included.filter(conversation => !seen.has(conversation.conversationId)).sort(newestFirst)) visit(conversation, 0);
+  for (const conversation of included.filter(conversation => !conversation.parentConversationId).sort(newestFirst)) visit(conversation, 0);
   return rows;
 }
 
-export function filterAgents(agents: readonly AgentConfig[], query: string): AgentConfig[] {
+export function filterAgents(agents: readonly AgentDefinition[], query: string): AgentDefinition[] {
   const normalized = query.trim().toLowerCase();
   const filtered = normalized ? agents.filter(agent => [
     agent.name,
@@ -94,29 +92,29 @@ function conversationMatches(conversation: ConversationSnapshot, query: string):
   const values = [
     conversation.conversationId,
     conversation.label,
-    conversation.config.name,
-    conversation.config.description,
-    conversation.config.source,
-    conversation.config.model,
-    conversation.config.thinking,
-    conversation.parent?.conversationId,
-    conversation.parent?.runId,
+    conversation.agent.name,
+    conversation.agent.description,
+    conversation.agent.source,
+    conversation.requestedConfig.model,
+    conversation.requestedConfig.thinking,
+    conversation.parentConversationId,
+    conversation.spawnedInGeneration?.toString(),
     conversation.effectiveConfig?.model,
     conversation.effectiveConfig?.thinking,
     conversation.effectiveConfig?.cwd,
-    ...(conversation.config.tools ?? []),
-    ...(conversation.config.skills ?? []),
+    ...(conversation.requestedConfig.tools ?? []),
+    ...(conversation.requestedConfig.skills ?? []),
     ...(conversation.effectiveConfig?.tools ?? []),
     ...(conversation.effectiveConfig?.skills ?? []),
   ];
-  for (const run of conversation.runs) {
+  for (const generation of conversation.generations) {
     values.push(
-      run.runId,
-      run.kind,
-      run.prompt,
-      run.status.kind === "done" ? run.status.outcome : run.status.kind,
-      run.activity.messageSnippet,
-      ...run.activity.toolHistory.flatMap(tool => [tool.name, tool.inputSummary]),
+      generation.generation.toString(),
+      generation.kind,
+      generation.prompt,
+      effectiveStatus(generation.status),
+      generation.activity.messageSnippet,
+      ...generation.activity.toolHistory.flatMap(tool => [tool.name, tool.inputSummary]),
     );
   }
   return values.some(value => value?.toLowerCase().includes(normalized));
