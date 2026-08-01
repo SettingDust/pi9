@@ -46,9 +46,11 @@ const mux = fakeMux();
     expect(mux.createSurface).toHaveBeenCalledOnce();
 expect(sleep).toHaveBeenCalledWith(500);
     expect(mux.sendLongCommand).toHaveBeenCalledOnce();
-    const [surface, command] = mux.sendLongCommand.mock.calls[0] as unknown as [string, string];
+    const [surface, command, launchOptions] = mux.sendLongCommand.mock.calls[0] as unknown as [string, string, { scriptPath: string; scriptPreamble: string }];
     expect(surface).toBe("surface-1");
-    expect(command).toContain("cd [/work/project]");
+    expect(launchOptions.scriptPreamble).toContain("cd [/work/project]");
+expect(launchOptions.scriptPreamble).toContain("export TOKEN=[secret]");
+    expect(launchOptions.scriptPath).toBe("/sessions/child.jsonl.launch.sh");
     expect(command).toContain("[C:\\runtime\\node.exe] [C:\\pi\\cli.js]");
     expect(command).toContain("--session [/sessions/child.jsonl]");
     expect(command).toContain("[do the work]");
@@ -56,6 +58,17 @@ expect(sleep).toHaveBeenCalledWith(500);
     expect(command).toContain("/sessions/child.jsonl.exit");
     expect(command).toContain("printf");
     expect(command).toContain("__SUBAGENT_DONE_");
+expect(command).not.toContain("cd [/work/project]");
+    expect(command).not.toContain("TOKEN=[secret]");
+  });
+it("keeps a multiline handoff prompt inside the launch script argv", async () => {
+    const mux = fakeMux();
+    await launchPaneExecution({ ...options(mux), prompt: "handoff:\n  objective: review\n  result_format: findings" });
+
+    const [, command, launchOptions] = mux.sendLongCommand.mock.calls[0] as unknown as [string, string, { scriptPath: string; scriptPreamble: string }];
+    expect(command).toContain("[handoff:\n  objective: review\n  result_format: findings]");
+    expect(launchOptions.scriptPath).toBe("/sessions/child.jsonl.launch.sh");
+    expect(mux.sendCommand).not.toHaveBeenCalledWith("surface-1", expect.stringContaining("handoff:"));
   });
 it("uses a native PowerShell launch script on Windows", async () => {
     const mux = fakeMux();
