@@ -271,15 +271,16 @@ function launchPiTransport(mux: TerminalMux, surface: string, options: PiPaneLau
   if ((options.dependencies?.platform ?? process.platform) === "win32") {
     const scriptPath = `${options.sessionFile}.launch.ps1`;
     const writeFile = options.dependencies?.writeFile ?? writeFileSync;
-    writeFile(scriptPath, `\ufeff${buildPowerShellLaunchScript(options.cwd, options.env, options.invocation.command, options.args)}`, "utf8");
+    writeFile(scriptPath, `\ufeff${buildPowerShellLaunchScript(options.cwd, options.env, options.invocation.command, options.args, `${options.sessionFile}.exit`)}`, "utf8");
     mux.sendCommand(surface, `powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File ${windowsCommandLineQuote(scriptPath)}`);
     return;
   }
 
   const parts = [mux.shellEscape(options.invocation.command), ...options.unixArgs.map(argument => argument.escaped ? mux.shellEscape(argument.value) : argument.value)];
   const env = Object.entries(options.env).map(([key, value]) => `${key}=${mux.shellEscape(value)}`).join(" ");
+const exitFile = mux.shellEscape(`${options.sessionFile}.exit`);
   const piCommand = `cd ${mux.shellEscape(options.cwd)} && ${env ? `${env} ` : ""}${parts.join(" ")}`;
-  mux.sendLongCommand(surface, `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`);
+  mux.sendLongCommand(surface, `(${piCommand}); __code=$?; if [ ! -e ${exitFile} ]; then printf '{"type":"failed","exitCode":%s}' "$__code" > ${exitFile}; fi; echo '__SUBAGENT_DONE_'$__code'__'`);
 }
 
 function sanitizeDisplayName(value: string | undefined): string {
@@ -290,6 +291,7 @@ function buildPowerShellLaunchScript(
   env: Readonly<Record<string, string>>,
   command: string,
   args: readonly string[],
+completionFile: string,
 ): string {
   return [
     `$ErrorActionPreference = 'Stop'`,
@@ -297,15 +299,21 @@ function buildPowerShellLaunchScript(
     ...Object.entries(env).map(([key, value]) =>
       `[Environment]::SetEnvironmentVariable(${powerShellLiteral(key)}, ${powerShellLiteral(value)}, 'Process')`),
     `$arguments = @(${args.map(powerShellLiteral).join(", ")})`,
+`$completionFile = ${powerShellLiteral(completionFile)}`,
     `$exitCode = 1`,
     `try {`,
     `  & ${powerShellLiteral(command)} @arguments`,
-    `  $exitCode = $LASTEXITCODE`,
+    `  $exitCode = if ($null -eq $LASTEXITCODE) { 0 } else { $LASTEXITCODE }`,
     `} catch {`,
     `  [Console]::Error.WriteLine($_.ToString())`,
+`  $exitCode = 1`,
+    `} finally {`,
+    `  if (-not (Test-Path -LiteralPath $completionFile)) {`,
+    `    Set-Content -LiteralPath $completionFile -Value ('{"type":"failed","exitCode":' + $exitCode + '}') -NoNewline -Encoding UTF8`,
+    `  }`,
+    `  Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue`,
     `}`,
     `Write-Output "__SUBAGENT_DONE_${"${exitCode}"}__"`,
-`Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue`,
     `exit $exitCode`,
     ``,
   ].join("\r\n");
