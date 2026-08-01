@@ -8,6 +8,7 @@ type Completion =
   | { type: "done" }
   | { type: "structured_output"; value: unknown }
   | { type: "ping"; name: string; message: string };
+
 function escapeXml(value: string): string {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&apos;");
 }
@@ -16,18 +17,27 @@ function requestedSkillPrompt(pi: ExtensionAPI): string | undefined {
   const raw = process.env.PI_SUBAGENT_SKILLS;
   if (!raw) return undefined;
   let names: unknown;
-  try { names = JSON.parse(raw); } catch { throw new Error("Invalid PI_SUBAGENT_SKILLS."); }
-  if (!Array.isArray(names) || names.some(name => typeof name !== "string")) throw new Error("Invalid PI_SUBAGENT_SKILLS.");
+  try { names = JSON.parse(raw); } catch { return fatalSkillPrompt("Invalid PI_SUBAGENT_SKILLS."); }
+  if (!Array.isArray(names) || names.some(name => typeof name !== "string")) return fatalSkillPrompt("Invalid PI_SUBAGENT_SKILLS.");
   const commands = pi.getCommands();
-  const blocks = names.map(name => {
+  const blocks: string[] = [];
+  for (const name of names) {
     const command = commands.find(value => value.source === "skill" && (value.name === name || value.name === `skill:${name}`));
-    if (!command) throw new Error(`Requested skill is unavailable: ${name}`);
-    const sourcePath = command.sourceInfo.path;
-    const body = stripFrontmatter(readFileSync(sourcePath, "utf8")).trim();
-    const baseDir = command.sourceInfo.baseDir ?? sourcePath.replace(/[\\/]?[^\\/]+$/, "");
-    return `<skill name="${escapeXml(name)}" location="${escapeXml(sourcePath)}">\nReferences are relative to ${escapeXml(baseDir)}.\n\n${body}\n</skill>`;
-  });
+    if (!command) return fatalSkillPrompt(`Requested skill is unavailable: ${name}`);
+    try {
+      const sourcePath = command.sourceInfo.path;
+      const body = stripFrontmatter(readFileSync(sourcePath, "utf8")).trim();
+      const baseDir = command.sourceInfo.baseDir ?? sourcePath.replace(/[\\/]?[^\\/]+$/, "");
+      blocks.push(`<skill name="${escapeXml(name)}" location="${escapeXml(sourcePath)}">\nReferences are relative to ${escapeXml(baseDir)}.\n\n${body}\n</skill>`);
+    } catch (error) {
+      return fatalSkillPrompt(`Requested skill could not be loaded: ${name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   return blocks.length ? blocks.join("\n\n") : undefined;
+}
+
+function fatalSkillPrompt(message: string): string {
+  return `<system-reminder>Fatal subagent setup error: ${escapeXml(message)} Call caller_ping immediately with this exact setup error and do not continue the delegated task.</system-reminder>`;
 }
 
 function renderDoneCall(args: { result?: unknown }, _theme: Theme): Component {
@@ -42,7 +52,7 @@ export default function paneChild(pi: ExtensionAPI) {
   const completionFile = process.env.PI_SUBAGENT_COMPLETION_FILE;
   if (!completionFile) return;
   const recorder = createPaneActivityRecorder(process.env.PI_SUBAGENT_RUN_ID, process.env.PI_SUBAGENT_ACTIVITY_FILE);
-const on = pi.on.bind(pi) as (event: string, handler: (value: any) => any) => void;
+  const on = pi.on.bind(pi) as (event: string, handler: (value: any) => any) => void;
   let skillPrompt: string | undefined;
   let skillsResolved = false;
   on("before_agent_start", (event: any) => {
@@ -78,9 +88,7 @@ const on = pi.on.bind(pi) as (event: string, handler: (value: any) => any) => vo
     if (doneCalled || process.env.PI_SUBAGENT_NUDGE_DISABLE === "1") return;
     nudgeTimer = setTimeout(() => {
       nudgeTimer = undefined;
-      if (!doneCalled && !userInputAfterAgentEnd) {
-        pi.sendUserMessage("Your task is still active. Call subagent_done when finished, or caller_ping if parent input is required.", { deliverAs: "followUp" });
-      }
+      if (!doneCalled && !userInputAfterAgentEnd) pi.sendUserMessage("Your task is still active. Call subagent_done when finished, or caller_ping if parent input is required.", { deliverAs: "followUp" });
     }, nudgeDelay);
   };
   on("session_start", () => { doneCalled = false; userInputAfterAgentEnd = false; clearNudge(); });

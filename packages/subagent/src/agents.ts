@@ -1,4 +1,4 @@
-import { statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { readdir, readFile, realpath } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import type { ModelThinkingLevel } from "@earendil-works/pi-ai";
@@ -14,7 +14,7 @@ export function isModelThinkingLevel(value: unknown): value is ModelThinkingLeve
 
 export type AgentSource = "package" | "user" | "project";
 
-export interface AgentConfig {
+export interface AgentDefinition {
   name: string;
   description: string;
   model?: string;
@@ -26,10 +26,33 @@ export interface AgentConfig {
   sourcePath?: string;
 }
 
-export function BuildAgentConfig(
+export type AgentDefinitionSummary = Readonly<Pick<
+  AgentDefinition,
+  "name" | "description" | "source" | "sourcePath"
+>>;
+
+export interface RequestedExecutionConfig {
+  readonly model?: string;
+  readonly thinking?: ModelThinkingLevel;
+  readonly skills?: readonly string[];
+  readonly tools?: readonly string[];
+  readonly cwd?: string;
+}
+
+export interface EffectiveExecutionConfig {
+  readonly model?: string;
+  readonly thinking?: ModelThinkingLevel;
+  readonly cwd: string;
+  readonly skills: readonly string[];
+  readonly tools: readonly string[];
+}
+
+export type ExecutionOverrides = Readonly<Pick<RequestedExecutionConfig, "model" | "thinking">>;
+
+export function buildAgentDefinition(
   content: string,
   source: AgentSource,
-): AgentConfig | { error: Error } {
+): AgentDefinition | { error: Error } {
   try {
     const { frontmatter, body } = parseFrontmatter<Record<string, unknown>>(content);
     const result = {
@@ -97,8 +120,8 @@ export interface AgentRegistryOptions {
 
 export class AgentRegistry {
 
-  private _agents = new Map<string, AgentConfig>();
-  get agents(): Map<string, AgentConfig> { return this._agents }
+  private _agents = new Map<string, AgentDefinition>();
+  get agents(): Map<string, AgentDefinition> { return this._agents }
 
   /**
    * Load agent configs from the following directories:
@@ -108,48 +131,40 @@ export class AgentRegistry {
   async reload(cwd: string = process.cwd(), options: AgentRegistryOptions = {}): Promise<void> {
     const discovery = { ...DEFAULT_SUBAGENT_SETTINGS.agentDiscovery, ...options.discovery };
     const globalDir = discovery.includeUserAgents ? join(getAgentDir(), "agents") : undefined;
-    const agents = new Map<string, AgentConfig>();
-    const extensions = new Set(discovery.agentFileExtensions);
-    const warn = (message: string) => { if (discovery.warnOnInvalidAgents) options.onWarning?.(message); };
     const projectDir = discovery.includeProjectAgents && discovery.projectAgentsStrategy !== "off"
-      ? nearestProjectAgentsDir(cwd, warn)
+      ? nearestProjectAgentsDir(cwd)
       : undefined;
+    const agents = new Map<string, AgentDefinition>();
+    const extensions = new Set(discovery.agentFileExtensions);
 
     async function loadAgents(dir: string | undefined, source: AgentSource, recursive = false): Promise<void> {
-      if (!dir) return;
-      let files: string[];
-      try {
-        if (!statSync(dir, { throwIfNoEntry: false })?.isDirectory()) return;
-        files = recursive
-          ? await listAgentFilesRecursive(dir, extensions, warn)
-          : (await readdir(dir)).filter(file => extensions.has(extname(file))).map(file => join(dir, file));
-      } catch (error) {
-        warn(`Failed to enumerate subagent directory ${dir}: ${error instanceof Error ? error.message : String(error)}`);
-        return;
-      }
+      if (!dir || !existsSync(dir)) { return }
+      const files = recursive
+        ? await listAgentFilesRecursive(dir, extensions, message => { if (discovery.warnOnInvalidAgents) options.onWarning?.(message); })
+        : (await readdir(dir)).filter(f => extensions.has(extname(f))).map(file => join(dir, file));
 
-      for (const path of files) {
+      for (const file of files) {
+        const path = file;
         let content: string;
 
         try {
           content = await readFile(path, { encoding: "utf-8" });
         } catch (error) {
-          warn(`Failed to read subagent definition ${path}: ${error instanceof Error ? error.message : String(error)}`);
+          if (discovery.warnOnInvalidAgents) options.onWarning?.(`Failed to read subagent definition ${path}: ${error instanceof Error ? error.message : String(error)}`);
           continue;
         }
 
-        const result = BuildAgentConfig(content, source);
+        const result = buildAgentDefinition(content, source);
         if ("error" in result) {
-          warn(`Invalid subagent definition ${path}: ${result.error.message}`);
+          if (discovery.warnOnInvalidAgents) options.onWarning?.(`Invalid subagent definition ${path}: ${result.error.message}`);
           continue;
         } else {
           agents.set(result.name, { ...result, sourcePath: path });
         }
       }
     }
-
-    for (const packageRoot of await packageRoots(cwd, options.packageManager, warn)) {
-      for (const dir of await readPackageAgentDirs(packageRoot, warn)) await loadAgents(dir, "package", true);
+    for (const packageRoot of await packageRoots(cwd, options.packageManager, message => { if (discovery.warnOnInvalidAgents) options.onWarning?.(message); })) {
+      for (const dir of await readPackageAgentDirs(packageRoot, message => { if (discovery.warnOnInvalidAgents) options.onWarning?.(message); })) await loadAgents(dir, "package", true);
     }
 
     const loadOrder: Array<[string | undefined, AgentSource]> = discovery.duplicateNamePolicy === "userOverridesProject"
@@ -165,7 +180,7 @@ export class AgentRegistry {
   }
 }
 
-export function serializeAgentConfig(config: AgentConfig) {
+export function serializeAgentDefinition(config: AgentDefinition) {
   return {
     name: config.name,
     description: config.description,
@@ -179,9 +194,8 @@ export function serializeAgentConfig(config: AgentConfig) {
 }
 
 export function listAgentDefinitions(registry: AgentRegistry) {
-  return Array.from(registry.agents.values()).map(serializeAgentConfig);
+  return Array.from(registry.agents.values()).map(serializeAgentDefinition);
 }
-
 async function packageRoots(cwd: string, injected: Pick<PackageManager, "listConfiguredPackages"> | undefined, warn: (message: string) => void): Promise<string[]> {
   try {
     let manager = injected;
@@ -191,7 +205,7 @@ async function packageRoots(cwd: string, injected: Pick<PackageManager, "listCon
       await settings.reload();
       manager = new DefaultPackageManager({ cwd, agentDir, settingsManager: settings });
     }
-    return [...new Set(manager.listConfiguredPackages().map(pkg => pkg.installedPath).filter((path): path is string => !!path))];
+    return [...new Set(manager.listConfiguredPackages().map(pkg => pkg.installedPath).filter((value): value is string => Boolean(value)))];
   } catch (error) {
     warn(`Failed to discover Pi packages: ${error instanceof Error ? error.message : String(error)}`);
     return [];
@@ -248,14 +262,12 @@ function objectValue(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
 
-function nearestProjectAgentsDir(cwd: string, warn: (message: string) => void): string | undefined {
+function nearestProjectAgentsDir(cwd: string): string | undefined {
   let dir = cwd;
   while (true) {
     const candidate = join(dir, ".pi", "agents");
-    try {
-      if (statSync(candidate, { throwIfNoEntry: false })?.isDirectory()) return candidate;
-    } catch (error) {
-      warn(`Failed to inspect subagent directory ${candidate}: ${error instanceof Error ? error.message : String(error)}`);
+    if (statSync(candidate, { throwIfNoEntry: false })?.isDirectory()) {
+      return candidate;
     }
     const parent = dirname(dir);
     if (parent === dir) return undefined;
@@ -263,19 +275,20 @@ function nearestProjectAgentsDir(cwd: string, warn: (message: string) => void): 
   }
 }
 
-export interface AgentRequestedConfig {
-  readonly model?: string;
-  readonly thinking?: ModelThinkingLevel;
-  readonly skills?: readonly string[];
-  readonly tools?: readonly string[];
-  readonly cwd?: string;
+export function summarizeAgentDefinition(definition: AgentDefinition): AgentDefinitionSummary {
+  return {
+    name: definition.name,
+    description: definition.description,
+    source: definition.source,
+    ...(definition.sourcePath ? { sourcePath: definition.sourcePath } : {}),
+  };
 }
 
 /** Resolve spawn-over-definition precedence. */
 export function resolveRequestedConfig(
-  config: AgentConfig,
+  config: AgentDefinition,
   spawn: SpawnRequest,
-): AgentRequestedConfig {
+): RequestedExecutionConfig {
   const skills = spawn.skills ?? config.skills;
   return {
     model: spawn.model ?? config.model,

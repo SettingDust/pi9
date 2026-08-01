@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { Usage } from "@earendil-works/pi-ai";
+import type { GenerationActivitySnapshot, GenerationPhase, GenerationToolUse } from "./conversation.js";
 
 export type PaneActivityEvent =
   | "session_start" | "agent_start" | "agent_end" | "turn_start" | "turn_end"
@@ -32,6 +33,26 @@ export function readPaneActivity(file: string, runningChildId: string): PaneActi
   } catch {
     return undefined;
   }
+}
+
+export function projectPaneActivity(state: PaneActivityState | undefined): GenerationActivitySnapshot | undefined {
+  if (!state) return undefined;
+  const phase: GenerationPhase = state.phase === "starting" ? "starting"
+    : state.phase === "active" ? "thinking"
+    : state.phase === "waiting" ? "settling"
+    : "settling";
+  const tools: GenerationToolUse[] = state.toolName ? [{
+    id: state.toolCallId ?? "pane-tool",
+    name: state.toolName,
+    startedAt: state.toolStartedAt ?? state.updatedAt,
+    ...(state.toolEndedAt !== undefined ? { completedAt: state.toolEndedAt } : {}),
+  }] : [];
+  return {
+    phase,
+    turns: state.turnIndex !== undefined ? state.turnIndex + 1 : 0,
+    compactions: 0,
+    toolHistory: tools,
+  };
 }
 
 export function createPaneActivityRecorder(runningChildId: string | undefined, file: string | undefined, now = Date.now) {

@@ -1,11 +1,13 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import type {
-  RunSnapshot,
   ConversationSnapshot,
-  RunToolUse,
-  RunViewStatus,
+  GenerationActivitySnapshot,
+  GenerationKind,
+  GenerationOutcomeStatus,
+  GenerationSnapshot,
+  GenerationToolUse,
+  GenerationViewStatus,
 } from "../../src/conversation.js";
-import type { RunOutcomeStatus, RunKind } from "../../src/conversation.js";
 
 export const ZERO_USAGE: Usage = {
   input: 0,
@@ -15,7 +17,7 @@ export const ZERO_USAGE: Usage = {
   totalTokens: 0,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 };
-export const TERMINAL_RESULT_KINDS = [
+export const TERMINAL_GENERATION_OUTCOMES = [
   "completed",
   "error",
   "interrupted",
@@ -27,31 +29,23 @@ type StatusInput =
   | { kind: "queued"; queuedAt?: number }
   | { kind: "running"; startedAt?: number }
   | {
-      kind: RunOutcomeStatus;
+      kind: GenerationOutcomeStatus;
       startedAt?: number;
       completedAt?: number;
       response?: string;
+      output?: string;
       error?: string;
     }
-  | Extract<RunViewStatus, { kind: "done" }>;
+  | Extract<GenerationViewStatus, { kind: "done" }>;
 
-export interface FakeAgentOptions {
-  conversationId?: string;
-  runId?: string;
-  parent?: { conversationId: string; runId: string };
-  label?: string;
+export interface FakeGenerationOptions {
+  generation?: number;
+  startedInParentGeneration?: number;
   prompt?: string;
   createdAt?: number;
-  kind?: RunKind;
-  config?: Partial<ConversationSnapshot["config"]>;
-  options?: {
-    agent?: string;
-    prompt?: string;
-    model?: string;
-    thinking?: ConversationSnapshot["config"]["thinking"];
-  };
+  kind?: GenerationKind;
   status?: StatusInput;
-  activity?: { phase?: RunSnapshot["activity"]["phase"]; toolHistory?: RunToolUse[] };
+  activity?: { phase?: GenerationActivitySnapshot["phase"]; toolHistory?: GenerationToolUse[] };
   message?: string;
   messageSnippet?: string;
   turns?: number;
@@ -59,14 +53,32 @@ export interface FakeAgentOptions {
   activeTools?: string[];
   usage?: Usage;
   totalUsage?: Usage;
-  canResume?: boolean;
-  sessionFile?: string;
-  requestedOverrides?: ConversationSnapshot["requestedOverrides"];
-  previousRuns?: RunSnapshot[];
-  runs?: RunSnapshot[];
+  joined?: boolean;
+  observerCount?: number;
+  nestedJoins?: GenerationSnapshot["nestedJoins"];
+  steers?: GenerationSnapshot["steers"];
 }
 
-function makeStatus(input: StatusInput | undefined): RunViewStatus {
+export interface FakeAgentOptions extends FakeGenerationOptions {
+  conversationId?: string;
+  parentConversationId?: string;
+  spawnedInGeneration?: number;
+  label?: string;
+  config?: Partial<ConversationSnapshot["agent"] & ConversationSnapshot["requestedConfig"]>;
+  options?: {
+    agent?: string;
+    prompt?: string;
+    model?: string;
+    thinking?: ConversationSnapshot["requestedConfig"]["thinking"];
+  };
+  resumeAllowed?: boolean;
+  isStopping?: boolean;
+  requestedOverrides?: ConversationSnapshot["requestedOverrides"];
+  previousGenerations?: GenerationSnapshot[];
+  generations?: GenerationSnapshot[];
+}
+
+function makeStatus(input: StatusInput | undefined): GenerationViewStatus {
   const status = input ?? {
     kind: "completed",
     startedAt: 1,
@@ -82,14 +94,13 @@ function makeStatus(input: StatusInput | undefined): RunViewStatus {
     startedAt: status.startedAt,
     completedAt: status.completedAt ?? 2,
     ...(status.kind === "completed"
-      ? { output: status.response ?? "done" }
+      ? { output: status.output ?? status.response ?? "done" }
       : { error: status.error ?? `Agent ${status.kind}.` }),
   };
 }
 
-export function fakeAgent(options: FakeAgentOptions = {}): ConversationSnapshot {
+export function fakeGeneration(options: FakeGenerationOptions = {}): GenerationSnapshot {
   const status = makeStatus(options.status);
-  const config = options.config ?? {};
   const tools = options.activity?.toolHistory
     ?? options.activeTools?.map((name, index) => ({
       id: `${name}-${index}`,
@@ -97,10 +108,12 @@ export function fakeAgent(options: FakeAgentOptions = {}): ConversationSnapshot 
       startedAt: 1,
     }))
     ?? [];
-  const run: RunSnapshot = {
-    runId: (options.runId ?? "r1") as RunSnapshot["runId"],
-    kind: options.kind ?? "spawn",
-    prompt: options.prompt ?? options.options?.prompt ?? "Fix issue",
+  const generation = options.generation ?? 1;
+  return {
+    generation,
+    kind: options.kind ?? (generation === 1 ? "spawn" : "resume"),
+    ...(options.startedInParentGeneration !== undefined ? { startedInParentGeneration: options.startedInParentGeneration } : {}),
+    prompt: options.prompt ?? "Fix issue",
     createdAt: options.createdAt ?? 1,
     status,
     activity: {
@@ -111,43 +124,58 @@ export function fakeAgent(options: FakeAgentOptions = {}): ConversationSnapshot 
       toolHistory: tools,
     },
     usage: options.totalUsage ?? options.usage ?? ZERO_USAGE,
-    observerCount: 0,
-    acknowledged: false,
-    steers: [],
+    observerCount: options.observerCount ?? 0,
+    joined: options.joined ?? false,
+    nestedJoins: options.nestedJoins ?? [],
+    steers: options.steers ?? [],
   };
-  const runs = options.runs ?? [...(options.previousRuns ?? []), run];
+}
+
+export function fakeAgent(options: FakeAgentOptions = {}): ConversationSnapshot {
+  const config = options.config ?? {};
+  const previousGenerations = options.previousGenerations ?? [];
+  const generationNumber = options.generation ?? previousGenerations.length + 1;
+  const generated = fakeGeneration({
+    ...options,
+    generation: generationNumber,
+    ...(options.startedInParentGeneration !== undefined
+      ? { startedInParentGeneration: options.startedInParentGeneration }
+      : generationNumber === 1 && options.spawnedInGeneration !== undefined
+        ? { startedInParentGeneration: options.spawnedInGeneration }
+        : {}),
+    prompt: options.prompt ?? options.options?.prompt,
+    joined: options.joined,
+  });
+  const generations = options.generations ?? [...previousGenerations, generated];
+  const latest = generations.at(-1)!;
+  const isActive = latest.status.kind === "queued" || latest.status.kind === "running";
+  if (isActive && options.resumeAllowed) throw new Error("An active fake conversation cannot allow resume.");
   return {
     conversationId: (options.conversationId ?? "c1") as ConversationSnapshot["conversationId"],
-    ...(options.parent
-      ? {
-          parent: {
-            conversationId: options.parent.conversationId as ConversationSnapshot["conversationId"],
-            runId: options.parent.runId as RunSnapshot["runId"],
-          },
-        }
+    ...(options.parentConversationId
+      ? { parentConversationId: options.parentConversationId as ConversationSnapshot["conversationId"] }
       : {}),
-    label: options.label,
+    ...(options.spawnedInGeneration !== undefined ? { spawnedInGeneration: options.spawnedInGeneration } : {}),
+    label: options.label ?? options.options?.agent ?? config.name ?? "helper",
     createdAt: options.createdAt ?? 1,
-    config: {
+    agent: {
       name: options.options?.agent ?? config.name ?? "helper",
       description: config.description ?? "",
       source: config.source ?? "project",
-      sourcePath: config.sourcePath,
+      ...(config.sourcePath ? { sourcePath: config.sourcePath } : {}),
+    },
+    requestedConfig: {
       model: options.options?.model ?? config.model,
       thinking: options.options?.thinking ?? config.thinking,
       tools: config.tools,
       skills: config.skills,
     },
-    runs,
-    currentRun: runs.at(-1),
+    generations,
+    resumeAllowed: options.resumeAllowed ?? false,
+    ...(isActive ? { currentGeneration: latest } : {}),
+    ...(options.isStopping ? { isStopping: true as const } : {}),
     ...(options.requestedOverrides ? { requestedOverrides: options.requestedOverrides } : {}),
-    canResume: options.canResume ?? false,
-    ...(options.sessionFile ? { sessionFile: options.sessionFile } : {}),
   };
-}
-
-export function fakeRunSection(options: FakeAgentOptions = {}): RunSnapshot {
-  return fakeAgent(options).runs.at(-1)!;
 }
 
 export const unique = () => `${Date.now()}-${Math.random()}`;

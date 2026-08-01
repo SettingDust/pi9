@@ -4,6 +4,93 @@ This changelog starts with version `v0.2.1`.
 
 ## [Unreleased]
 
+## [0.10.4] - 2026-07-31
+
+### Changed
+
+- Include the current generation in canonical lifecycle results and completion notifications.
+- Make cancellation idempotent while keeping execution-settlement details internal.
+- Represent missing terminal join output explicitly as `null`.
+
+## [0.10.3] - 2026-07-31
+
+### Changed
+
+- Improve agent-facing tool ergonomics with more concise lifecycle guidance and schema descriptions for agent names, task labels, and resume prompts.
+
+## [0.10.2] - 2026-07-31
+
+### Breaking
+
+- Replace private run records and random `runId` values with append-only, one-based generations scoped to each subagent.
+- Rename `maxTasksPerRun` to `maxTasksPerCall` and `subagent-run-index` metadata to version 4 `subagent-generation-index` entries.
+
+### Changed
+
+- Correlate joins, recursive lineage, completion notifications, cancellation, and resumed work by exact subagent generation.
+- Show generation history and provenance throughout `/subagents` without exposing private execution identifiers.
+
+## [0.10.1] - 2026-07-31
+
+### Breaking
+
+- Rename the snapshot-derived `availableActions` response field to `actionHints` to avoid implying that asynchronous state cannot change before the next action.
+
+### Changed
+
+- Allow callers to inspect any subagent in their descendant tree while keeping resume, steer, cancel, join, and targeted removal restricted to direct children.
+
+## [0.10.0] - 2026-07-30
+
+### Breaking
+
+- Replace the public lifecycle vocabulary with `queued`, `running`, `completed`, `failed`, and `cancelled` statuses plus the orthogonal finished-result `joined` flag.
+- Require a nonblank label for every spawn and expose caller-relative `availableActions` on every live-subagent result.
+- Replace `list(scope?, state?)` with direct-child `list(statuses?, joined?)`; listed children include minimal informational descendant trees.
+- Flatten successful result items from `{ ok: true, data }` to `{ ok: true, ...fields }` and embed current canonical fields in failures targeting live subagents.
+- Restrict every targeted lifecycle action to direct children.
+- Rename the completion event to `subagent:finished`; lifecycle event and completion-notification payloads now use the canonical block.
+
+### Changed
+
+- Project active subagents with `joined: false`, so `list({ joined: false })` includes active and uncollected finished children.
+- Expose the current one-based `generation`, generation-scoped `metrics`, aggregate `totalMetrics`, and prior-generation `history` through inspection without legacy top-level counters.
+- Report plausible lowercase two-word unknown subagent IDs as not found while retaining format errors for malformed values.
+- Make join blocking and idempotent, require join before resume, and report collection state with `joined`.
+- Make cancellation wait for settlement and forcibly abandon unresponsive executions after an internal bound while releasing scheduler capacity.
+- Return failed execution explanations in `failure`, reserving `error` for action and invocation failures.
+- Remove ordinary provider-facing execution-history summaries while preserving the overlay's **Previous runs** history.
+- Bind every target in a join batch before publishing observer or nested-join updates, preventing resume races during binding.
+- Release completed join observers before projecting the final result so resumable subagents immediately advertise `resume`.
+- Validate requested skills before allocating or dispatching spawn runs.
+- Communicate action failures through prose and remove machine-readable error codes from responses.
+- Distinguish malformed subagent IDs from well-formed IDs that are not found, and clarify batch, completion, collection, and removal semantics in the tool prompt.
+- Reject repeated subagent IDs after the first batch occurrence and summarize batch item successes and failures.
+
+## [0.9.2] - 2026-07-29
+
+### Changed
+
+- Deliver compact hidden `<subagent-notification>` messages and reconcile their runs against live observation state immediately before model requests, without mutating stored session history.
+- Show human-facing completion status through Pi notifications instead of model-visible custom-message rendering, without duplicating UI alerts when model-message delivery retries.
+- Distinguish wrong-kind identifiers from unknown or invalid identifiers with concise, actionable errors across resume, steer, cancel, inspect, join, and remove.
+- Tighten model-facing delegation guidance and accurately describe cancellation as the only prerequisite for removing active conversation subtrees.
+
+### Breaking
+
+- Replace `list` run-status filtering with mutually exclusive `active`, `resumable`, and `terminal` conversation-state filtering, always returning complete run histories for matching conversations.
+
+## [0.9.1] - 2026-07-29
+
+### Changed
+
+- **Breaking:** Make conversations the stable recursive ownership tree, with immutable `parentConversationId` and `spawnedByRunId`; runs are now parentless execution episodes.
+- Default `list` to immediate child conversations and add `scope: "descendants"` for the caller's complete owned subtree.
+- Apply conversation-descendant authorization uniformly to resume, inspect, steer, cancel, join, and remove.
+- Remove terminal conversations as complete child-first subtrees, rejecting the entire removal when any descendant remains active.
+- Remove run-lineage fields and all descendant reparenting behavior.
+- Tighten the tool prompt and remove redundant schema string-length constraints while retaining parser-level validation.
+
 ## [0.9.0] - 2026-07-29
 
 ### Added
@@ -246,7 +333,14 @@ This changelog starts with version `v0.2.1`.
 - Add coverage for native inherited extension loading, canonical self-exclusion, SDK child tools, and recursive shared-manager behavior.
 - Add coverage for lifecycle events, session metadata persistence, session guards, command completions, background completion rendering, and resume message rendering.
 
-[Unreleased]: https://github.com/Chase-C/pi9/compare/subagent-v0.9.0...HEAD
+[Unreleased]: https://github.com/Chase-C/pi9/compare/subagent-v0.10.4...HEAD
+[0.10.4]: https://github.com/Chase-C/pi9/compare/subagent-v0.10.3...subagent-v0.10.4
+[0.10.3]: https://github.com/Chase-C/pi9/compare/subagent-v0.10.2...subagent-v0.10.3
+[0.10.2]: https://github.com/Chase-C/pi9/compare/subagent-v0.10.1...subagent-v0.10.2
+[0.10.1]: https://github.com/Chase-C/pi9/compare/subagent-v0.10.0...subagent-v0.10.1
+[0.10.0]: https://github.com/Chase-C/pi9/compare/subagent-v0.9.2...subagent-v0.10.0
+[0.9.2]: https://github.com/Chase-C/pi9/compare/subagent-v0.9.1...subagent-v0.9.2
+[0.9.1]: https://github.com/Chase-C/pi9/compare/subagent-v0.9.0...subagent-v0.9.1
 [0.9.0]: https://github.com/Chase-C/pi9/compare/subagent-v0.8.2...subagent-v0.9.0
 [0.8.2]: https://github.com/Chase-C/pi9/compare/subagent-v0.8.1...subagent-v0.8.2
 [0.8.1]: https://github.com/Chase-C/pi9/compare/subagent-v0.8.0...subagent-v0.8.1

@@ -1,44 +1,34 @@
 import { Usage } from "@earendil-works/pi-ai";
 import type { AgentSession, AgentSessionEvent } from "@earendil-works/pi-coding-agent";
-import type { ConversationUpdateKind, RunActivitySnapshot, RunPhase, RunToolUse } from "./conversation.js";
-import type { PaneActivityState } from "./pane-activity.js";
+import type { ConversationUpdateKind, GenerationActivitySnapshot, GenerationPhase, GenerationToolUse } from "./conversation.js";
 
 const DefaultUsage: Usage = {
   input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }
 }
-function isUsage(value: unknown): value is Usage {
-  const usage = asRecord(value);
-  const cost = usage && asRecord(usage.cost);
-  return Boolean(usage && cost
-    && ["input", "output", "cacheRead", "cacheWrite", "totalTokens"].every(key => typeof usage[key] === "number")
-    && ["input", "output", "cacheRead", "cacheWrite", "total"].every(key => typeof cost[key] === "number"));
-}
 
-export type RunActivityListener = (kind: ConversationUpdateKind) => void;
+export type GenerationActivityListener = (kind: ConversationUpdateKind) => void;
 
-export class RunActivity {
+export class GenerationActivity {
 
   private _message: string = "";
-  private _phase: RunPhase = "starting";
+  private _phase: GenerationPhase = "starting";
   private _turns: number = 0;
-  private _toolHistory = new Array<RunToolUse>();
+  private _toolHistory = new Array<GenerationToolUse>();
   private _compactions: number = 0;
   private _latestUsage: Usage = DefaultUsage;
   private _nextSyntheticToolId = 0;
-  private _paneSequence = 0;
-  private _paneTurnIndex = 0;
 
   constructor(
-    private readonly onChange: RunActivityListener,
-    private readonly onSessionEvent?: (event: AgentSessionEvent) => RunPhase | undefined,
+    private readonly onChange: GenerationActivityListener,
+    private readonly onSessionEvent?: (event: AgentSessionEvent) => GenerationPhase | undefined,
   ) {}
 
   get message() { return this._message }
 
   get usage(): Usage { return this._latestUsage }
 
-  snapshot(): RunActivitySnapshot {
+  snapshot(): GenerationActivitySnapshot {
     return {
       phase: this._phase,
       messageSnippet: this._message || undefined,
@@ -46,6 +36,15 @@ export class RunActivity {
       compactions: this._compactions,
       toolHistory: this._toolHistory.map(tool => ({ ...tool })),
     };
+  }
+  observe(snapshot: GenerationActivitySnapshot, usage?: Usage): void {
+    this._phase = snapshot.phase;
+    this._message = snapshot.messageSnippet ?? this._message;
+    this._turns = Math.max(this._turns, snapshot.turns);
+    this._compactions = Math.max(this._compactions, snapshot.compactions);
+    this._toolHistory = snapshot.toolHistory.map(tool => ({ ...tool }));
+    if (usage) this._latestUsage = usage;
+    this.onChange("phase");
   }
 
   subscribe(session: AgentSession): () => void {
@@ -66,7 +65,7 @@ export class RunActivity {
         // Each assistant message carries the usage for that single API call, where the
         // input/cache fields already cover the whole conversation re-sent that call. Summing
         // across calls would re-count the growing context every round, so we take the latest
-        // call's usage as the run's current context size rather than accumulating.
+        // call's usage as the generation's current context size rather than accumulating.
         this._latestUsage = event.message.usage;
         this.onChange("usage");
       }
@@ -90,42 +89,8 @@ export class RunActivity {
       }
     });
   }
-observePane(activity: PaneActivityState): void {
-    if (activity.sequence <= this._paneSequence) return;
-    this._paneSequence = activity.sequence;
-    const turnIndex = activity.turnIndex;
-    if (typeof turnIndex === "number" && Number.isInteger(turnIndex) && turnIndex >= 0) {
-      const nextTurn = turnIndex + 1;
-      if (nextTurn > this._paneTurnIndex) {
-        this._turns += nextTurn - this._paneTurnIndex;
-        this._paneTurnIndex = nextTurn;
-        this.onChange("turn");
-      }
-    }
-    const paneUsage = activity.usage;
-    if (isUsage(paneUsage)) {
-      this._latestUsage = paneUsage;
-      this.onChange("usage");
-    }
-    if (activity.latestEvent === "agent_start" || activity.latestEvent === "turn_start") this._setPhase("thinking");
-    else if (activity.latestEvent === "message_update") this._setPhase("responding");
-    else if (activity.latestEvent === "agent_end") this._setPhase("settling");
-    else if (activity.latestEvent === "tool_execution_start" && activity.toolName) {
-      this._startToolUse({ toolCallId: activity.toolCallId, toolName: activity.toolName });
-      this._setPhase("executing_tool");
-      this.onChange("tool");
-    } else if (activity.latestEvent === "tool_execution_end") {
-      this._finishToolUse({ toolCallId: activity.toolCallId, toolName: activity.toolName });
-      this._setPhase(this._toolHistory.some(tool => tool.completedAt === undefined) ? "executing_tool" : "thinking");
-      this.onChange("tool");
-    } else if (activity.latestEvent === "turn_end" && turnIndex === undefined) {
-      this._paneTurnIndex += 1;
-      this._turns += 1;
-      this.onChange("turn");
-    }
-  }
 
-  private _setPhase(phase: RunPhase): void {
+  private _setPhase(phase: GenerationPhase): void {
     if (phase === this._phase) return;
     this._phase = phase;
     this.onChange("phase");
@@ -184,8 +149,7 @@ function toolInputSummary(toolName: string, args: unknown): string | undefined {
       const count = action === "spawn" ? countPart(input.spawns, "task")
         : action === "resume" ? countPart(input.resumes, "task")
         : action === "steer" ? countPart(input.messages, "message")
-        : action === "cancel" || action === "inspect" || action === "join" ? countPart(input.runIds, "run")
-        : action === "remove" ? countPart(input.conversationIds, "conversation")
+        : action === "cancel" || action === "inspect" || action === "join" || action === "remove" ? countPart(input.subagentIds, "subagent")
         : undefined;
       return joinParts([action, count]);
     }

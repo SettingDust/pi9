@@ -14,7 +14,7 @@ export interface SubagentUiSettings {
 }
 
 export interface SubagentRuntimeSettings {
-  maxTasksPerRun: number;
+  maxTasksPerCall: number;
   /**
    * Tree-wide cap on concurrently running subagents. A single shared task queue spans every
    * parent/child level within one Pi process, so this value bounds the total in-flight count
@@ -36,14 +36,7 @@ export interface SubagentAgentDiscoverySettings {
 }
 
 export interface SubagentDisplaySettings {
-  promptPreviewLength: number;
-  messageSnippetLength: number;
-  outputSnippetLength: number;
-  outputSnippetMaxLines: number;
   toolCallLabelMaxLength: number;
-  toolInputSummaryLength: number;
-  collapsedAgentListLimit: number;
-  collapsedDescriptionLength: number;
   /** Max rows per widget section before a +N more overflow line. */
   widgetMaxRowsPerSection: number;
 }
@@ -63,7 +56,7 @@ export function createDefaultSubagentSettings(): SubagentSettings {
   return {
     ...DEFAULT_SUBAGENT_UI_SETTINGS,
     runtime: {
-      maxTasksPerRun: 8,
+      maxTasksPerCall: 8,
       maxConcurrentSubagents: 4,
       maxConversations: 100,
       completionNotify: "auto",
@@ -77,14 +70,7 @@ export function createDefaultSubagentSettings(): SubagentSettings {
       warnOnInvalidAgents: false,
     },
     display: {
-      promptPreviewLength: 120,
-      messageSnippetLength: 200,
-      outputSnippetLength: 400,
-      outputSnippetMaxLines: 8,
       toolCallLabelMaxLength: 60,
-      toolInputSummaryLength: 80,
-      collapsedAgentListLimit: 8,
-      collapsedDescriptionLength: 100,
       widgetMaxRowsPerSection: 6,
     },
   };
@@ -153,7 +139,7 @@ export function normalizeSettings(value: unknown): SubagentSettingsLoadResult {
 
   const runtime = objectValue(record.runtime);
   if (runtime) {
-    assignPositiveInt(runtime, "maxTasksPerRun", value => { settings.runtime.maxTasksPerRun = value; }, warnings);
+    assignPositiveInt(runtime, "maxTasksPerCall", value => { settings.runtime.maxTasksPerCall = value; }, warnings);
     assignPositiveInt(runtime, "maxConcurrentSubagents", value => { settings.runtime.maxConcurrentSubagents = value; }, warnings);
     assignPositiveInt(runtime, "maxConversations", value => { settings.runtime.maxConversations = value; }, warnings);
     assignEnum(runtime, "completionNotify", COMPLETION_NOTIFY_MODES, value => { settings.runtime.completionNotify = value; }, warnings);
@@ -178,14 +164,7 @@ export function normalizeSettings(value: unknown): SubagentSettingsLoadResult {
 
   const display = objectValue(record.display);
   if (display) {
-    assignPositiveInt(display, "promptPreviewLength", value => { settings.display.promptPreviewLength = value; }, warnings);
-    assignPositiveInt(display, "messageSnippetLength", value => { settings.display.messageSnippetLength = value; }, warnings);
-    assignPositiveInt(display, "outputSnippetLength", value => { settings.display.outputSnippetLength = value; }, warnings);
-    assignPositiveInt(display, "outputSnippetMaxLines", value => { settings.display.outputSnippetMaxLines = value; }, warnings);
     assignPositiveInt(display, "toolCallLabelMaxLength", value => { settings.display.toolCallLabelMaxLength = value; }, warnings);
-    assignPositiveInt(display, "toolInputSummaryLength", value => { settings.display.toolInputSummaryLength = value; }, warnings);
-    assignPositiveInt(display, "collapsedAgentListLimit", value => { settings.display.collapsedAgentListLimit = value; }, warnings);
-    assignPositiveInt(display, "collapsedDescriptionLength", value => { settings.display.collapsedDescriptionLength = value; }, warnings);
     assignPositiveInt(display, "widgetMaxRowsPerSection", value => { settings.display.widgetMaxRowsPerSection = value; }, warnings);
   }
 
@@ -253,7 +232,7 @@ export interface PrepareSubagentRuntimeContext extends SubagentSettingsLoadConte
 }
 
 export interface PrepareSubagentRuntimeTarget {
-  configure?(options: { maxRunning?: number; maxConversations?: number }): void;
+  configure?(options: { maxExecuting?: number; maxConversations?: number }): void;
 }
 
 export interface PrepareSubagentRuntimeAgentRegistry {
@@ -278,7 +257,7 @@ export async function prepareSubagentRuntime({
 }: PrepareSubagentRuntimeOptions): Promise<SubagentSettings> {
   const settings = await loadSubagentSettings(ctx, settingsStore);
   runtime.configure?.({
-    maxRunning: settings.runtime.maxConcurrentSubagents,
+    maxExecuting: settings.runtime.maxConcurrentSubagents,
     maxConversations: settings.runtime.maxConversations,
   });
   if (agentRegistry) {
