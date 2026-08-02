@@ -114,7 +114,6 @@ const allowedInvocationKeys: Record<SubagentAction, readonly string[]> = {
   join: ["action", "subagentIds"],
   remove: ["action", "subagentIds"],
 };
-const knownInvocationKeys = new Set(Object.values(allowedInvocationKeys).flat());
 
 export function parseSubagentInvocation(
   raw: unknown,
@@ -139,10 +138,13 @@ export function parseSubagentInvocation(
   }
 
   const parsedAction = action as SubagentAction;
-  const extra = Object.keys(params).find(key => !knownInvocationKeys.has(key));
+  const extra = Object.keys(params).find(
+    key => !allowedInvocationKeys[parsedAction].includes(key),
+  );
   if (extra) {
+    const allowed = allowedInvocationKeys[parsedAction].join(", ");
     return {
-      error: `Property ${extra} is not allowed.`,
+      error: `Property ${extra} is not allowed for action=${parsedAction}. Allowed properties: ${allowed}.`,
       action: parsedAction,
     };
   }

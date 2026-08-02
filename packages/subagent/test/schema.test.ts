@@ -34,14 +34,6 @@ describe("parseSubagentInvocation", () => {
     assert.match(text(parseSubagentInvocation({ action: "explode" })), /Unknown action/);
   });
 
-  it("ignores schema-exposed fields that do not apply to the selected action", () => {
-    const result = parseSubagentInvocation({ ...valid.spawn, joined: false });
-    assert.deepEqual(result, {
-      action: "spawn",
-      spawns: [{ kind: "spawn", agent: "helper", prompt: "work", label: "Worker" }],
-    });
-  });
-
   it("rejects a spawn task without a label", () => {
     const result = parseSubagentInvocation({ action: "spawn", spawns: [{ agent: "helper", prompt: "work" }] });
     assert.match(text(result), /label must be a non-empty string/);
