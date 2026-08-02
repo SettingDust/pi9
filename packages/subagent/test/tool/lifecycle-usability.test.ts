@@ -179,7 +179,7 @@ test("cancelling a parent does not crash its in-flight nested join update", asyn
     prepareInvocation: async () => ({ runtime: { maxTasksPerCall: 8 } }) as any,
   });
   const controller = new AbortController();
-  const execution = tool.execute("join-call", { action: "join", subagentIds: ["calm-river"] }, controller.signal, () => {}, ctx);
+  const execution = tool.execute("join-call", { request: { action: "join", subagentIds: ["calm-river"] } }, controller.signal, () => {}, ctx);
   await subscription;
 
   parent.settle(parent.latestGeneration, "aborted", { error: "Generation cancelled." });

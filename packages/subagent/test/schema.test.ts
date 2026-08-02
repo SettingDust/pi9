@@ -16,7 +16,8 @@ const valid: Record<string, Record<string, unknown>> = {
 };
 
 const text = (value: unknown) => JSON.stringify(value);
-const spawnBranch = (schema: any) => schema.anyOf.find((branch: any) => branch.properties?.action?.enum?.includes("spawn"));
+const requestSchema = (schema: any) => schema.properties.request;
+const spawnBranch = (schema: any) => requestSchema(schema).anyOf.find((branch: any) => branch.properties?.action?.enum?.includes("spawn"));
 
 describe("parseSubagentInvocation", () => {
   for (const [action, invocation] of Object.entries(valid)) {
@@ -32,12 +33,22 @@ describe("parseSubagentInvocation", () => {
 
   it("rejects a missing or unknown action", () => {
     assert.match(text(parseSubagentInvocation({})), /Provide an action/);
-assert.match(text(parseSubagentInvocation({ action: "explode" })), /Unknown action/);
+    assert.match(text(parseSubagentInvocation({ action: "explode" })), /Unknown action/);
   });
 
   it("rejects a spawn task without a label", () => {
     const result = parseSubagentInvocation({ action: "spawn", spawns: [{ agent: "helper", prompt: "work" }] });
     assert.match(text(result), /label must be a non-empty string/);
+  });
+
+  it("wraps the strict action union in an ordinary root object", () => {
+    const schema: any = createSubagentParamsSchema();
+    assert.equal(schema.type, "object");
+    assert.equal(schema.additionalProperties, false);
+    assert.deepEqual(schema.required, ["request"]);
+    assert.equal("anyOf" in schema, false);
+    assert.equal(requestSchema(schema).anyOf.length, 9);
+    assert.ok(requestSchema(schema).anyOf.every((branch: any) => branch.additionalProperties === false));
   });
 
   it("exposes dynamic agent and model enums for spawn", () => {

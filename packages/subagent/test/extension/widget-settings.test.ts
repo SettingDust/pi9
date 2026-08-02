@@ -75,7 +75,7 @@ test("loading settings for a tool invocation refreshes the visible widget", asyn
     settingsStore: { load: async () => ({ settings }), save: async () => {} },
   });
 
-  await tool.execute("call", { action: "agents" }, undefined, undefined, {
+  await tool.execute("call", { request: { action: "agents" } }, undefined, undefined, {
     cwd: "/tmp",
     hasUI: true,
     ui: { setWidget },
@@ -83,7 +83,7 @@ test("loading settings for a tool invocation refreshes the visible widget", asyn
 
   expect(setWidget).toHaveBeenCalledWith("subagent", expect.any(Function), { placement: "belowEditor" });
 });
-const spawnBranch = (schema: any) => schema.anyOf.find((branch: any) => branch.properties?.action?.enum?.includes("spawn"));
+const spawnBranch = (schema: any) => schema.properties.request.anyOf.find((branch: any) => branch.properties?.action?.enum?.includes("spawn"));
 
 test("session start refreshes agent and model schema", async () => {
   const handlers = new Map<string, Function[]>();
@@ -100,7 +100,7 @@ test("session start refreshes agent and model schema", async () => {
 
   const available = [{ provider: "all", id: "fallback" }];
   const scopedModels = [{ model: { provider: "scope", id: "alpha" } }, { model: { provider: "scope", id: "alpha" } }];
-await handlers.get("session_start")?.at(-1)?.({}, { cwd: "/tmp", hasUI: false, ui: {}, scopedModels, modelRegistry: { getAvailable: () => available } });
+  await handlers.get("session_start")?.at(-1)?.({}, { cwd: "/tmp", hasUI: false, ui: {}, scopedModels, modelRegistry: { getAvailable: () => available } });
 
   expect(tools).toHaveLength(2);
   const initialSpawn = spawnBranch(tools[0].parameters).properties.spawns.items;

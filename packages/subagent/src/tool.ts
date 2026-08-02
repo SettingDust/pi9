@@ -741,8 +741,9 @@ export function defineSubagentTool(deps: SubagentToolDeps) {
       "After a completion notification, join for its result or resume the subagent for follow-up; steer only while active."
     ],
     parameters: createSubagentParamsSchema({ agentNames, modelIds }),
+    constrainedSampling: { type: "json_schema", strict: "prefer" },
     renderCall(args, theme) {
-      return renderSubagentCall(args, theme);
+      return renderSubagentCall(args.request, theme);
     },
     renderResult(result, options, theme) {
       return renderSubagentResult(result, options, theme);
@@ -753,7 +754,7 @@ export function defineSubagentTool(deps: SubagentToolDeps) {
         ? { ...actionDeps, caller: { conversation: parent, generation: parent.requireCurrentGeneration() } }
         : actionDeps;
       const settings = await prepareInvocation(ctx);
-      const invocation = parseSubagentInvocation(params, { maxTasks: settings.runtime.maxTasksPerCall });
+      const invocation = parseSubagentInvocation(params.request, { maxTasks: settings.runtime.maxTasksPerCall });
       if ("error" in invocation) return invocationErrorResult(invocationDeps, invocation);
 
       switch (invocation.action) {

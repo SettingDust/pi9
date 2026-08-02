@@ -441,12 +441,19 @@ function isCompletionNotification(entry: unknown): entry is CompletionNotificati
 
 function toolAction(event: unknown): unknown {
   if (!event || typeof event !== "object") return undefined;
-  const value = event as { toolName?: unknown; args?: { action?: unknown } };
-  return value.toolName === "subagent" ? value.args?.action : undefined;
+  const value = event as { toolName?: unknown; args?: unknown };
+  return value.toolName === "subagent" ? invocationArgs(value.args)?.action : undefined;
+}
+function invocationArgs(params: unknown): { action?: unknown; subagentIds?: unknown } | undefined {
+  if (!params || typeof params !== "object" || Array.isArray(params)) return;
+  const value = params as { request?: unknown; action?: unknown; subagentIds?: unknown };
+  return value.request && typeof value.request === "object" && !Array.isArray(value.request)
+    ? value.request as { action?: unknown; subagentIds?: unknown }
+    : value;
 }
 function claimTarget(params: unknown): { action: unknown; subagentIds: Set<string> } {
-  if (!params || typeof params !== "object") return { action: undefined, subagentIds: new Set() };
-  const value = params as { action?: unknown; subagentIds?: unknown };
+  const value = invocationArgs(params);
+  if (!value) return { action: undefined, subagentIds: new Set() };
   const action = value.action;
   if ((action !== "inspect" && action !== "cancel" && action !== "join") || !Array.isArray(value.subagentIds)) return { action, subagentIds: new Set() };
   return { action, subagentIds: new Set(value.subagentIds.filter((id): id is string => typeof id === "string")) };

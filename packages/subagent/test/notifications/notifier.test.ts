@@ -170,7 +170,7 @@ test("completion messages do not rebound after runtime-local identities are reus
 
 test("successive generations retain exact completion correlation", () => {
   const f = fixture();
-  f.notifier.beginTool("root", "inspect-first-generation", { action: "inspect", subagentIds: ["calm-river"] });
+  f.notifier.beginTool("root", "inspect-first-generation", { request: { action: "inspect", subagentIds: ["calm-river"] } });
   f.generation.joined = true;
   f.conversations[0].generations.push({ generation: 2, createdAt: 3, observerCount: 0, joined: false, status: { kind: "done", outcome: "completed", completedAt: 4 } });
   f.notifier.completeTool("root", "inspect-first-generation", {
@@ -186,7 +186,7 @@ for (const action of ["inspect", "cancel"] as const) {
   test(`${action} completion uses the generation acted on after rollover and releases the initial claim`, () => {
     const f = fixture();
     const toolCallId = `${action}-after-rollover`;
-    f.notifier.beginTool("root", toolCallId, { action, subagentIds: ["calm-river"] });
+    f.notifier.beginTool("root", toolCallId, { request: { action, subagentIds: ["calm-river"] } });
     f.generation.joined = true;
     const resumed: any = { generation: 2, createdAt: 3, observerCount: 0, joined: false, status: { kind: "done", outcome: action === "cancel" ? "aborted" : "completed", completedAt: 4 } };
     f.conversations[0].generations.push(resumed);
@@ -510,5 +510,15 @@ test("active steer send rejection retries without duplicating the UI notificatio
   assert.equal(f.sent.length, 2);
   assert.deepEqual(f.sent.map(value => value.options), [{ deliverAs: "steer" }, { deliverAs: "steer" }]);
   assert.equal(f.notified.length, 1);
+  f.notifier.unsubscribe();
+});
+test("wrapped lifecycle calls claim their target generation", () => {
+  const f = fixture();
+  f.notifier.beginTool("root", "wrapped-inspect", {
+    request: { action: "inspect", subagentIds: ["calm-river"] },
+  });
+  f.fire("session_start");
+  f.flush();
+  assert.equal(f.sent.length, 0);
   f.notifier.unsubscribe();
 });

@@ -43,30 +43,32 @@ export function createSubagentParamsSchema(options: DynamicSpawnSchemaOptions = 
     subagentIds: Type.Array(Type.String(), { minItems: 1 }),
   }, { additionalProperties: false });
 
-  return Type.Union([
-    Type.Object({ action: action("agents") }, { additionalProperties: false }),
-    Type.Object({
-      action: action("list"),
-      statuses: Type.Optional(Type.Array(StringEnum(SUBAGENT_STATUSES), { minItems: 1 })),
-      joined: Type.Optional(Type.Boolean()),
-    }, { additionalProperties: false }),
-    Type.Object({
-      action: action("spawn"),
-      spawns: Type.Array(createSpawnTaskSchema(options), { minItems: 1 }),
-    }, { additionalProperties: false }),
-    Type.Object({
-      action: action("resume"),
-      resumes: Type.Array(ResumeTaskSchema, { minItems: 1 }),
-    }, { additionalProperties: false }),
-    Type.Object({
-      action: action("steer"),
-      messages: Type.Array(SteerMessageSchema, { minItems: 1 }),
-    }, { additionalProperties: false }),
-    targets("cancel"),
-    targets("inspect"),
-    targets("join"),
-    targets("remove"),
-  ], { type: "object" });
+  return Type.Object({
+    request: Type.Union([
+      Type.Object({ action: action("agents") }, { additionalProperties: false }),
+      Type.Object({
+        action: action("list"),
+        statuses: Type.Optional(Type.Array(StringEnum(SUBAGENT_STATUSES), { minItems: 1 })),
+        joined: Type.Optional(Type.Boolean()),
+      }, { additionalProperties: false }),
+      Type.Object({
+        action: action("spawn"),
+        spawns: Type.Array(createSpawnTaskSchema(options), { minItems: 1 }),
+      }, { additionalProperties: false }),
+      Type.Object({
+        action: action("resume"),
+        resumes: Type.Array(ResumeTaskSchema, { minItems: 1 }),
+      }, { additionalProperties: false }),
+      Type.Object({
+        action: action("steer"),
+        messages: Type.Array(SteerMessageSchema, { minItems: 1 }),
+      }, { additionalProperties: false }),
+      targets("cancel"),
+      targets("inspect"),
+      targets("join"),
+      targets("remove"),
+    ]),
+  }, { additionalProperties: false });
 }
 export const SubagentParams = createSubagentParamsSchema();
 
