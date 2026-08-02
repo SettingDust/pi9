@@ -14,6 +14,25 @@ const toolCall = (arguments_: Record<string, any>) => ({
   name: "subagent",
   arguments: arguments_,
 });
+const spawnBranch = (schema: any) => schema.anyOf.find((branch: any) => branch.properties?.action?.enum?.includes("spawn"));
+const validInvocations = [
+  { action: "agents" },
+  { action: "list" },
+  { action: "spawn", spawns: [{ agent: "helper", prompt: "work", label: "Worker" }] },
+  { action: "resume", resumes: [{ subagentId: "airy-acorn", prompt: "continue" }] },
+  { action: "steer", messages: [{ subagentId: "airy-acorn", message: "adjust" }] },
+  { action: "cancel", subagentIds: ["airy-acorn"] },
+  { action: "inspect", subagentIds: ["airy-acorn"] },
+  { action: "join", subagentIds: ["airy-acorn"] },
+  { action: "remove", subagentIds: ["airy-acorn"] },
+];
+
+test("published schema accepts every action's minimal invocation", () => {
+  const tool: any = defineSubagentTool({ runtime, agentRegistry: registry, prepareInvocation: async () => settings });
+  for (const invocation of validInvocations) {
+    assert.doesNotThrow(() => validateToolArguments(tool, toolCall(invocation)));
+  }
+});
 
 test("SDK validation rejects a whole batch containing a malformed task", () => {
   const tool: any = defineSubagentTool({
@@ -43,17 +62,34 @@ test("SDK validation enforces the task-array minimum", () => {
     /Validation failed/,
   );
 });
+
 test("definition can expose discovered agents and available models", () => {
   const tool: any = defineSubagentTool({
     runtime,
     agentRegistry: registry,
     prepareInvocation: async () => settings,
-    agentNames: ["handler", "reviewer"],
+agentNames: ["handler", "reviewer"],
     modelIds: ["provider/alpha"],
   });
-  const spawn = tool.parameters.properties.spawns.items;
+  const spawn = spawnBranch(tool.parameters).properties.spawns.items;
   assert.deepEqual(spawn.properties.agent.enum, ["handler", "reviewer"]);
   assert.deepEqual(spawn.properties.model.enum, ["provider/alpha"]);
+});
+
+test("published schema rejects fields from another action", () => {
+  const tool: any = defineSubagentTool({
+    runtime,
+    agentRegistry: registry,
+    prepareInvocation: async () => settings,
+  });
+  assert.throws(
+    () => validateToolArguments(tool, toolCall({
+      action: "spawn",
+      spawns: [{ agent: "helper", prompt: "work", label: "Worker" }],
+      joined: false,
+    })),
+    /Validation failed/,
+  );
 });
 
 test("tool prepares settings, applies task limits, and renders simple typed content", async () => {
