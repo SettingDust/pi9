@@ -16,6 +16,7 @@ const valid: Record<string, Record<string, unknown>> = {
 };
 
 const text = (value: unknown) => JSON.stringify(value);
+const spawnBranch = (schema: any) => schema.anyOf.find((branch: any) => branch.properties?.action?.enum?.includes("spawn"));
 
 describe("parseSubagentInvocation", () => {
   for (const [action, invocation] of Object.entries(valid)) {
@@ -31,22 +32,23 @@ describe("parseSubagentInvocation", () => {
 
   it("rejects a missing or unknown action", () => {
     assert.match(text(parseSubagentInvocation({})), /Provide an action/);
-    assert.match(text(parseSubagentInvocation({ action: "explode" })), /Unknown action/);
+assert.match(text(parseSubagentInvocation({ action: "explode" })), /Unknown action/);
   });
 
   it("rejects a spawn task without a label", () => {
     const result = parseSubagentInvocation({ action: "spawn", spawns: [{ agent: "helper", prompt: "work" }] });
     assert.match(text(result), /label must be a non-empty string/);
   });
+
   it("exposes dynamic agent and model enums for spawn", () => {
     const schema: any = createSubagentParamsSchema({ agentNames: ["handler", "reviewer"], modelIds: ["provider/alpha", "provider/beta"] });
-    const spawn = schema.properties.spawns.items;
+    const spawn = spawnBranch(schema).properties.spawns.items;
     assert.deepEqual(spawn.properties.agent.enum, ["handler", "reviewer"]);
     assert.deepEqual(spawn.properties.model.enum, ["provider/alpha", "provider/beta"]);
 
     const fallback: any = createSubagentParamsSchema();
-    assert.equal(fallback.properties.spawns.items.properties.agent.type, "string");
-    assert.equal(fallback.properties.spawns.items.properties.model.type, "string");
+    assert.equal(spawnBranch(fallback).properties.spawns.items.properties.agent.type, "string");
+    assert.equal(spawnBranch(fallback).properties.spawns.items.properties.model.type, "string");
   });
 
   for (const action of ["join", "cancel"] as const) {

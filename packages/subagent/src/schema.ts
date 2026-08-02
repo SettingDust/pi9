@@ -37,15 +37,36 @@ export const SteerMessageSchema = Type.Object({
 }, { additionalProperties: false });
 
 export function createSubagentParamsSchema(options: DynamicSpawnSchemaOptions = {}) {
-  return Type.Object({
-    action: StringEnum(SUBAGENT_ACTIONS),
-    statuses: Type.Optional(Type.Array(StringEnum(SUBAGENT_STATUSES), { minItems: 1 })),
-    joined: Type.Optional(Type.Boolean()),
-    spawns: Type.Optional(Type.Array(createSpawnTaskSchema(options), { minItems: 1 })),
-    resumes: Type.Optional(Type.Array(ResumeTaskSchema, { minItems: 1 })),
-    messages: Type.Optional(Type.Array(SteerMessageSchema, { minItems: 1 })),
-    subagentIds: Type.Optional(Type.Array(Type.String(), { minItems: 1 })),
+  const action = <T extends SubagentAction>(value: T) => StringEnum([value]);
+  const targets = (value: "cancel" | "inspect" | "join" | "remove") => Type.Object({
+    action: action(value),
+    subagentIds: Type.Array(Type.String(), { minItems: 1 }),
   }, { additionalProperties: false });
+
+  return Type.Union([
+    Type.Object({ action: action("agents") }, { additionalProperties: false }),
+    Type.Object({
+      action: action("list"),
+      statuses: Type.Optional(Type.Array(StringEnum(SUBAGENT_STATUSES), { minItems: 1 })),
+      joined: Type.Optional(Type.Boolean()),
+    }, { additionalProperties: false }),
+    Type.Object({
+      action: action("spawn"),
+      spawns: Type.Array(createSpawnTaskSchema(options), { minItems: 1 }),
+    }, { additionalProperties: false }),
+    Type.Object({
+      action: action("resume"),
+      resumes: Type.Array(ResumeTaskSchema, { minItems: 1 }),
+    }, { additionalProperties: false }),
+    Type.Object({
+      action: action("steer"),
+      messages: Type.Array(SteerMessageSchema, { minItems: 1 }),
+    }, { additionalProperties: false }),
+    targets("cancel"),
+    targets("inspect"),
+    targets("join"),
+    targets("remove"),
+  ], { type: "object" });
 }
 export const SubagentParams = createSubagentParamsSchema();
 
