@@ -224,7 +224,7 @@ export function createPaneGenerationExecutor(dependencies: PaneExecutionDependen
       piInvocation,
     });
 
-    generation.attachControl({
+    conversation.bindControl(generation, {
       steer: async text => handle.send(text),
       abort: async () => handle.interrupt(),
     });
@@ -280,16 +280,21 @@ async function launchPiPane(options: PiPaneLaunchOptions): Promise<PaneExecution
   let surface: string;
   if (herdr) {
     while (true) {
-      const source = herdrSurfaces.at(-1) ?? process.env.HERDR_PANE_ID!;
-      try { surface = mux.createSurfaceSplit!(name, herdrNextDirection, source); break; }
+      const layoutIndex = herdrSurfaces.length;
+      const source = layoutIndex === 0 ? process.env.HERDR_PANE_ID!
+        : layoutIndex === 1 || layoutIndex === 3 ? herdrSurfaces[0]!
+        : layoutIndex === 2 ? herdrSurfaces[1]!
+        : herdrSurfaces.at(-1)!;
+      const direction = layoutIndex < 2 ? "right" : layoutIndex < 4 ? "down" : herdrNextDirection;
+      try { surface = mux.createSurfaceSplit!(name, direction, source); herdrNextDirection = direction === "right" ? "down" : "right"; break; }
       catch (error) {
-        if (!isMissingPaneError(error) || herdrSurfaces.length === 0) throw error;
-        herdrSurfaces.pop();
+        const sourceIndex = herdrSurfaces.indexOf(source);
+        if (!isMissingPaneError(error) || sourceIndex < 0) throw error;
+        herdrSurfaces.splice(sourceIndex, 1);
         if (herdrSurfaces.length === 0) herdrNextDirection = "right";
       }
     }
     herdrSurfaces.push(surface);
-    herdrNextDirection = herdrNextDirection === "right" ? "down" : "right";
   } else {
     surface = mux.createSurface(name);
   }

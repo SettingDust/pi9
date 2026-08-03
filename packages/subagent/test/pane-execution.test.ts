@@ -6,7 +6,10 @@ import { beforeEach, expect, test, vi } from "vitest";
 import { launchPaneExecution, createPaneGenerationExecutor, reopenPaneExecution, resetPaneExecutionStateForTests } from "../src/pane-execution.js";
 import { Conversation } from "../src/conversation.js";
 
-beforeEach(() => resetPaneExecutionStateForTests());
+beforeEach(() => {
+  vi.unstubAllEnvs();
+  resetPaneExecutionStateForTests();
+});
 function mux() {
   return {
     closeSurface: vi.fn(),
@@ -22,6 +25,26 @@ function mux() {
       return { reason: "done", exitCode: 0 };
     }),
   };
+}
+
+function herdrMux() {
+  const fakeMux = mux();
+  let nextSurface = 0;
+  const createSurfaceSplit = vi.fn((_name: string, _direction: "left" | "right" | "up" | "down", _source?: string) => `pane-${++nextSurface}`);
+  fakeMux.getMuxBackend.mockReturnValue("herdr");
+  return { fakeMux: Object.assign(fakeMux, { createSurfaceSplit }), createSurfaceSplit };
+}
+
+async function launchHerdrPane(fakeMux: ReturnType<typeof herdrMux>["fakeMux"], directory: string, index: number) {
+  return launchPaneExecution({
+    cwd: directory,
+    sessionFile: path.join(directory, `child-${index}.jsonl`),
+    prompt: `work ${index}`,
+    extensionPaths: [],
+    env: {},
+    piInvocation: { command: "pi", args: [] },
+    dependencies: { mux: fakeMux as any, sleep: async () => undefined, platform: "linux" },
+  });
 }
 
 const definition = { name: "worker", description: "", systemPrompt: "System", source: "project" as const };
@@ -60,6 +83,70 @@ test("unix launcher stores prompt as one bash argv array element", async () => {
   expect(command).toContain("__code=$?");
   expect(command).not.toContain(prompt);
   expect(command).not.toContain("/skill");
+});
+
+test("Herdr creates four live child panes clockwise in a balanced grid", async () => {
+  vi.stubEnv("HERDR_PANE_ID", "main");
+  const directory = await mkdtemp(path.join(tmpdir(), "pane-herdr-layout-"));
+  const { fakeMux, createSurfaceSplit } = herdrMux();
+  const handles = [];
+
+  try {
+    for (let index = 1; index <= 4; index++) handles.push(await launchHerdrPane(fakeMux, directory, index));
+    expect(createSurfaceSplit.mock.calls.map(([, direction, source]) => [source, direction])).toEqual([
+      ["main", "right"],
+      ["pane-1", "right"],
+      ["pane-2", "down"],
+      ["pane-1", "down"],
+    ]);
+  } finally {
+    for (const handle of handles.reverse()) handle.close();
+  }
+});
+
+test("Herdr removes the missing selected source and recomputes the split", async () => {
+  vi.stubEnv("HERDR_PANE_ID", "main");
+  const directory = await mkdtemp(path.join(tmpdir(), "pane-herdr-recovery-"));
+  const { fakeMux, createSurfaceSplit } = herdrMux();
+  createSurfaceSplit.mockImplementation((_name: string, direction: "left" | "right" | "up" | "down", source?: string) => {
+    if (source === "pane-1" && direction === "down") throw new Error("pane_not_found");
+    return `pane-${createSurfaceSplit.mock.results.filter(result => result.type === "return").length + 1}`;
+  });
+  const handles = [];
+
+  try {
+    for (let index = 1; index <= 4; index++) handles.push(await launchHerdrPane(fakeMux, directory, index));
+    expect(createSurfaceSplit.mock.calls.map(([, direction, source]) => [source, direction])).toEqual([
+      ["main", "right"],
+      ["pane-1", "right"],
+      ["pane-2", "down"],
+      ["pane-1", "down"],
+      ["pane-3", "down"],
+    ]);
+  } finally {
+    for (const handle of handles.reverse()) handle.close();
+  }
+});
+
+test("pane Generation reports running after control binding and before completion", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "pane-running-"));
+  const fakeMux = mux();
+  let release!: () => void;
+  fakeMux.pollForExit.mockImplementationOnce(() => new Promise(resolve => {
+    release = () => resolve({ reason: "done", exitCode: 0 });
+  }));
+  const statuses: string[] = [];
+  const conversation = new Conversation("running-pane" as any, definition, { kind: "spawn", agent: "worker", prompt: "wait", label: "wait" }, (changed, kind) => {
+    if (kind === "status") statuses.push(changed.status.kind);
+  });
+  const executor = createPaneGenerationExecutor({ mux: fakeMux as any, sleep: async () => undefined, platform: "linux", loadExtensionPaths: async () => [] });
+
+  expect(conversation.status.kind).toBe("queued");
+  const execution = executor(ctx(tmp), conversation, conversation.latestGeneration);
+  await vi.waitFor(() => expect(statuses).toEqual(["running"]));
+  expect(conversation.status.kind).toBe("running");
+  release();
+  await execution;
 });
 
 test("windows launcher keeps large prompts out of PowerShell native argv", async () => {

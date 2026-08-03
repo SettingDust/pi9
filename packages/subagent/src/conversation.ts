@@ -328,6 +328,11 @@ export class Conversation {
     this.unsubscribe = generation.activity.subscribe(session);
     this.listener(this, "status");
   }
+  bindControl(generation: Generation, control: GenerationControl): void {
+    if (generation !== this.requireCurrentGeneration()) throw new Error(`Generation ${generation.number} is no longer current.`);
+    generation.attachControl(control);
+    this.listener(this, "status");
+  }
   sessionForResume(): AgentSession | undefined { return this.session; }
   retainSessionFile(file: string): void { this.retainedSessionFile = file; }
   sessionFileForResume(): string | undefined { return this.retainedSessionFile; }
