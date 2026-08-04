@@ -1,6 +1,6 @@
 {
   "name": "@pi9/context",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Pi extension to show a breakdown of your current context usage.",
   "license": "MIT",
   "author": "Chase Cummings <chaseecummings@gmail.com>",
@@ -50,7 +50,8 @@
       "./src/index.ts"
     ],
     "skills": [],
-    "prompts": []
+    "prompts": [],
+    "image": "https://raw.githubusercontent.com/Chase-C/pi9/main/packages/context/media/context-report.png"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

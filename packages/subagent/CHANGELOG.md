@@ -4,6 +4,32 @@ This changelog starts with version `v0.2.1`.
 
 ## [Unreleased]
 
+## [0.10.7] - 2026-08-03
+
+### Changed
+
+- Omit spawn/resume markers from join rendering.
+- Always display the `/subagents` conversation browser as a tree.
+- Separate navigation help from context-sensitive action chips in the `/subagents` overlay, aligning the footer divider with the browser columns.
+- Show only actions available for the selected conversation and guard unavailable cancellation and subtree removal shortcuts.
+- Replace duplicate inspector action prompts with a single agent-aware `delegate to <agent>` footer action.
+
+## [0.10.6] - 2026-08-03
+
+### Changed
+
+- Add a package gallery image showing the subagent workflow.
+
+## [0.10.5] - 2026-08-02
+
+### Changed
+
+- Make agent and conversation details in the `/subagents` overlay scrollable with Page Up and Page Down, including directional overflow markers.
+
+### Fixed
+
+- Render the editor border glyphs in the widget settings preview with the intended dim color.
+
 ## [0.10.4] - 2026-07-31
 
 ### Changed
@@ -333,7 +359,10 @@ This changelog starts with version `v0.2.1`.
 - Add coverage for native inherited extension loading, canonical self-exclusion, SDK child tools, and recursive shared-manager behavior.
 - Add coverage for lifecycle events, session metadata persistence, session guards, command completions, background completion rendering, and resume message rendering.
 
-[Unreleased]: https://github.com/Chase-C/pi9/compare/subagent-v0.10.4...HEAD
+[Unreleased]: https://github.com/Chase-C/pi9/compare/subagent-v0.10.7...HEAD
+[0.10.7]: https://github.com/Chase-C/pi9/compare/subagent-v0.10.6...subagent-v0.10.7
+[0.10.6]: https://github.com/Chase-C/pi9/compare/subagent-v0.10.5...subagent-v0.10.6
+[0.10.5]: https://github.com/Chase-C/pi9/compare/subagent-v0.10.4...subagent-v0.10.5
 [0.10.4]: https://github.com/Chase-C/pi9/compare/subagent-v0.10.3...subagent-v0.10.4
 [0.10.3]: https://github.com/Chase-C/pi9/compare/subagent-v0.10.2...subagent-v0.10.3
 [0.10.2]: https://github.com/Chase-C/pi9/compare/subagent-v0.10.1...subagent-v0.10.2

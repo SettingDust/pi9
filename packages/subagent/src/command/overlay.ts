@@ -15,8 +15,8 @@ import { effectiveStatus, type ConversationSnapshot, type GenerationSnapshot } f
 import { formatElapsed, formatTokens, generationElapsedMs, statusColor } from "../generation-format.js";
 import type { SubagentRuntime } from "../runtime.js";
 import { DEFAULT_SUBAGENT_SETTINGS, type SubagentSettings } from "../settings.js";
-import { clamp, isCancelKey, isDownKey, isEnterKey, isShiftTabKey, isUpKey, type SubagentKeybindings } from "./input.js";
-import { filterAgents, projectConversations, type ConversationLayoutMode } from "./overlay-model.js";
+import { clamp, isCancelKey, isDownKey, isEnterKey, isPageDownKey, isPageUpKey, isShiftTabKey, isUpKey, type SubagentKeybindings } from "./input.js";
+import { filterAgents, projectConversations } from "./overlay-model.js";
 import { SubagentSettingsComponent, type SubagentSettingsChange } from "./settings.js";
 
 export type SubagentOverlayPage = "conversations" | "agents" | "settings";
@@ -46,7 +46,6 @@ export class SubagentOverlayComponent implements Component, Focusable {
   private _focused = false;
   private page: SubagentOverlayPage;
   private focusRegion: FocusRegion = "list";
-  private conversationMode: ConversationLayoutMode = "tree";
   private readonly selected: Record<SubagentOverlayPage, number> = { conversations: 0, agents: 0, settings: 0 };
   private selectedConversationId?: string;
   private selectedAgentName?: string;
@@ -55,6 +54,7 @@ export class SubagentOverlayComponent implements Component, Focusable {
   private promptTarget?: PromptTarget;
   private detail?: { conversationId: string; generation?: number };
   private actionError = "";
+  private inspectorScrollOffset = 0;
   private readonly settings: SubagentSettingsComponent;
   private readonly unsubscribe: () => void;
   private readonly bodyHeight: number;
@@ -121,6 +121,8 @@ export class SubagentOverlayComponent implements Component, Focusable {
     if (isShiftTabKey(data)) { this.switchPage(-1); return; }
     if ((this.page === "conversations" || this.page === "agents") && data === "/") { this.setFocus("filter"); return; }
     if (this.page === "settings") { this.settings.handleInput(data); return; }
+    if (isPageUpKey(data, this.keybindings)) { this.scrollInspector(-1); return; }
+    if (isPageDownKey(data, this.keybindings)) { this.scrollInspector(1); return; }
     if (isUpKey(data, this.keybindings)) { this.moveSelection(-1); return; }
     if (isDownKey(data, this.keybindings)) { this.moveSelection(1); return; }
     if (this.page === "agents") this.handleAgentAction(data);
@@ -130,18 +132,20 @@ export class SubagentOverlayComponent implements Component, Focusable {
   render(width: number): string[] {
     const innerWidth = Math.max(1, width - 2);
     const header = this.detail ? this.renderDetailTitle(innerWidth) : this.renderTabs(innerWidth);
+    const help = this.renderHelp(innerWidth);
+    const bodyHeight = Math.max(1, this.bodyHeight - help.length + 1);
     const body = this.detail
-      ? this.renderDetail(innerWidth)
+      ? this.renderDetail(innerWidth, bodyHeight)
       : this.page === "settings"
-        ? fitHeight(this.settings.render(Math.max(1, innerWidth - 2)), this.bodyHeight)
-        : this.renderBrowser(innerWidth);
+        ? fitHeight(this.settings.render(Math.max(1, innerWidth - 2)), bodyHeight)
+        : this.renderBrowser(innerWidth, bodyHeight);
     const lines = [
       this.border(`╭${"─".repeat(innerWidth)}╮`),
       this.row(header, innerWidth),
       this.border(`├${"─".repeat(innerWidth)}┤`),
       ...body.map(line => this.row(line, innerWidth)),
       this.border(`├${"─".repeat(innerWidth)}┤`),
-      this.row(this.muted(this.helpText()), innerWidth),
+      ...help.map(line => this.row(line, innerWidth)),
       this.border(`╰${"─".repeat(innerWidth)}╯`),
     ];
     return lines.map(line => visibleWidth(line) > width ? truncateToWidth(line, width, "") : line);
@@ -176,7 +180,7 @@ export class SubagentOverlayComponent implements Component, Focusable {
     return truncateToWidth(` ${this.accent("Subagents")}  ${title}`, width, "");
   }
 
-  private renderBrowser(width: number): string[] {
+  private renderBrowser(width: number, bodyHeight: number): string[] {
     const wide = width >= 80;
     const leftWidth = wide ? Math.max(30, Math.floor(width * 0.36)) : width;
     const rightWidth = wide ? width - leftWidth - 3 : width;
@@ -185,28 +189,28 @@ export class SubagentOverlayComponent implements Component, Focusable {
     const filter = this.renderFilter(Math.max(1, leftWidth - 2));
 
     if (!wide) {
-      if (this.bodyHeight < 4) {
-        const listHeight = Math.max(0, this.bodyHeight - 1);
+      if (bodyHeight < 4) {
+        const listHeight = Math.max(0, bodyHeight - 1);
         return [
           ...fitHeight(this.renderListViewport(list, listHeight, Math.max(1, leftWidth - 2)), listHeight),
           ` ${filter}`,
         ];
       }
-      const contentHeight = this.bodyHeight - 2;
+      const contentHeight = bodyHeight - 2;
       const listHeight = Math.ceil(contentHeight / 2);
       const inspectorHeight = contentHeight - listHeight;
       return [
         ...fitHeight(this.renderListViewport(list, listHeight, Math.max(1, leftWidth - 2)), listHeight),
         ` ${filter}`,
         this.border("─".repeat(width)),
-        ...fitHeight(compactViewport(inspector, inspectorHeight), inspectorHeight),
+        ...fitHeight(this.renderInspectorViewport(inspector, inspectorHeight, Math.max(1, rightWidth - 2)), inspectorHeight),
       ];
     }
 
-    const topPadding = this.bodyHeight > 1 ? 1 : 0;
-    const listHeight = Math.max(0, this.bodyHeight - topPadding - 1);
+    const topPadding = bodyHeight > 1 ? 1 : 0;
+    const listHeight = Math.max(0, bodyHeight - topPadding - 1);
     const left = [...(topPadding ? [""] : []), ...fitHeight(this.renderListViewport(list, listHeight, Math.max(1, leftWidth - 2)), listHeight), filter];
-    const right = fitHeight([...(topPadding ? [""] : []), ...compactViewport(inspector, Math.max(0, this.bodyHeight - topPadding))], this.bodyHeight);
+    const right = fitHeight(this.renderInspectorViewport(inspector, bodyHeight, Math.max(1, rightWidth - 2), true), bodyHeight);
     return left.map((line, index) => `${pad(` ${line}`, leftWidth)} ${this.border("│")} ${pad(` ${right[index] ?? ""}`, rightWidth)}`);
   }
 
@@ -299,10 +303,14 @@ export class SubagentOverlayComponent implements Component, Focusable {
       "",
       ...wrapParagraphs(agent.systemPrompt.trim() || "No custom instructions.", width),
     ];
-    const action = this.promptTarget?.kind === "agent"
-      ? [`${this.success("→")} ${this.accent(`Start ${agent.name}`)}`, ...this.renderPrompt(width), ...(this.actionError ? [this.error(this.actionError)] : [])]
-      : [`${this.success("→")} ${this.accent(`Start ${agent.name}`)} ${this.muted("· enter to compose a task")}`];
-    return pinBottom(lines, action, Math.max(1, this.bodyHeight - 1));
+    if (this.promptTarget?.kind !== "agent") return lines;
+    return [
+      ...lines,
+      "",
+      this.accent("Task prompt"),
+      ...this.renderPrompt(width),
+      ...(this.actionError ? [this.error(this.actionError)] : []),
+    ];
   }
 
   private renderConversationChronology(conversation: ConversationSnapshot, generation: GenerationSnapshot, width: number): string[] {
@@ -397,19 +405,17 @@ export class SubagentOverlayComponent implements Component, Focusable {
 
   private renderFilter(width: number): string {
     const input = this.activeFilter!;
-    const suffix = this.page === "conversations" ? `  View: ${this.conversationMode === "flat" ? "[Flat] Tree" : "Flat [Tree]"}` : "";
-    const available = Math.max(6, width - visibleWidth(suffix) - 3);
-    const rendered = input.render(available)[0] ?? "";
+    const rendered = input.render(Math.max(6, width - 3))[0] ?? "";
     const value = input.getValue() || this.focusRegion === "filter" ? rendered : this.muted("Filter…");
-    return truncateToWidth(`/ ${value}${suffix}`, width, "");
+    return truncateToWidth(`/ ${value}`, width, "");
   }
 
-  private renderDetail(width: number): string[] {
+  private renderDetail(width: number, bodyHeight: number): string[] {
     const conversation = this.findConversation(this.detail!.conversationId);
-    if (!conversation) return fitHeight([this.error("Conversation is no longer available.")], this.bodyHeight);
+    if (!conversation) return fitHeight([this.error("Conversation is no longer available.")], bodyHeight);
     const generation = this.findGeneration(conversation, this.detail!.generation);
-    if (!generation) return fitHeight([this.muted("Generation is no longer available.")], this.bodyHeight);
-    return fitHeight(compactViewport(this.renderConversationChronology(conversation, generation, width), this.bodyHeight), this.bodyHeight);
+    if (!generation) return fitHeight([this.muted("Generation is no longer available.")], bodyHeight);
+    return fitHeight(compactViewport(this.renderConversationChronology(conversation, generation, width), bodyHeight), bodyHeight);
   }
 
   private handleAgentAction(data: string): void {
@@ -422,7 +428,6 @@ export class SubagentOverlayComponent implements Component, Focusable {
   private handleConversationAction(data: string): void {
     const rows = this.conversationRows;
     const conversation = rows[this.selectedConversation(rows)]?.conversation;
-    if (data.toLowerCase() === "t") { this.conversationMode = this.conversationMode === "flat" ? "tree" : "flat"; this.resetSelection(); this.requestRender(); return; }
     if (!conversation) return;
     if (isEnterKey(data, this.keybindings)) {
       const generation = conversation.currentGeneration ?? conversation.generations.at(-1);
@@ -445,6 +450,7 @@ export class SubagentOverlayComponent implements Component, Focusable {
     this.promptTarget = target;
     this.prompt.setValue("");
     this.actionError = "";
+    this.inspectorScrollOffset = Number.MAX_SAFE_INTEGER;
     this.setFocus("prompt");
   }
 
@@ -503,18 +509,21 @@ export class SubagentOverlayComponent implements Component, Focusable {
 
   private cancelGeneration(conversationId: string, generationNumber?: number): void {
     const conversation = this.findConversation(conversationId);
-    if (!conversation) return;
+    if (!conversation || conversation.parentConversationId || conversation.isStopping) return;
     const generation = this.findGeneration(conversation, generationNumber);
     if (generation?.status.kind === "queued" || generation?.status.kind === "running") this.options.onCancel?.(conversation.conversationId);
   }
 
   private removeConversation(conversationId: string): void {
+    const conversation = this.findConversation(conversationId);
+    if (!conversation || !this.isRemoveAvailable(conversation)) return;
     this.options.onRemove?.(conversationId);
     if (this.detail?.conversationId === conversationId) this.detail = undefined;
     if (this.selectedConversationId === conversationId) this.selectedConversationId = undefined;
   }
 
   private moveSelection(delta: number): void {
+    this.inspectorScrollOffset = 0;
     if (this.page === "agents") {
       const agents = this.filteredAgents;
       const index = clamp(this.selectedAgent(agents) + delta, 0, Math.max(0, agents.length - 1));
@@ -532,10 +541,12 @@ export class SubagentOverlayComponent implements Component, Focusable {
   private switchPage(delta: number): void {
     const index = PAGES.indexOf(this.page);
     this.page = PAGES[(index + delta + PAGES.length) % PAGES.length];
+    this.inspectorScrollOffset = 0;
     this.closePrompt();
   }
 
   private resetSelection(): void {
+    this.inspectorScrollOffset = 0;
     this.selected[this.page] = 0;
     if (this.page === "agents") this.selectedAgentName = undefined;
     if (this.page === "conversations") this.selectedConversationId = undefined;
@@ -566,6 +577,14 @@ export class SubagentOverlayComponent implements Component, Focusable {
   private isResumeAvailable(conversation: ConversationSnapshot): boolean {
     return !conversation.parentConversationId && conversation.resumeAllowed;
   }
+  private isRemoveAvailable(conversation: ConversationSnapshot): boolean {
+    if (conversation.parentConversationId) return false;
+    try {
+      return this.manager.projectSubagent(conversation.conversationId).actionHints.includes("remove");
+    } catch {
+      return false;
+    }
+  }
   private setFocus(region: FocusRegion): void { this.focusRegion = region; this.syncFocus(); this.requestRender(); }
   private syncFocus(): void {
     this.filters.conversations.focused = this._focused && this.focusRegion === "filter" && this.page === "conversations";
@@ -573,10 +592,34 @@ export class SubagentOverlayComponent implements Component, Focusable {
     this.prompt.focused = this._focused && this.focusRegion === "prompt";
     this.settings.focused = this._focused && this.focusRegion === "list" && this.page === "settings";
   }
+  private scrollInspector(direction: -1 | 1): void {
+    const pageSize = Math.max(1, this.bodyHeight - 3);
+    this.inspectorScrollOffset = Math.max(0, this.inspectorScrollOffset + direction * pageSize);
+    this.requestRender();
+  }
+  private renderInspectorViewport(lines: string[], height: number, width: number, topPadding = false): string[] {
+    const paddedLength = lines.length + (topPadding ? 1 : 0);
+    if (paddedLength <= height || height < 3) {
+      const padded = topPadding ? ["", ...lines] : lines;
+      this.inspectorScrollOffset = clamp(this.inspectorScrollOffset, 0, Math.max(0, padded.length - height));
+      return padded.slice(this.inspectorScrollOffset, this.inspectorScrollOffset + height);
+    }
+
+    const contentHeight = height - 2;
+    const maxOffset = lines.length - contentHeight;
+    this.inspectorScrollOffset = clamp(this.inspectorScrollOffset, 0, maxOffset);
+    const above = this.inspectorScrollOffset;
+    const below = lines.length - this.inspectorScrollOffset - contentHeight;
+    return [
+      above ? this.muted(center(`▲ ${above} more above`, width)) : "",
+      ...lines.slice(this.inspectorScrollOffset, this.inspectorScrollOffset + contentHeight),
+      below ? this.muted(center(`▼ ${below} more below`, width)) : "",
+    ];
+  }
   private requestRender(): void { this.tui.requestRender(); }
   private findConversation(id: string): ConversationSnapshot | undefined { return this.manager.listConversations().find(conversation => conversation.conversationId === id); }
   private findGeneration(conversation: ConversationSnapshot, generation?: number): GenerationSnapshot | undefined { return generation ? conversation.generations.find(candidate => candidate.generation === generation) : conversation.currentGeneration ?? conversation.generations.at(-1); }
-  private get conversationRows() { return projectConversations(this.manager.listConversations(), { mode: this.conversationMode, query: this.filters.conversations.getValue() }); }
+  private get conversationRows() { return projectConversations(this.manager.listConversations(), { query: this.filters.conversations.getValue() }); }
   private get filteredAgents() { return filterAgents(this.options.agents, this.filters.agents.getValue()); }
   private get selectedListLine(): number {
     return (this.page === "agents" ? this.selectedAgent(this.filteredAgents) : this.selectedConversation(this.conversationRows)) * 4;
@@ -586,6 +629,7 @@ export class SubagentOverlayComponent implements Component, Focusable {
   private text(text: string): string { return this.theme.fg?.("text", text) ?? text; }
   private accent(text: string): string { return this.theme.fg?.("accent", this.bold(text)) ?? text; }
   private success(text: string): string { return this.theme.fg?.("success", text) ?? text; }
+  private warning(text: string): string { return this.theme.fg?.("warning", text) ?? text; }
   private muted(text: string): string { return this.theme.fg?.("muted", text) ?? text; }
   private dim(text: string): string { return this.theme.fg?.("dim", text) ?? text; }
   private error(text: string): string { return this.theme.fg?.("error", text) ?? text; }
@@ -596,12 +640,44 @@ export class SubagentOverlayComponent implements Component, Focusable {
   }
   private statusAccent(generation: GenerationSnapshot, text: string): string { return this.statusText(generation, text); }
   private row(content: string, width: number): string { return `${this.border("│")}${pad(content, width)}${this.border("│")}`; }
-  private helpText(): string {
-    if (this.focusRegion === "prompt") return "enter submit · esc cancel";
-    if (this.detail) return "c cancel · g collect · r resume · x remove · esc back";
-    if (this.page === "agents") return "↑↓ select · / filter · enter/s start · tab pages · esc close";
-    if (this.page === "conversations") return "↑↓ select · enter inspect · / filter · t flat/tree · c cancel · g collect · r resume · x remove · tab pages · esc close";
-    return this.settings.isEditing ? "type value · enter save · esc cancel" : "↑↓ select · enter/space change · tab pages · esc close";
+  private renderHelp(width: number): string[] {
+    if (this.focusRegion === "prompt") return [this.muted("enter submit · esc cancel")];
+    if (this.detail) {
+      const conversation = this.findConversation(this.detail.conversationId);
+      const generation = conversation && this.findGeneration(conversation, this.detail.generation);
+      const actions = conversation && generation ? this.conversationActionHelp(conversation, generation, false) : "";
+      return [this.dim("esc back"), ...(actions ? wrapTextWithAnsi(actions, width) : [])];
+    }
+    if (this.page === "settings") {
+      return [this.muted(this.settings.isEditing ? "type value · enter save · esc cancel" : "↑↓ select · enter/space change · tab pages · esc close")];
+    }
+
+    const navigation = "↑↓ select · PgUp/PgDn scroll details · / filter · tab pages · esc close";
+    const conversation = this.page === "conversations"
+      ? this.conversationRows[this.selectedConversation(this.conversationRows)]?.conversation
+      : undefined;
+    const agent = this.page === "agents"
+      ? this.filteredAgents[this.selectedAgent(this.filteredAgents)]
+      : undefined;
+    const generation = conversation?.currentGeneration ?? conversation?.generations.at(-1);
+    const actions = this.page === "agents"
+      ? agent ? this.actionChip("enter/s", `delegate to ${agent.name}`) : ""
+      : conversation && generation ? this.conversationActionHelp(conversation, generation) : "";
+    return dividedHelp(this.muted(navigation), actions, width, text => this.border(text));
+  }
+
+  private conversationActionHelp(conversation: ConversationSnapshot, generation: GenerationSnapshot, includeInspect = true): string {
+    const actions: Array<[string, string]> = [];
+    if (includeInspect) actions.push(["enter", "inspect"]);
+    if (!conversation.parentConversationId && !conversation.isStopping && (generation.status.kind === "queued" || generation.status.kind === "running")) actions.push(["c", "cancel"]);
+    if (this.isCollectAvailable(conversation)) actions.push(["g", "collect"]);
+    if (this.isResumeAvailable(conversation)) actions.push(["r", "resume"]);
+    if (this.isRemoveAvailable(conversation)) actions.push(["x", "remove"]);
+    return actions.map(([key, label]) => this.actionChip(key, label)).join("  ");
+  }
+
+  private actionChip(key: string, label: string): string {
+    return `${this.warning(this.bold(`[${key}]`))} ${this.theme.fg?.("accent", label) ?? label}`;
   }
 }
 
@@ -644,11 +720,6 @@ function wrapParagraphs(text: string, width: number): string[] {
     ...wrapTextWithAnsi(compact(paragraph), Math.max(1, width)),
   ]);
 }
-function pinBottom(content: string[], bottom: string[], height: number): string[] {
-  const available = Math.max(0, height - bottom.length);
-  const visible = content.slice(0, available);
-  return [...visible, ...Array(Math.max(0, available - visible.length)).fill(""), ...bottom];
-}
 function markdownTheme(theme: Theme): MarkdownTheme {
   const color = (name: ThemeColor) => (text: string) => theme.fg?.(name, text) ?? text;
   return { heading: color("mdHeading"), link: color("mdLink"), linkUrl: color("mdLinkUrl"), code: color("mdCode"), codeBlock: color("mdCodeBlock"), codeBlockBorder: color("mdCodeBlockBorder"), quote: color("mdQuote"), quoteBorder: color("mdQuoteBorder"), hr: color("mdHr"), listBullet: color("mdListBullet"), bold: text => theme.bold?.(text) ?? text, italic: text => theme.italic?.(text) ?? text, strikethrough: text => theme.strikethrough?.(text) ?? text, underline: text => text };
@@ -657,6 +728,15 @@ function compact(text?: string): string { return text?.replace(/\s+/g, " ").trim
 function count(values: readonly unknown[] | undefined, noun: string): string { const amount = values?.length ?? 0; return `${amount} ${noun}${amount === 1 ? "" : "s"}`; }
 function center(text: string, width: number): string { return `${" ".repeat(Math.max(0, Math.floor((width - visibleWidth(text)) / 2)))}${text}`; }
 function pad(text: string, width: number): string { const fitted = visibleWidth(text) > width ? truncateToWidth(text, width, "") : text; return `${fitted}${" ".repeat(Math.max(0, width - visibleWidth(fitted)))}`; }
+function dividedHelp(navigation: string, actions: string, width: number, border: (text: string) => string): string[] {
+  if (width < 80) return [...wrapTextWithAnsi(navigation, width), ...(actions ? wrapTextWithAnsi(actions, width) : [])];
+  const leftWidth = Math.max(30, Math.floor(width * 0.36));
+  const rightWidth = width - leftWidth - 3;
+  const left = wrapTextWithAnsi(navigation, leftWidth);
+  const right = actions ? wrapTextWithAnsi(actions, rightWidth) : [];
+  const height = Math.max(left.length, right.length);
+  return Array.from({ length: height }, (_, index) => `${pad(left[index] ?? "", leftWidth)} ${border("│")} ${pad(right[index] ?? "", rightWidth)}`);
+}
 function fitHeight(lines: string[], height: number): string[] { return [...lines.slice(0, height), ...Array(Math.max(0, height - lines.length)).fill("")]; }
 function viewportAt(lines: string[], height: number, selectedLine: number): string[] {
   if (lines.length <= height) return lines;

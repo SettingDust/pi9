@@ -1,6 +1,6 @@
 {
   "name": "@pi9/subagent",
-  "version": "0.10.4",
+  "version": "0.10.7",
   "description": "Asynchronous, resumable, and recursive subagents for Pi with stable identities and live progress.",
   "license": "MIT",
   "author": "Chase Cummings <chaseecummings@gmail.com>",
@@ -52,7 +52,8 @@
       "./src/index.ts"
     ],
     "skills": [],
-    "prompts": []
+    "prompts": [],
+    "image": "https://raw.githubusercontent.com/Chase-C/pi9/main/packages/subagent/media/conversations-overlay.png"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

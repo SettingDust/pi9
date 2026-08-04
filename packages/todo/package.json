@@ -1,6 +1,6 @@
 {
   "name": "@pi9/todo",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "description": "Phased, session-aware todo planning for Pi agents.",
   "license": "MIT",
   "author": "Chase Cummings <chaseecummings@gmail.com>",
@@ -50,7 +50,8 @@
       "./src/index.ts"
     ],
     "skills": [],
-    "prompts": []
+    "prompts": [],
+    "image": "https://raw.githubusercontent.com/Chase-C/pi9/main/packages/todo/media/todo-plan.png"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
