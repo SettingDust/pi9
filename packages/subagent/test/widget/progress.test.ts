@@ -1,8 +1,10 @@
 import { expect, test, vi } from "vitest";
 import { visibleWidth } from "@earendil-works/pi-tui";
 
+import { Conversation, completedGeneration } from "../../src/conversation.js";
+import { SubagentRuntime } from "../../src/runtime.js";
 import { createDefaultSubagentSettings } from "../../src/settings.js";
-import { formatProgressWidgetLines, updateSubagentWidget } from "../../src/widget.js";
+import { formatProgressWidgetLines, registerSubagentWidgetLifecycle, updateSubagentWidget } from "../../src/widget.js";
 import { fakeAgent } from "../helpers/fake-agent.js";
 import { renderWidgetContent } from "../helpers/render-widget.js";
 
@@ -25,6 +27,38 @@ test("progress mode renders one active line and excludes settled conversations",
 
     expect(renderWidgetContent(setWidget.mock.calls[0]![1], undefined, 120))
       .toEqual(["● Investigate · scout · running 4.0s · starting…"]);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("progress widget refreshes when a runtime conversation starts running", async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(10_000);
+  try {
+    let release!: () => void;
+    const running = new Promise<void>(resolve => { release = resolve; });
+    const registry = { agents: new Map([["worker", { name: "worker", description: "", systemPrompt: "", source: "project" }]]) } as any;
+    const runtime = new SubagentRuntime(registry, 1, async (_ctx, conversation: Conversation, generation) => {
+      conversation.bindSession(generation, { messages: [], subscribe: () => () => {}, abort() {} } as any);
+      await running;
+      return completedGeneration(conversation, generation, "done");
+    });
+    const settings = createDefaultSubagentSettings();
+    settings.widgetMode = "progress";
+    const setWidget = vi.fn();
+    const handlers = new Map<string, (event: unknown, ctx: unknown) => void>();
+    registerSubagentWidgetLifecycle({ on: (event, handler) => { handlers.set(event, handler as any); } }, runtime, () => settings);
+
+    handlers.get("session_start")?.({}, { hasUI: true, ui: { setWidget } });
+    const started = runtime.startTasks({ cwd: "/tmp", modelRegistry: { find: () => undefined } } as any, [
+      { kind: "spawn", agent: "worker", prompt: "work", label: "Work" },
+    ] as any);
+
+    await vi.waitFor(() => expect(renderWidgetContent(setWidget.mock.calls.at(-1)?.[1], undefined, 120)[0]).toContain("running"));
+    expect(renderWidgetContent(setWidget.mock.calls.at(-1)?.[1], undefined, 120)[0]).toMatch(/^● Work · worker · running \d+(?:\.\d+)?ms · starting…$/);
+    release();
+    await started.completion;
   } finally {
     vi.useRealTimers();
   }

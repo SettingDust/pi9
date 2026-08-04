@@ -1,7 +1,7 @@
 import { test, expect } from "vitest";
 import { completedGeneration, Conversation } from "../../src/conversation.js";
 import { SubagentRuntime, type SubagentCaller } from "../../src/runtime.js";
-import { cancelAction, defineSubagentTool, inspectAction, joinAction, listAction, removeAction, resumeAction, steerAction } from "../../src/tool.js";
+import { cancelAction, defineSubagentTool, inspectAction, joinAction, listAction, removeAction, resumeAction, spawnAction, steerAction } from "../../src/tool.js";
 
 const knownModel = { provider: "test", id: "known" } as any;
 const config = {
@@ -32,6 +32,25 @@ function joinLatest(runtime: SubagentRuntime, subagentId: any): void {
   binding.markJoined();
   binding.release();
 }
+
+test("spawn response reflects a started generation after the scheduler tick", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(done => { release = done; });
+  const runtime = new SubagentRuntime(registry, 1, async (_ctx, conversation, generation) => {
+    conversation.bindSession(generation, session());
+    await gate;
+    return completedGeneration(conversation, generation, "done");
+  });
+
+  const result = await spawnAction(deps(runtime), {
+    action: "spawn",
+    spawns: [{ kind: "spawn", agent: "worker", prompt: "wait", label: "visible" }],
+  }, ctx);
+
+  expect(response(result).results[0]).toMatchObject({ status: "running" });
+  release();
+  await runtime.bindSubagentJoin([response(result).results[0].subagentId]).completion;
+});
 
 test("list joined=false includes active subagents and projects joined explicitly", async () => {
   let release!: () => void;

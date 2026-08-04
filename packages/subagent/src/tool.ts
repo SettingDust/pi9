@@ -230,6 +230,7 @@ async function startTasks(
   if (validTasks.length) {
     const handle = deps.runtime.startTasks(ctx, validTasks, owner ? { caller: owner } : {});
     for (const start of handle.starts) outcomes.push({ ...start, inputIndex: validIndexes[start.inputIndex] });
+    await new Promise<void>(resolve => setImmediate(resolve));
   }
   outcomes.sort((left, right) => left.inputIndex - right.inputIndex);
 
