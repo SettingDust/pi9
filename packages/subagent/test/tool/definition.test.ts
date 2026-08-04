@@ -17,8 +17,8 @@ const toolCall = (arguments_: Record<string, any>) => ({
 const spawnBranch = (schema: any) => schema.properties.request.anyOf.find((branch: any) => branch.properties?.action?.enum?.includes("spawn"));
 const validInvocations = [
   { action: "agents" },
-  { action: "list" },
-  { action: "spawn", spawns: [{ agent: "helper", prompt: "work", label: "Worker" }] },
+  { action: "list", statuses: null, joined: null },
+  { action: "spawn", spawns: [{ agent: "helper", prompt: "work", label: "Worker", skills: null, model: null, thinking: null, cwd: null }] },
   { action: "resume", resumes: [{ subagentId: "airy-acorn", prompt: "continue" }] },
   { action: "steer", messages: [{ subagentId: "airy-acorn", message: "adjust" }] },
   { action: "cancel", subagentIds: ["airy-acorn"] },
@@ -58,15 +58,14 @@ test("SDK validation rejects a whole batch containing a malformed task", () => {
   assert.throws(() => validateToolArguments(tool, toolCall(raw)), /Validation failed/);
 });
 
-test("SDK validation enforces the task-array minimum", () => {
+test("SDK validation leaves task-array minimum enforcement to the parser", () => {
   const tool: any = defineSubagentTool({
     runtime,
     agentRegistry: registry,
     prepareInvocation: async () => settings,
   });
-  assert.throws(
+  assert.doesNotThrow(
     () => validateToolArguments(tool, toolCall({ request: { action: "spawn", spawns: [] } })),
-    /Validation failed/,
   );
 });
 
@@ -80,7 +79,23 @@ test("definition can expose discovered agents and available models", () => {
   });
   const spawn = spawnBranch(tool.parameters).properties.spawns.items;
   assert.deepEqual(spawn.properties.agent.enum, ["handler", "reviewer"]);
-  assert.deepEqual(spawn.properties.model.enum, ["provider/alpha"]);
+  assert.deepEqual(spawn.properties.model.anyOf.find((branch: any) => branch.enum)?.enum, ["provider/alpha"]);
+});
+
+test("execution normalizes nullable provider fields before parsing", async () => {
+  const tool: any = defineSubagentTool({ runtime, agentRegistry: registry, prepareInvocation: async () => settings });
+  const listed = await tool.execute("list", {
+    request: { action: "list", statuses: null, joined: null },
+  }, undefined, undefined, {});
+  assert.deepEqual(listed.details.response, { action: "list", results: [] });
+
+  const spawned = await tool.execute("spawn", {
+    request: {
+      action: "spawn",
+      spawns: [{ agent: "missing", prompt: "work", label: "Worker", skills: null, model: null, thinking: null, cwd: null }],
+    },
+  }, undefined, undefined, { cwd: "/tmp", modelRegistry: { find: () => undefined } });
+  assert.match(spawned.details.response.results[0].error, /Unknown agent/);
 });
 
 test("published schema rejects fields from another action", () => {

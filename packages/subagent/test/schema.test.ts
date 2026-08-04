@@ -51,15 +51,32 @@ describe("parseSubagentInvocation", () => {
     assert.ok(requestSchema(schema).anyOf.every((branch: any) => branch.additionalProperties === false));
   });
 
+  it("uses required nullable properties for strict provider schemas", () => {
+    const schema: any = createSubagentParamsSchema();
+    const visit = (node: any): void => {
+      if (node?.type === "object") {
+        assert.deepEqual(node.required, Object.keys(node.properties ?? {}));
+        for (const property of Object.values(node.properties ?? {})) visit(property);
+      }
+      for (const branch of node?.anyOf ?? []) visit(branch);
+      if (node?.items) visit(node.items);
+    };
+    visit(schema);
+    const list = requestSchema(schema).anyOf.find((branch: any) => branch.properties.action.enum.includes("list"));
+    assert.equal(list.properties.joined.anyOf.some((branch: any) => branch.type === "null"), true);
+    assert.equal(list.properties.statuses.anyOf.some((branch: any) => branch.type === "null"), true);
+    assert.equal("minItems" in list.properties.statuses.anyOf.find((branch: any) => branch.type === "array"), false);
+  });
+
   it("exposes dynamic agent and model enums for spawn", () => {
     const schema: any = createSubagentParamsSchema({ agentNames: ["handler", "reviewer"], modelIds: ["provider/alpha", "provider/beta"] });
     const spawn = spawnBranch(schema).properties.spawns.items;
     assert.deepEqual(spawn.properties.agent.enum, ["handler", "reviewer"]);
-    assert.deepEqual(spawn.properties.model.enum, ["provider/alpha", "provider/beta"]);
+    assert.deepEqual(spawn.properties.model.anyOf.find((branch: any) => branch.enum)?.enum, ["provider/alpha", "provider/beta"]);
 
     const fallback: any = createSubagentParamsSchema();
     assert.equal(spawnBranch(fallback).properties.spawns.items.properties.agent.type, "string");
-    assert.equal(spawnBranch(fallback).properties.spawns.items.properties.model.type, "string");
+    assert.equal(spawnBranch(fallback).properties.spawns.items.properties.model.anyOf.find((branch: any) => branch.type === "string").type, "string");
   });
 
   for (const action of ["join", "cancel"] as const) {

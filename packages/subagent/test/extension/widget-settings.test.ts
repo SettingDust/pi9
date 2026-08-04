@@ -105,8 +105,8 @@ test("session start refreshes agent and model schema", async () => {
   expect(tools).toHaveLength(2);
   const initialSpawn = spawnBranch(tools[0].parameters).properties.spawns.items;
   const refreshedSpawn = spawnBranch(tools[1].parameters).properties.spawns.items;
-  expect(initialSpawn.properties.model.type).toBe("string");
-  expect(refreshedSpawn.properties.model.enum).toEqual(["scope/alpha"]);
+  expect(initialSpawn.properties.model.anyOf.find((branch: any) => branch.type === "string").type).toBe("string");
+  expect(refreshedSpawn.properties.model.anyOf.find((branch: any) => branch.enum)?.enum).toEqual(["scope/alpha"]);
   expect(refreshedSpawn.properties.agent.enum).toEqual(["handler"]);
   expect(availableModelIds({ scopedModels: [], modelRegistry: { getAvailable: () => available } })).toEqual(["all/fallback"]);
 });

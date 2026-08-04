@@ -1,5 +1,5 @@
 import { StringEnum } from "@earendil-works/pi-ai";
-import { Type, type Static } from "typebox";
+import { Type, type Static, type TSchema } from "typebox";
 import { isModelThinkingLevel, MODEL_THINKING_LEVELS } from "./agents.js";
 import { isSubagentId, type SubagentId } from "./identifiers.js";
 
@@ -38,9 +38,19 @@ export const SteerMessageSchema = Type.Object({
 
 export function createSubagentParamsSchema(options: DynamicSpawnSchemaOptions = {}) {
   const action = <T extends SubagentAction>(value: T) => StringEnum([value]);
+  const nullable = <T extends TSchema>(schema: T) => Type.Union([schema, Type.Null()]);
+  const providerSpawnTask = Type.Object({
+    agent: options.agentNames?.length ? StringEnum(options.agentNames) : Type.String({ description: "Agent definition name." }),
+    prompt: Type.String(),
+    label: Type.String({ description: "3-5 words describing what, not how." }),
+    skills: nullable(Type.Array(Type.String())),
+    model: nullable(options.modelIds?.length ? StringEnum(options.modelIds) : Type.String()),
+    thinking: nullable(StringEnum(MODEL_THINKING_LEVELS)),
+    cwd: nullable(Type.String()),
+  }, { additionalProperties: false });
   const targets = (value: "cancel" | "inspect" | "join" | "remove") => Type.Object({
     action: action(value),
-    subagentIds: Type.Array(Type.String(), { minItems: 1 }),
+    subagentIds: Type.Array(Type.String()),
   }, { additionalProperties: false });
 
   return Type.Object({
@@ -48,20 +58,20 @@ export function createSubagentParamsSchema(options: DynamicSpawnSchemaOptions = 
       Type.Object({ action: action("agents") }, { additionalProperties: false }),
       Type.Object({
         action: action("list"),
-        statuses: Type.Optional(Type.Array(StringEnum(SUBAGENT_STATUSES), { minItems: 1 })),
-        joined: Type.Optional(Type.Boolean()),
+        statuses: nullable(Type.Array(StringEnum(SUBAGENT_STATUSES))),
+        joined: nullable(Type.Boolean()),
       }, { additionalProperties: false }),
       Type.Object({
         action: action("spawn"),
-        spawns: Type.Array(createSpawnTaskSchema(options), { minItems: 1 }),
+        spawns: Type.Array(providerSpawnTask),
       }, { additionalProperties: false }),
       Type.Object({
         action: action("resume"),
-        resumes: Type.Array(ResumeTaskSchema, { minItems: 1 }),
+        resumes: Type.Array(ResumeTaskSchema),
       }, { additionalProperties: false }),
       Type.Object({
         action: action("steer"),
-        messages: Type.Array(SteerMessageSchema, { minItems: 1 }),
+        messages: Type.Array(SteerMessageSchema),
       }, { additionalProperties: false }),
       targets("cancel"),
       targets("inspect"),

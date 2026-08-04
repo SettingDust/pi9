@@ -211,6 +211,23 @@ export async function resumeAction(
   return startTasks(deps, "resume", invocation.resumes, ctx);
 }
 
+function normalizeProviderRequest(raw: unknown): unknown {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return raw;
+  const request = raw as Record<string, unknown>;
+  if (request.action === "list") {
+    return Object.fromEntries(Object.entries(request).filter(([, value]) => value !== null));
+  }
+  if (request.action === "spawn" && Array.isArray(request.spawns)) {
+    return {
+      ...request,
+      spawns: request.spawns.map(task => task && typeof task === "object" && !Array.isArray(task)
+        ? Object.fromEntries(Object.entries(task).filter(([, value]) => value !== null))
+        : task),
+    };
+  }
+  return raw;
+}
+
 async function startTasks(
   deps: ActionDeps,
   action: "spawn" | "resume",
@@ -755,7 +772,7 @@ export function defineSubagentTool(deps: SubagentToolDeps) {
         ? { ...actionDeps, caller: { conversation: parent, generation: parent.requireCurrentGeneration() } }
         : actionDeps;
       const settings = await prepareInvocation(ctx);
-      const invocation = parseSubagentInvocation(params.request, { maxTasks: settings.runtime.maxTasksPerCall });
+      const invocation = parseSubagentInvocation(normalizeProviderRequest(params.request), { maxTasks: settings.runtime.maxTasksPerCall });
       if ("error" in invocation) return invocationErrorResult(invocationDeps, invocation);
 
       switch (invocation.action) {
