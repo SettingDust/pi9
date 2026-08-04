@@ -1,5 +1,6 @@
+import { statSync } from "node:fs";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { AgentRegistry, resolveRequestedConfig } from "./agents.js";
+import { AgentRegistry, isModelThinkingLevel, resolveRequestedConfig, type AgentDefinition, type ExecutionOverrides, type RequestedExecutionConfig } from "./agents.js";
 import {
   Conversation,
   GenerationSteerError,
@@ -10,14 +11,18 @@ import {
   type ConversationUpdateListener,
   type Generation,
   type GenerationBinding,
+  type GenerationKind,
   type GenerationRef,
   type GenerationSnapshot,
   type GenerationViewStatus,
   type NestedJoinTargetSnapshot,
+  type RestoredTerminalConversation,
+  type RestoredTerminalGeneration,
   type SteerReceipt,
 } from "./conversation.js";
 import { resolveModel, resolveRequestedSkills, resolveTaskCwd } from "./execute.js";
-import { ConversationIdAllocator, type ConversationId, type SubagentId } from "./identifiers.js";
+import { ConversationIdAllocator, isConversationId, type ConversationId, type SubagentId } from "./identifiers.js";
+import { readPaneCompletionOutput } from "./pane-execution.js";
 import { GenerationScheduler, type GenerationExecutor } from "./scheduler.js";
 import { projectLiveSubagent, projectSubagentGenerationStatus, projectSubagentStatus, type CanonicalLiveSubagent, type FailureProjectionMode } from "./contract.js";
 import type { SubagentStatus, SpawnRequest, ResumeRequest } from "./schema.js";
@@ -70,6 +75,48 @@ const DEFAULT_OPEN_CONVERSATION_PANE_DEPENDENCIES: OpenConversationPaneDependenc
   getPiInvocation: () => { throw new Error("Pane reopening is not configured."); },
 };
 
+export interface TerminalRecoveryV4Record {
+  readonly version: 4;
+  readonly subagentId: string;
+  readonly generation: number;
+  readonly agent: string;
+  readonly label?: string;
+  readonly kind: GenerationKind;
+  readonly status: "completed" | "error" | "aborted" | "interrupted" | "skipped";
+  readonly completedAt: number;
+  readonly startedAt?: number;
+  readonly elapsedMs?: number;
+}
+
+export interface TerminalRecoveryV5Record {
+  readonly version: 5;
+  readonly subagentId: string;
+  readonly generation: number;
+  readonly agent: string;
+  readonly label: string;
+  readonly kind: GenerationKind;
+  readonly status: "completed" | "error" | "aborted" | "interrupted" | "skipped";
+  readonly conversationCreatedAt: number;
+  readonly createdAt: number;
+  readonly completedAt: number;
+  readonly startedAt?: number;
+  readonly elapsedMs?: number;
+  readonly prompt: string;
+  readonly parentConversationId?: string;
+  readonly startedInParentGeneration?: number;
+  readonly requestedConfig: RequestedExecutionConfig;
+  readonly requestedOverrides?: ExecutionOverrides;
+  readonly retainedSessionFile?: string;
+  readonly joined: boolean;
+}
+
+export type TerminalRecoveryRecord = TerminalRecoveryV4Record | TerminalRecoveryV5Record;
+
+interface RecoveryGroup {
+  readonly id: ConversationId;
+  readonly records: readonly TerminalRecoveryRecord[];
+}
+
 /** Owns retained conversations. Generations are addressed internally by their object identity. */
 export class SubagentRuntime {
   private readonly conversations = new Map<ConversationId, Conversation>();
@@ -78,6 +125,7 @@ export class SubagentRuntime {
   private updateDeferralDepth = 0;
   private readonly conversationIds = new ConversationIdAllocator();
   private readonly executionScheduler: GenerationScheduler;
+  private readonly hydratedTerminalOutputs = new Set<string>();
 
   constructor(
     readonly registry: AgentRegistry,
@@ -137,6 +185,100 @@ export class SubagentRuntime {
     }, failureMode);
   }
 
+  restoreTerminalConversations(records: readonly TerminalRecoveryRecord[]): number {
+    const groups = new Map<string, TerminalRecoveryRecord[]>();
+    for (const record of records) {
+      if (!isRecoveryRecord(record)) continue;
+      const group = groups.get(record.subagentId) ?? [];
+      group.push(record);
+      groups.set(record.subagentId, group);
+    }
+
+    let restored = 0;
+    const orderedGroups: RecoveryGroup[] = [];
+    for (const [rawId, group] of groups) {
+      if (!isConversationId(rawId) || this.conversations.has(rawId)) continue;
+      const sorted = [...group].sort((left, right) => left.generation - right.generation);
+      if (sorted.some((record, index) => index > 0 && record.generation === sorted[index - 1].generation)) continue;
+      orderedGroups.push({ id: rawId, records: sorted });
+    }
+    orderedGroups.sort((left, right) => left.id.localeCompare(right.id));
+
+    let pending = orderedGroups;
+    while (pending.length > 0 && this.conversations.size < this.maxConversations) {
+      const deferred: RecoveryGroup[] = [];
+      let progressed = false;
+      for (const group of pending) {
+        if (this.conversations.size >= this.maxConversations) break;
+        const first = group.records[0];
+        if (!first || first.generation !== 1 || !this.registry.agents.has(first.agent)) continue;
+        if (group.records.some((record, index) => record.generation !== index + 1 || record.kind !== (index === 0 ? "spawn" : "resume") || record.agent !== first.agent)) continue;
+        const definition = this.registry.agents.get(first.agent);
+        if (!definition) continue;
+        const input = this.toRestoredConversation(group.id, definition, group.records);
+        if (!input) continue;
+        if (input.parentConversationId && !this.conversations.has(input.parentConversationId)) {
+          deferred.push(group);
+          continue;
+        }
+        try {
+          const conversation = Conversation.restoreTerminal(input, (changed, kind) => this.updated(changed, kind));
+          if (!this.conversationIds.claim(group.id)) continue;
+          this.conversations.set(group.id, conversation);
+          restored++;
+          progressed = true;
+        } catch {
+          // Malformed historical data remains skipped without mutating runtime state.
+        }
+      }
+      if (!progressed) break;
+      pending = deferred;
+    }
+    return restored;
+  }
+
+  private toRestoredConversation(id: ConversationId, definition: AgentDefinition, records: readonly TerminalRecoveryRecord[]): RestoredTerminalConversation | undefined {
+    const first = records[0];
+    if (!first) return;
+    let metadata: TerminalRecoveryV5Record | undefined;
+    for (let index = records.length - 1; index >= 0; index--) {
+      const record = records[index];
+      if (record.version === 5) { metadata = record; break; }
+    }
+    const parentConversationId = metadata?.parentConversationId !== undefined
+      ? isConversationId(metadata.parentConversationId) ? metadata.parentConversationId : undefined
+      : undefined;
+    if (metadata?.parentConversationId !== undefined && !parentConversationId) return;
+    const generations: RestoredTerminalGeneration[] = records.map(record => {
+      const v5Record = record.version === 5;
+      return {
+        generation: record.generation,
+        kind: record.kind,
+        ...(v5Record && record.startedInParentGeneration !== undefined ? { startedInParentGeneration: record.startedInParentGeneration } : {}),
+        prompt: v5Record ? record.prompt : "",
+        createdAt: v5Record ? record.createdAt : record.completedAt,
+        status: {
+          kind: "done",
+          outcome: record.status,
+          ...(record.startedAt !== undefined ? { startedAt: record.startedAt } : {}),
+          completedAt: record.completedAt,
+        },
+        joined: v5Record ? record.joined : false,
+      };
+    });
+    return {
+      conversationId: id,
+      definition,
+      label: metadata?.label ?? first.label ?? first.agent,
+      createdAt: metadata?.conversationCreatedAt ?? first.completedAt,
+      ...(parentConversationId ? { parentConversationId } : {}),
+      requestedConfig: metadata?.requestedConfig ?? {},
+      ...(metadata?.requestedOverrides ? { requestedOverrides: metadata.requestedOverrides } : {}),
+      ...(metadata?.retainedSessionFile ? { retainedSessionFile: metadata.retainedSessionFile } : {}),
+      generations,
+    };
+  }
+
   /** Resolves and reserves the complete batch synchronously; executions never inherit caller cancellation. */
   startTasks(ctx: ExtensionContext, tasks: readonly (SpawnRequest | ResumeRequest)[], options: { caller?: SubagentCaller } = {}): GenerationHandle {
     const starts: OrderedStartOutcome[] = [];
@@ -192,6 +334,8 @@ export class SubagentRuntime {
       return { error: `Subagent ${conversation.conversationId} cannot be resumed.` };
     }
     if (!conversation.isResumeAllowed) return { error: this.resumeError(conversation) };
+    const sessionFile = conversation.sessionFileForResume();
+    if (sessionFile && !isRetainedSessionFile(sessionFile)) return { error: `Subagent ${conversation.conversationId} retained session file is missing.` };
     return { conversation, generation: conversation.beginResume(task.prompt, caller?.generation.number) };
   }
 
@@ -283,6 +427,7 @@ export class SubagentRuntime {
     if (conversation.hasActiveExecution || conversation.isStopping) throw new Error(`Subagent ${conversationId} is active and cannot be reopened.`);
     const sessionFile = conversation.sessionFileForResume();
     if (!conversation.isPaneOpenable || !sessionFile) throw new Error(`Subagent ${conversationId} does not have a retained pane session.`);
+    if (!isRetainedSessionFile(sessionFile)) throw new Error(`Subagent ${conversationId} retained pane session file is missing.`);
     const retained = conversation.retainedPaneSurface();
     if (retained) {
       const exists = await this.openPaneDependencies.retainedPaneExists(retained);
@@ -329,6 +474,7 @@ export class SubagentRuntime {
   }
 
   private bindRecords(records: readonly GenerationRecord[]): JoinBinding {
+    this.hydrateBoundTerminalOutputs(records);
     const attached: BoundRecord[] = [];
     try { for (const record of records) attached.push({ conversationId: record.conversation.conversationId, binding: record.conversation.bindGeneration(record.generation) }); }
     catch (error) { for (const item of attached) item.binding.release(); throw error; }
@@ -345,6 +491,18 @@ export class SubagentRuntime {
       markJoined: () => { for (const item of attached) if (item.binding.snapshot().status.kind === "done") item.binding.markJoined(); },
       release: () => { if (released) return; released = true; unsubscribe(); for (const item of attached) item.binding.release(); },
     };
+  }
+  private hydrateBoundTerminalOutputs(records: readonly GenerationRecord[]): void {
+    for (const { conversation, generation } of records) {
+      if (generation.state.kind !== "done" || generation.state.output !== undefined) continue;
+      const sessionFile = conversation.sessionFileForResume();
+      if (!sessionFile) continue;
+      const key = generationKey({ conversationId: conversation.conversationId, generation: generation.number });
+      if (this.hydratedTerminalOutputs.has(key)) continue;
+      this.hydratedTerminalOutputs.add(key);
+      const output = readPaneCompletionOutput(sessionFile);
+      if (output !== undefined) conversation.hydrateTerminalOutput(generation, output);
+    }
   }
   private updateNestedJoin(caller: SubagentCaller, index: number, update: { targets?: readonly NestedJoinTargetSnapshot[]; state?: "running" | "completed" | "failed" | "interrupted"; error?: string }): void {
     if (!this.isCurrentCaller(caller)) return;
@@ -520,6 +678,48 @@ export class SubagentRuntime {
     for (const listener of this.listeners) listener(conversation, kind);
   }
 }
+
+function isRetainedSessionFile(file: string): boolean {
+  try { return statSync(file).isFile(); } catch { return false; }
+}
+
+function isRecoveryRecord(value: unknown): value is TerminalRecoveryRecord {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Record<string, unknown>;
+  if ((record.version !== 4 && record.version !== 5) || typeof record.subagentId !== "string" || !isConversationId(record.subagentId)
+    || !Number.isSafeInteger(record.generation) || (record.generation as number) < 1 || typeof record.agent !== "string" || !record.agent
+    || (record.kind !== "spawn" && record.kind !== "resume") || !isTerminalRecoveryStatus(record.status)
+    || !isTimestamp(record.completedAt)) return false;
+  if (record.startedAt !== undefined && !isTimestamp(record.startedAt)) return false;
+  if (record.elapsedMs !== undefined && !isTimestamp(record.elapsedMs)) return false;
+  if (record.version === 4) return record.label === undefined || typeof record.label === "string";
+  return typeof record.label === "string" && isTimestamp(record.conversationCreatedAt) && isTimestamp(record.createdAt)
+    && typeof record.prompt === "string" && isRequestedConfig(record.requestedConfig) && typeof record.joined === "boolean"
+    && (record.parentConversationId === undefined || isConversationId(record.parentConversationId))
+    && (record.startedInParentGeneration === undefined || (Number.isSafeInteger(record.startedInParentGeneration) && (record.startedInParentGeneration as number) >= 1))
+    && (record.requestedOverrides === undefined || isExecutionOverrides(record.requestedOverrides))
+    && (record.retainedSessionFile === undefined || (typeof record.retainedSessionFile === "string" && record.retainedSessionFile.length > 0));
+}
+
+function isTerminalRecoveryStatus(value: unknown): value is TerminalRecoveryRecord["status"] {
+  return value === "completed" || value === "error" || value === "aborted" || value === "interrupted" || value === "skipped";
+}
+function isTimestamp(value: unknown): value is number { return typeof value === "number" && Number.isFinite(value) && value >= 0; }
+function isObject(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null; }
+function isRequestedConfig(value: unknown): value is RequestedExecutionConfig {
+  if (!isObject(value) || Object.keys(value).some(key => !["model", "thinking", "skills", "tools", "cwd"].includes(key))) return false;
+  return (value.model === undefined || typeof value.model === "string")
+    && (value.thinking === undefined || isModelThinkingLevel(value.thinking))
+    && (value.cwd === undefined || typeof value.cwd === "string")
+    && (value.skills === undefined || isStringArray(value.skills))
+    && (value.tools === undefined || isStringArray(value.tools));
+}
+function isExecutionOverrides(value: unknown): value is ExecutionOverrides {
+  return isObject(value) && Object.keys(value).every(key => key === "model" || key === "thinking")
+    && (value.model === undefined || typeof value.model === "string")
+    && (value.thinking === undefined || isModelThinkingLevel(value.thinking));
+}
+function isStringArray(value: unknown): value is string[] { return Array.isArray(value) && value.every(item => typeof item === "string"); }
 
 function generationRef(record: GenerationRecord): GenerationRef { return { conversationId: record.conversation.conversationId, generation: record.generation.number }; }
 function callerRef(caller: SubagentCaller): GenerationRef { return { conversationId: caller.conversation.conversationId, generation: caller.generation.number }; }

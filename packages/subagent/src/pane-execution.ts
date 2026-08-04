@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -79,6 +79,22 @@ type PaneCompletion =
   | { type: "structured_output"; value: unknown }
   | { type: "ping"; name: string; message: string }
   | { type: "failed"; exitCode: number };
+
+/** Returns the lazy-join output recorded by a terminal child pane, if valid. */
+export function readPaneCompletionOutput(sessionFile: string): string | undefined {
+  try {
+    const completion: unknown = JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8"));
+    if (!completion || typeof completion !== "object" || Array.isArray(completion)) return undefined;
+    const value = completion as Record<string, unknown>;
+    switch (value.type) {
+      case "structured_output": return Object.hasOwn(value, "value") ? formatStructuredOutput(value.value) : undefined;
+      case "ping": return typeof value.name === "string" && typeof value.message === "string" ? value.message : undefined;
+      case "done": return "";
+      case "failed": return typeof value.exitCode === "number" ? undefined : undefined;
+      default: return undefined;
+    }
+  } catch { return undefined; }
+}
 
 export type PaneCompletionOutcome =
   | { status: "completed"; completion: PaneCompletion }
@@ -427,10 +443,13 @@ async function loadMux(): Promise<TerminalMux> {
   const packageName = "pi-terminal-mux";
   return await import(packageName) as TerminalMux;
 }
-function childSessionFile(ctx: ExtensionContext, conversationId: string, generation: number): string {
+export function childSessionFile(ctx: ExtensionContext, conversationId: string, generation: number): string {
   const parent = ctx.sessionManager?.getSessionFile?.();
   const base = parent ? parent.replace(/\.jsonl$/i, "") : path.join(ctx.cwd, ".pi", "subagent-sessions");
   return path.join(base, "tasks", `${conversationId}-g${generation}.jsonl`);
+}
+export function retainedChildSessionFile(parentSessionFile: string, conversationId: string, generation: number): string {
+  return path.join(parentSessionFile.replace(/\.jsonl$/i, ""), "tasks", `${conversationId}-g${generation}.jsonl`);
 }
 function formatStructuredOutput(value: unknown): string { return typeof value === "string" ? value : JSON.stringify(value) ?? String(value); }
 function sanitizeDisplayName(value: string | undefined): string { return value?.replace(/[\u0000-\u001f\u007f-\u009f]/g, "").trim().slice(0, 48) || "subagent"; }

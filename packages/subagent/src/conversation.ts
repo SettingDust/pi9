@@ -126,9 +126,50 @@ export type GenerationState =
   | { readonly kind: "running"; readonly session?: AgentSession; readonly control?: GenerationControl; readonly startedAt: number }
   | { readonly kind: "done"; readonly outcome: GenerationOutcomeStatus; readonly startedAt?: number; readonly completedAt: number; readonly output?: string; readonly error?: string };
 
+type DoneGenerationStatus = Extract<GenerationViewStatus, { readonly kind: "done" }>;
+
+export interface RestoredTerminalGeneration {
+  readonly generation: number;
+  readonly kind: GenerationKind;
+  readonly startedInParentGeneration?: number;
+  readonly prompt: string;
+  readonly createdAt: number;
+  readonly status: DoneGenerationStatus;
+  readonly joined: boolean;
+}
+
+export interface RestoredTerminalConversation {
+  readonly conversationId: ConversationId;
+  readonly definition: AgentDefinition;
+  readonly label: string;
+  readonly createdAt: number;
+  readonly parentConversationId?: ConversationId;
+  readonly requestedConfig: RequestedExecutionConfig;
+  readonly requestedOverrides?: ExecutionOverrides;
+  readonly retainedSessionFile?: string;
+  readonly generations: readonly RestoredTerminalGeneration[];
+}
+
+interface GenerationConstructionOptions {
+  readonly createdAt?: number;
+  readonly status?: DoneGenerationStatus;
+  readonly joined?: boolean;
+}
+
+interface ConversationConstructionOptions {
+  readonly parentConversationId?: ConversationId;
+  readonly startedInParentGeneration?: number;
+  readonly resolvedSkillBlocks?: readonly string[];
+  readonly createdAt?: number;
+  readonly requestedConfig?: RequestedExecutionConfig;
+  readonly requestedOverrides?: ExecutionOverrides;
+  readonly retainedSessionFile?: string;
+  readonly restoredGenerations?: readonly RestoredTerminalGeneration[];
+}
+
 /** One append-only execution generation within a conversation. Object identity is its exact internal key. */
 export class Generation {
-  readonly createdAt = Date.now();
+  readonly createdAt: number;
   readonly activity: GenerationActivity;
   state: GenerationState = { kind: "queued" };
   observerCount = 0;
@@ -142,12 +183,16 @@ export class Generation {
     readonly prompt: string,
     private readonly onChange: GenerationActivityListener,
     readonly startedInParentGeneration?: number,
+    options: GenerationConstructionOptions = {},
   ) {
+    this.createdAt = options.createdAt ?? Date.now();
     if (!Number.isSafeInteger(number) || number < 1) throw new Error(`Invalid generation number: ${number}.`);
     if (startedInParentGeneration !== undefined && (!Number.isSafeInteger(startedInParentGeneration) || startedInParentGeneration < 1)) {
       throw new Error(`Invalid parent generation number: ${startedInParentGeneration}.`);
     }
     this.activity = new GenerationActivity(onChange, event => this.handleSessionEvent(event));
+    if (options.status) this.state = Object.freeze({ ...options.status });
+    if (options.joined !== undefined) this.joined = options.joined;
   }
 
   get kind(): GenerationKind { return this.number === 1 ? "spawn" : "resume"; }
@@ -248,7 +293,7 @@ export interface GenerationBinding { readonly generation: Generation; snapshot()
 
 /** One persistent conversation containing append-only, one-based generations. */
 export class Conversation {
-  readonly createdAt = Date.now();
+  readonly createdAt: number;
   readonly agentName: string;
   readonly parentConversationId?: ConversationId;
   readonly resolvedSkillBlocks?: readonly string[];
@@ -270,18 +315,40 @@ export class Conversation {
     readonly definition: AgentDefinition,
     spawn: SpawnRequest,
     readonly listener: ConversationUpdateListener,
-    options: { parentConversationId?: ConversationId; startedInParentGeneration?: number; resolvedSkillBlocks?: readonly string[] } = {},
+    options: ConversationConstructionOptions = {},
   ) {
+    this.createdAt = options.createdAt ?? Date.now();
     this.agentName = spawn.agent;
     this.label = spawn.label;
     this.parentConversationId = options.parentConversationId;
     this.resolvedSkillBlocks = options.resolvedSkillBlocks;
-    this.requestedConfig = resolveRequestedConfig(definition, spawn);
-    if (spawn.model !== undefined || spawn.thinking !== undefined) this.requestedOverrides = Object.freeze({
+    this.requestedConfig = options.requestedConfig ?? resolveRequestedConfig(definition, spawn);
+    if (options.requestedOverrides) this.requestedOverrides = options.requestedOverrides;
+    else if (spawn.model !== undefined || spawn.thinking !== undefined) this.requestedOverrides = Object.freeze({
       ...(spawn.model !== undefined ? { model: spawn.model } : {}),
       ...(spawn.thinking !== undefined ? { thinking: spawn.thinking } : {}),
     });
-    this.generations.push(this.newGeneration(1, spawn.prompt, options.startedInParentGeneration));
+    if (options.retainedSessionFile) this.retainedSessionFile = options.retainedSessionFile;
+    if (options.restoredGenerations) this.generations.push(...this.restoreGenerations(options.restoredGenerations));
+    else this.generations.push(this.newGeneration(1, spawn.prompt, options.startedInParentGeneration));
+  }
+
+  static restoreTerminal(input: RestoredTerminalConversation, listener: ConversationUpdateListener): Conversation {
+    const firstGeneration = input.generations[0];
+    if (!firstGeneration) throw new Error(`Cannot restore conversation ${input.conversationId} without generations.`);
+    return new Conversation(input.conversationId, input.definition, {
+      kind: "spawn",
+      agent: input.definition.name,
+      prompt: firstGeneration.prompt,
+      label: input.label,
+    }, listener, {
+      createdAt: input.createdAt,
+      parentConversationId: input.parentConversationId,
+      requestedConfig: input.requestedConfig,
+      requestedOverrides: input.requestedOverrides,
+      retainedSessionFile: input.retainedSessionFile,
+      restoredGenerations: input.generations,
+    });
   }
 
   get spawnedInGeneration(): number | undefined { return this.generations[0]?.startedInParentGeneration; }
@@ -301,8 +368,24 @@ export class Conversation {
   }
   get isStopping(): boolean { return this.stopping !== undefined; }
 
-  private newGeneration(number: number, prompt: string, startedInParentGeneration?: number): Generation {
-    return new Generation(number, prompt, update => this.listener(this, update), startedInParentGeneration);
+  private newGeneration(number: number, prompt: string, startedInParentGeneration?: number, options?: GenerationConstructionOptions): Generation {
+    return new Generation(number, prompt, update => this.listener(this, update), startedInParentGeneration, options);
+  }
+
+  private restoreGenerations(restored: readonly RestoredTerminalGeneration[]): Generation[] {
+    if (!restored.length) throw new Error(`Cannot restore conversation ${this.conversationId} without generations.`);
+    return restored.map((generation, index) => {
+      const expectedNumber = index + 1;
+      const expectedKind: GenerationKind = expectedNumber === 1 ? "spawn" : "resume";
+      if (generation.generation !== expectedNumber) throw new Error(`Restored generation ${generation.generation} is out of order.`);
+      if (generation.kind !== expectedKind) throw new Error(`Restored generation ${generation.generation} must be ${expectedKind}.`);
+      if (generation.status.kind !== "done") throw new Error(`Restored generation ${generation.generation} is not terminal.`);
+      return this.newGeneration(generation.generation, generation.prompt, generation.startedInParentGeneration, {
+        createdAt: generation.createdAt,
+        status: generation.status,
+        joined: generation.joined,
+      });
+    });
   }
 
   beginResume(prompt: string, startedInParentGeneration?: number): Generation {
@@ -457,6 +540,16 @@ export class Conversation {
   setEffectiveConfig(config: EffectiveExecutionConfig): void { this.effectiveConfig = config; }
 
   generationSnapshot(generation: Generation): GenerationSnapshot { this.requireGeneration(generation); return this.project(generation); }
+
+  /** Adds recovered output without changing a terminal generation's lifecycle state. */
+  hydrateTerminalOutput(generation: Generation, output: string): boolean {
+    this.requireGeneration(generation);
+    const state = generation.state;
+    if (state.kind !== "done" || state.output !== undefined) return false;
+    generation.state = Object.freeze({ ...state, output });
+    this.listener(this, "message");
+    return true;
+  }
 
   snapshot(): ConversationSnapshot {
     const generations = this.generationHistory;

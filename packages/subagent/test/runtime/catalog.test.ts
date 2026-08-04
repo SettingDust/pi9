@@ -1,4 +1,4 @@
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -236,6 +236,7 @@ test("removal disposes retained conversation resources", async () => {
 });
 test("completed pane conversations open a read-only viewer from the retained session", async () => {
   const tmp = await mkdtemp(path.join(tmpdir(), "subagent-open-"));
+  await writeFile(path.join(tmp, "child.jsonl"), "");
   const paneExecutor = async (_ctx: any, conversation: any, generation: any) => {
     conversation.retainSessionFile(path.join(tmp, "child.jsonl"));
     return completedGeneration(conversation, generation, generation.prompt);
@@ -259,6 +260,7 @@ test("completed pane conversations open a read-only viewer from the retained ses
 });
 test("read-only viewer reopens safely when pane liveness is unavailable", async () => {
   const tmp = await mkdtemp(path.join(tmpdir(), "subagent-viewer-"));
+  await writeFile(path.join(tmp, "child.jsonl"), "");
   const closed: string[] = [];
   let viewer = 0;
   const manager = new SubagentRuntime(registry, 1, async (_ctx, conversation, generation) => {

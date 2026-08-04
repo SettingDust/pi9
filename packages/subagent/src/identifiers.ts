@@ -31,6 +31,12 @@ export class IdAllocatorBase<T extends string> {
     private readonly randomIndex: RandomIndex = randomInt,
   ) {}
 
+  protected reserve(value: string): boolean {
+    if (this.allocated.has(value)) return false;
+    this.allocated.add(value);
+    return true;
+  }
+
   allocate(): T | undefined {
     for (let attempt = 0; attempt < RANDOM_RETRIES; attempt++) {
       const candidate = this.randomCandidate();
@@ -57,4 +63,5 @@ export class IdAllocatorBase<T extends string> {
 /** Allocates unique conversation IDs for one owning runtime lifetime. */
 export class ConversationIdAllocator extends IdAllocatorBase<ConversationId> {
   constructor(randomIndex?: RandomIndex) { super(CONVERSATION_ID_ADJECTIVES, CONVERSATION_ID_NOUNS, randomIndex); }
+  claim(value: string): value is ConversationId { return isConversationId(value) && this.reserve(value); }
 }
