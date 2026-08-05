@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "vitest";
 import { CompletionNotifier } from "../../src/notifications.js";
 
-function fixture(mode: "auto" | "steer" | "none" = "auto", idle = true, send?: (message: any, options: any) => void | Promise<void>) {
+function fixture(mode: "auto" | "steer" | "none" = "auto", idle = true, send?: (message: any, options: any) => void | Promise<void>, entries: any[] = [], append?: (customType: string, data?: unknown) => void) {
   let listener: any;
   const handlers = new Map<string, any>();
   const sent: any[] = [];
@@ -38,9 +38,10 @@ function fixture(mode: "auto" | "steer" | "none" = "auto", idle = true, send?: (
   const pi: any = {
     on(event: string, fn: any) { handlers.set(event, fn); },
     sendMessage(message: any, options: any) { sent.push({ message, options }); return send?.(message, options); },
+    appendEntry(customType: string, data?: unknown) { append?.(customType, data); entries.push({ type: "custom", customType, data }); },
   };
   const notifier = new CompletionNotifier({ pi, manager, getMode: () => mode, scheduleRetry: (fn, delay) => { const item = { fn, delay, cancelled: false }; scheduled.push(item); return () => { item.cancelled = true; }; } });
-  return { generation, conversations, sent, notified, scheduled, notifier, flush(maxDelay = 0) { for (;;) { const index = scheduled.findIndex(item => item.delay <= maxDelay); if (index < 0) break; const item = scheduled.splice(index, 1)[0]; if (!item.cancelled) item.fn(); } }, fire(event: string, value: unknown = {}) { handlers.get(event)?.(value, { isIdle: () => idle, hasUI: true, ui: { notify: (message: string, level: string) => notified.push({ message, level }) } }); }, update(kind: string, updatedGeneration: any = generation) { const conversation = conversations.find(value => value.generations.includes(updatedGeneration)); listener?.({ conversationId: conversation?.conversationId, snapshot: () => ({ generations: [updatedGeneration] }) }, kind); } };
+  return { generation, conversations, sent, notified, scheduled, entries, notifier, flush(maxDelay = 0) { for (;;) { const index = scheduled.findIndex(item => item.delay <= maxDelay); if (index < 0) break; const item = scheduled.splice(index, 1)[0]; if (!item.cancelled) item.fn(); } }, fire(event: string, value: unknown = {}) { handlers.get(event)?.(value, { isIdle: () => idle, hasUI: true, ui: { notify: (message: string, level: string) => notified.push({ message, level }) }, sessionManager: { getBranch: () => entries } }); }, update(kind: string, updatedGeneration: any = generation) { const conversation = conversations.find(value => value.generations.includes(updatedGeneration)); listener?.({ conversationId: conversation?.conversationId, snapshot: () => ({ generations: [updatedGeneration] }) }, kind); } };
 }
 
 test("notifies a terminal generation once without leaking output", () => {
@@ -52,6 +53,149 @@ test("notifies a terminal generation once without leaking output", () => {
   assert.doesNotMatch(JSON.stringify(f.sent[0]), /SECRET/);
   f.fire("turn_end");
   assert.equal(f.sent.length, 1);
+  f.notifier.unsubscribe();
+});
+
+test("delivered completion markers survive notifier recreation", () => {
+  const entries: any[] = [];
+  const first = fixture("auto", true, undefined, entries);
+  first.fire("session_start"); first.flush();
+  assert.equal(first.sent.length, 1);
+  assert.deepEqual(entries.filter((entry: any) => entry.customType === "subagent-completion-delivered"), [{
+    type: "custom",
+    customType: "subagent-completion-delivered",
+    data: { subagentId: "calm-river", generation: 1 },
+  }]);
+  first.notifier.unsubscribe();
+
+  const second = fixture("auto", true, undefined, entries);
+  second.fire("session_start"); second.flush();
+  assert.equal(second.sent.length, 0);
+  second.notifier.unsubscribe();
+});
+
+test("historical terminal generation indexes migrate once before notifying", () => {
+  const entries: any[] = [{
+    type: "custom",
+    customType: "subagent-generation-index",
+    data: { subagentId: "calm-river", generation: 1 },
+  }];
+  const f = fixture("auto", true, undefined, entries);
+  f.fire("session_start"); f.flush();
+  assert.equal(f.sent.length, 0);
+  assert.deepEqual(entries, [{
+    type: "custom",
+    customType: "subagent-generation-index",
+    data: { subagentId: "calm-river", generation: 1 },
+  }, {
+    type: "custom",
+    customType: "subagent-completion-delivered",
+    data: { subagentId: "calm-river", generation: 1 },
+  }, {
+    type: "custom",
+    customType: "subagent-completion-delivery-v1",
+    data: {},
+  }]);
+  f.notifier.unsubscribe();
+});
+
+test("post-migration unsent generation indexes remain eligible", () => {
+  const entries: any[] = [{
+    type: "custom",
+    customType: "subagent-completion-delivery-v1",
+    data: {},
+  }, {
+    type: "custom",
+    customType: "subagent-generation-index",
+    data: { subagentId: "calm-river", generation: 1 },
+  }];
+  const f = fixture("auto", true, undefined, entries);
+  f.fire("session_start"); f.flush();
+  assert.equal(f.sent.length, 1);
+  assert.deepEqual(entries.filter((entry: any) => entry.customType === "subagent-completion-delivered"), [{
+    type: "custom",
+    customType: "subagent-completion-delivered",
+    data: { subagentId: "calm-river", generation: 1 },
+  }]);
+  f.notifier.unsubscribe();
+});
+
+
+test("marker persistence retries without resending an accepted notification", () => {
+  let attempts = 0;
+  const entries: any[] = [{ type: "custom", customType: "subagent-completion-delivery-v1", data: {} }];
+  const f = fixture("auto", true, undefined, entries, customType => {
+    if (customType === "subagent-completion-delivered" && ++attempts === 1) throw new Error("disk unavailable");
+  });
+  f.fire("session_start"); f.flush();
+  assert.equal(f.sent.length, 1);
+  assert.equal(entries.some(entry => entry.customType === "subagent-completion-delivered"), false);
+  f.flush(500);
+  assert.equal(f.sent.length, 1);
+  assert.equal(entries.some(entry => entry.customType === "subagent-completion-delivered"), true);
+  f.notifier.unsubscribe();
+});
+
+test("migration completes only after every historical marker is persisted", () => {
+  let attempts = 0;
+  const entries: any[] = [{
+    type: "custom",
+    customType: "subagent-generation-index",
+    data: { subagentId: "calm-river", generation: 1 },
+  }];
+  const f = fixture("auto", true, undefined, entries, customType => {
+    if (customType === "subagent-completion-delivered" && ++attempts === 1) throw new Error("disk unavailable");
+  });
+  f.fire("session_start"); f.flush();
+  assert.equal(f.sent.length, 0);
+  assert.equal(entries.some(entry => entry.customType === "subagent-completion-delivery-v1"), false);
+  f.flush(500);
+  assert.deepEqual(entries.slice(1).map(entry => entry.customType), [
+    "subagent-completion-delivered",
+    "subagent-completion-delivery-v1",
+  ]);
+  f.notifier.unsubscribe();
+});
+
+test("malformed delivered markers do not suppress notifications", () => {
+  const malformed = [
+    { type: "custom", customType: "subagent-completion-delivered", data: { subagentId: "", generation: 1 } },
+    { type: "custom", customType: "subagent-completion-delivered", data: { subagentId: "calm-river", generation: 0 } },
+    { type: "custom", customType: "subagent-completion-delivered", data: { subagentId: "calm-river", generation: 1.5 } },
+    { type: "custom", customType: "subagent-completion", data: { subagentId: "calm-river", generation: 1 } },
+    { type: "custom", customType: "subagent-completion-delivered", data: null },
+  ];
+
+  for (const marker of malformed) {
+    const f = fixture("auto", true, undefined, [marker]);
+    f.fire("session_start"); f.flush();
+    assert.equal(f.sent.length, 1);
+    f.notifier.unsubscribe();
+  }
+});
+
+test("session starts replace branch-scoped delivered markers", () => {
+  const entries: any[] = [{
+    type: "custom",
+    customType: "subagent-completion-delivered",
+    data: { subagentId: "calm-river", generation: 1 },
+  }, {
+    type: "custom",
+    customType: "subagent-completion-delivery-v1",
+    data: {},
+  }];
+  const f = fixture("auto", true, undefined, entries);
+  f.fire("session_start"); f.flush();
+  assert.equal(f.sent.length, 0);
+
+  entries.length = 0;
+  f.fire("session_start"); f.flush();
+  assert.equal(f.sent.length, 1);
+  assert.deepEqual(entries.filter((entry: any) => entry.customType === "subagent-completion-delivered"), [{
+    type: "custom",
+    customType: "subagent-completion-delivered",
+    data: { subagentId: "calm-river", generation: 1 },
+  }]);
   f.notifier.unsubscribe();
 });
 
@@ -506,10 +650,17 @@ test("active steer send rejection retries without duplicating the UI notificatio
   f.fire("tool_execution_start", { toolName: "other", args: {} });
   f.flush();
   await Promise.resolve(); await Promise.resolve();
+  assert.deepEqual(f.entries.filter((entry: any) => entry.customType === "subagent-completion-delivered"), []);
   f.flush(500);
+  await Promise.resolve(); await Promise.resolve();
   assert.equal(f.sent.length, 2);
   assert.deepEqual(f.sent.map(value => value.options), [{ deliverAs: "steer" }, { deliverAs: "steer" }]);
   assert.equal(f.notified.length, 1);
+  assert.deepEqual(f.entries.filter((entry: any) => entry.customType === "subagent-completion-delivered"), [{
+    type: "custom",
+    customType: "subagent-completion-delivered",
+    data: { subagentId: "calm-river", generation: 1 },
+  }]);
   f.notifier.unsubscribe();
 });
 test("wrapped lifecycle calls claim their target generation", () => {

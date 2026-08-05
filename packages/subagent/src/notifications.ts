@@ -37,6 +37,9 @@ export interface CompletionNotificationMessage {
 
 const COMPLETION_GRACE_MS = 500;
 const RESULTS_INSTRUCTION = "Use `subagent join` when you need to collect these results.";
+const COMPLETION_DELIVERED_MARKER = "subagent-completion-delivered";
+const COMPLETION_MIGRATION_MARKER = "subagent-completion-delivery-v1";
+const SUBAGENT_GENERATION_INDEX = "subagent-generation-index";
 
 type AgentMessage = ContextEvent["messages"][number];
 type CustomMessage = Extract<AgentMessage, { role: "custom" }>;
@@ -137,11 +140,13 @@ export interface NotifierContext {
   isIdle(): boolean;
   hasUI?: boolean;
   ui?: { notify?(message: string, level?: "info" | "warning" | "error"): void };
+  sessionManager?: { getBranch?(): readonly unknown[] };
 }
 type Handler = (event: unknown, ctx?: NotifierContext) => void;
 export interface CompletionNotifierPi {
   on?(event: "agent_end" | "turn_end" | "tool_execution_start" | "tool_execution_end" | "session_start" | "session_shutdown", handler: Handler): void;
   sendMessage?(message: { customType: string; content: string; display?: boolean; details?: unknown }, options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" }): void | Promise<void>;
+  appendEntry?(customType: string, data?: unknown): void;
 }
 export interface CompletionNotifierDeps {
   pi: CompletionNotifierPi;
@@ -158,6 +163,9 @@ export class CompletionNotifier {
   private cancelGraceTimer?: () => void;
   private retryToolOpportunity = false;
   private readonly delivered = new Set<string>();
+  private readonly pendingDelivered = new Map<string, { subagentId: string; generation: number }>();
+  private migrationPending = false;
+  private branchEpoch = 0;
   private readonly uiNotified = new Set<string>();
   private readonly observed = new Set<string>();
   private readonly gracePending = new Set<string>();
@@ -168,8 +176,8 @@ export class CompletionNotifier {
 
   constructor(private readonly deps: CompletionNotifierDeps) {
     this.unsubscribeAgent = deps.manager.onConversationUpdate?.(this.onUpdate) ?? (() => {});
-    deps.pi.on?.("session_start", (_e, ctx) => { this.ctx = ctx; this.arm(0); });
-    deps.pi.on?.("session_shutdown", () => { this.ctx = undefined; this.cancel(); this.cancelGrace(); this.clearClaims(); });
+    deps.pi.on?.("session_start", (_e, ctx) => { this.branchEpoch++; this.ctx = ctx; this.restoreDeliveredMarkers(ctx); this.arm(0); });
+    deps.pi.on?.("session_shutdown", () => { this.branchEpoch++; this.ctx = undefined; this.cancel(); this.cancelGrace(); this.clearClaims(); this.clearBranchState(); });
     deps.pi.on?.("agent_end", (_e, ctx) => this.opportunity(ctx));
     deps.pi.on?.("turn_end", (_e, ctx) => this.opportunity(ctx));
     deps.pi.on?.("tool_execution_start", (event, ctx) => this.onToolStart(event, ctx));
@@ -310,8 +318,10 @@ export class CompletionNotifier {
   }
 
   private flush(toolOpportunity = false): void {
+    const persistencePending = this.flushPendingMarkers();
+    if (persistencePending) this.arm(500);
     const mode = this.deps.getMode();
-    if (mode === "none") { this.cancel(); return; }
+    if (mode === "none") { if (!persistencePending) this.cancel(); return; }
     const eligible = this.catalog().filter(candidate => { const keyValue = candidateKey(candidate); const generation = candidate.generation; return !this.delivered.has(keyValue) && !this.observed.has(keyValue) && !this.gracePending.has(keyValue) && !this.claimCountByGeneration.has(keyValue) && !generation.joined && generation.observerCount === 0; });
     if (!eligible.length) return;
     if (!this.ctx) return;
@@ -330,14 +340,19 @@ export class CompletionNotifier {
     if (!entries.length || !this.deps.pi.sendMessage) return;
     const message = createCompletionNotificationMessage(entries, this.notificationEpoch);
     const active = !this.ctx.isIdle();
+    const branchEpoch = this.branchEpoch;
     try {
       const sent = this.deps.pi.sendMessage({ customType: "subagent-completion", display: false, ...message }, mode === "steer" && active ? { deliverAs: "steer" } : { triggerTurn: true });
       this.notifyUi(entries);
       for (const entry of entries) this.delivered.add(notificationKey(entry));
-      void Promise.resolve(sent).catch(() => {
-        for (const entry of entries) this.delivered.delete(notificationKey(entry));
-        this.arm(500, mode === "steer" && active);
-      });
+      if (isPromiseLike(sent)) {
+        void sent.then(() => this.persistDelivered(entries, branchEpoch), () => {
+          for (const entry of entries) this.delivered.delete(notificationKey(entry));
+          this.arm(500, mode === "steer" && active);
+        });
+      } else {
+        this.persistDelivered(entries, branchEpoch);
+      }
     } catch {
       for (const entry of entries) this.delivered.delete(notificationKey(entry));
       this.arm(500, mode === "steer" && active);
@@ -351,6 +366,69 @@ export class CompletionNotifier {
       this.ctx.ui.notify(formatUiNotification(pending), completionNotificationLevel(pending));
       for (const entry of pending) this.uiNotified.add(notificationKey(entry));
     } catch {}
+  }
+
+  private clearBranchState(): void {
+    this.delivered.clear();
+    this.pendingDelivered.clear();
+    this.migrationPending = false;
+    this.uiNotified.clear();
+    this.observed.clear();
+    this.gracePending.clear();
+  }
+
+  private restoreDeliveredMarkers(ctx?: NotifierContext): void {
+    this.delivered.clear();
+    this.pendingDelivered.clear();
+    this.migrationPending = false;
+    const branch = ctx?.sessionManager?.getBranch?.() ?? [];
+    const hasMigrationMarker = branch.some(entry => customMarkerType(entry) === COMPLETION_MIGRATION_MARKER);
+    for (const entry of branch) {
+      const marker = deliveredMarker(entry);
+      if (!marker) continue;
+      this.delivered.add(generationKey({ conversationId: marker.subagentId as GenerationRef["conversationId"], generation: marker.generation }));
+    }
+    if (hasMigrationMarker) return;
+    const historical = new Map<string, { subagentId: string; generation: number }>();
+    for (const entry of branch) {
+      const marker = generationIndexMarker(entry);
+      if (!marker) continue;
+      historical.set(generationKey({ conversationId: marker.subagentId as GenerationRef["conversationId"], generation: marker.generation }), marker);
+    }
+    for (const [key, marker] of historical) {
+      this.delivered.add(key);
+      this.pendingDelivered.set(key, marker);
+    }
+    this.migrationPending = true;
+    if (this.flushPendingMarkers()) this.arm(500);
+  }
+
+  private persistDelivered(entries: readonly Pick<CompletionNotification, "subagentId" | "generation">[], branchEpoch: number): void {
+    if (branchEpoch !== this.branchEpoch) return;
+    for (const entry of entries) this.pendingDelivered.set(notificationKey(entry), entry);
+    if (this.flushPendingMarkers()) this.arm(500);
+  }
+
+  private flushPendingMarkers(): boolean {
+    const appendEntry = this.deps.pi.appendEntry;
+    if (!appendEntry) {
+      this.pendingDelivered.clear();
+      this.migrationPending = false;
+      return false;
+    }
+    for (const [key, entry] of this.pendingDelivered) {
+      try {
+        appendEntry(COMPLETION_DELIVERED_MARKER, { subagentId: entry.subagentId, generation: entry.generation });
+        this.pendingDelivered.delete(key);
+      } catch {}
+    }
+    if (!this.pendingDelivered.size && this.migrationPending) {
+      try {
+        appendEntry(COMPLETION_MIGRATION_MARKER, {});
+        this.migrationPending = false;
+      } catch {}
+    }
+    return this.pendingDelivered.size > 0 || this.migrationPending;
   }
 
   private currentGenerationKey(subagentId: string): string | undefined {
@@ -419,6 +497,34 @@ function completionDetails(message: CustomMessage): CompletionNotificationMessag
   if (!Array.isArray(completions)) return;
   const valid = completions.filter(isCompletionNotification);
   return { ...(notificationEpoch ? { notificationEpoch } : {}), completions: valid };
+}
+
+function customMarkerType(entry: unknown): string | undefined {
+  if (!entry || typeof entry !== "object") return;
+  const value = entry as { type?: unknown; customType?: unknown };
+  return value.type === "custom" && typeof value.customType === "string" ? value.customType : undefined;
+}
+
+function deliveredMarker(entry: unknown): { subagentId: string; generation: number } | undefined {
+  if (!entry || typeof entry !== "object") return;
+  const value = entry as { type?: unknown; customType?: unknown; data?: unknown };
+  if (value.type !== "custom" || value.customType !== COMPLETION_DELIVERED_MARKER || !value.data || typeof value.data !== "object") return;
+  const data = value.data as { subagentId?: unknown; generation?: unknown };
+  if (typeof data.subagentId !== "string" || data.subagentId.length === 0 || typeof data.generation !== "number" || !Number.isSafeInteger(data.generation) || data.generation < 1) return;
+  return { subagentId: data.subagentId, generation: data.generation };
+}
+
+function generationIndexMarker(entry: unknown): { subagentId: string; generation: number } | undefined {
+  if (!entry || typeof entry !== "object") return;
+  const value = entry as { type?: unknown; customType?: unknown; data?: unknown };
+  if (value.type !== "custom" || value.customType !== SUBAGENT_GENERATION_INDEX || !value.data || typeof value.data !== "object") return;
+  const data = value.data as { subagentId?: unknown; generation?: unknown };
+  if (typeof data.subagentId !== "string" || data.subagentId.length === 0 || typeof data.generation !== "number" || !Number.isSafeInteger(data.generation) || data.generation < 1) return;
+  return { subagentId: data.subagentId, generation: data.generation };
+}
+
+function isPromiseLike(value: unknown): value is Promise<void> {
+  return !!value && typeof (value as { then?: unknown }).then === "function";
 }
 
 function isCompletionNotification(entry: unknown): entry is CompletionNotification {
