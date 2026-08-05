@@ -85,20 +85,41 @@ test("unix launcher stores prompt as one bash argv array element", async () => {
   expect(command).not.toContain("/skill");
 });
 
-test("Herdr creates four live child panes clockwise in a balanced grid", async () => {
+test("Herdr creates child panes in the approved source cycle", async () => {
   vi.stubEnv("HERDR_PANE_ID", "main");
   const directory = await mkdtemp(path.join(tmpdir(), "pane-herdr-layout-"));
   const { fakeMux, createSurfaceSplit } = herdrMux();
   const handles = [];
 
   try {
-    for (let index = 1; index <= 4; index++) handles.push(await launchHerdrPane(fakeMux, directory, index));
+    for (let index = 1; index <= 9; index++) handles.push(await launchHerdrPane(fakeMux, directory, index));
     expect(createSurfaceSplit.mock.calls.map(([, direction, source]) => [source, direction])).toEqual([
       ["main", "right"],
       ["pane-1", "right"],
+      ["pane-1", "down"],
       ["pane-2", "down"],
       ["pane-1", "down"],
+      ["pane-2", "down"],
+      ["pane-3", "down"],
+      ["pane-4", "down"],
+      ["pane-1", "down"],
     ]);
+  } finally {
+    for (const handle of handles.reverse()) handle.close();
+  }
+});
+
+test("Herdr keeps the P5+ source cycle after closing a non-anchor pane", async () => {
+  vi.stubEnv("HERDR_PANE_ID", "main");
+  const directory = await mkdtemp(path.join(tmpdir(), "pane-herdr-close-cycle-"));
+  const { fakeMux, createSurfaceSplit } = herdrMux();
+  const handles = [];
+
+  try {
+    for (let index = 1; index <= 5; index++) handles.push(await launchHerdrPane(fakeMux, directory, index));
+    handles[4]!.close();
+    handles.push(await launchHerdrPane(fakeMux, directory, 6));
+    expect(createSurfaceSplit.mock.calls.at(-1)?.slice(1)).toEqual(["down", "pane-2"]);
   } finally {
     for (const handle of handles.reverse()) handle.close();
   }
@@ -119,10 +140,12 @@ test("Herdr removes the missing selected source and recomputes the split", async
     expect(createSurfaceSplit.mock.calls.map(([, direction, source]) => [source, direction])).toEqual([
       ["main", "right"],
       ["pane-1", "right"],
-      ["pane-2", "down"],
       ["pane-1", "down"],
-      ["pane-3", "down"],
+      ["pane-2", "right"],
+      ["pane-2", "down"],
     ]);
+    expect(createSurfaceSplit.mock.results[2]?.type).toBe("throw");
+    expect(createSurfaceSplit.mock.calls[3]?.slice(1)).toEqual(["right", "pane-2"]);
   } finally {
     for (const handle of handles.reverse()) handle.close();
   }

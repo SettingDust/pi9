@@ -100,14 +100,16 @@ export type PaneCompletionOutcome =
   | { status: "completed"; completion: PaneCompletion }
   | { status: "cancelled" };
 
-const herdrSurfaces: string[] = [];
-let herdrNextDirection: "right" | "down" = "right";
+const herdrAnchorSurfaces: string[] = [];
+let herdrCycleCursor = 0;
+let herdrCycleStarted = false;
 const activePaneHandles = new Set<PaneExecutionHandle>();
 export function resetPaneExecutionStateForTests(): void {
   for (const handle of activePaneHandles) handle.close();
   activePaneHandles.clear();
-  herdrSurfaces.length = 0;
-  herdrNextDirection = "right";
+  herdrAnchorSurfaces.length = 0;
+  herdrCycleCursor = 0;
+  herdrCycleStarted = false;
 }
 
 export async function launchPaneExecution(options: PaneExecutionOptions): Promise<PaneExecutionHandle> {
@@ -296,21 +298,28 @@ async function launchPiPane(options: PiPaneLaunchOptions): Promise<PaneExecution
   let surface: string;
   if (herdr) {
     while (true) {
-      const layoutIndex = herdrSurfaces.length;
-      const source = layoutIndex === 0 ? process.env.HERDR_PANE_ID!
-        : layoutIndex === 1 || layoutIndex === 3 ? herdrSurfaces[0]!
-        : layoutIndex === 2 ? herdrSurfaces[1]!
-        : herdrSurfaces.at(-1)!;
-      const direction = layoutIndex < 2 ? "right" : layoutIndex < 4 ? "down" : herdrNextDirection;
-      try { surface = mux.createSurfaceSplit!(name, direction, source); herdrNextDirection = direction === "right" ? "down" : "right"; break; }
-      catch (error) {
-        const sourceIndex = herdrSurfaces.indexOf(source);
+      const creatingAnchor = !herdrCycleStarted && herdrAnchorSurfaces.length < 4;
+      const source = creatingAnchor
+        ? herdrAnchorSurfaces.length === 0 ? process.env.HERDR_PANE_ID!
+          : herdrAnchorSurfaces.length < 3 ? herdrAnchorSurfaces[0]!
+          : herdrAnchorSurfaces[1]!
+        : herdrAnchorSurfaces[herdrCycleCursor % herdrAnchorSurfaces.length]!;
+      const direction = creatingAnchor && herdrAnchorSurfaces.length < 2 ? "right" : "down";
+      if (!creatingAnchor) herdrCycleStarted = true;
+      try {
+        surface = mux.createSurfaceSplit!(name, direction, source);
+        if (creatingAnchor) herdrAnchorSurfaces.push(surface);
+        else herdrCycleCursor = (herdrCycleCursor + 1) % herdrAnchorSurfaces.length;
+        break;
+      } catch (error) {
+        const sourceIndex = herdrAnchorSurfaces.indexOf(source);
         if (!isMissingPaneError(error) || sourceIndex < 0) throw error;
-        herdrSurfaces.splice(sourceIndex, 1);
-        if (herdrSurfaces.length === 0) herdrNextDirection = "right";
+        herdrAnchorSurfaces.splice(sourceIndex, 1);
+        if (sourceIndex < herdrCycleCursor) herdrCycleCursor--;
+        if (herdrCycleCursor >= herdrAnchorSurfaces.length) herdrCycleCursor = 0;
+        if (herdrAnchorSurfaces.length === 0) herdrCycleStarted = false;
       }
     }
-    herdrSurfaces.push(surface);
   } else {
     surface = mux.createSurface(name);
   }
@@ -324,9 +333,13 @@ async function launchPiPane(options: PiPaneLaunchOptions): Promise<PaneExecution
     try { mux.closeSurface(surface); }
     catch (error) { if (!isMissingPaneError(error)) throw error; }
     finally {
-      const index = herdrSurfaces.indexOf(surface);
-      if (index >= 0) herdrSurfaces.splice(index, 1);
-      if (herdrSurfaces.length === 0) herdrNextDirection = "right";
+      const anchorIndex = herdrAnchorSurfaces.indexOf(surface);
+      if (anchorIndex >= 0) {
+        herdrAnchorSurfaces.splice(anchorIndex, 1);
+        if (anchorIndex < herdrCycleCursor) herdrCycleCursor--;
+        if (herdrCycleCursor >= herdrAnchorSurfaces.length) herdrCycleCursor = 0;
+        if (herdrAnchorSurfaces.length === 0) herdrCycleStarted = false;
+      }
     }
   };
 
