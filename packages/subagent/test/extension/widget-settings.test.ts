@@ -110,3 +110,46 @@ test("session start refreshes agent and model schema", async () => {
   expect(refreshedSpawn.properties.agent.enum).toEqual(["handler"]);
   expect(availableModelIds({ scopedModels: [], modelRegistry: { getAvailable: () => available } })).toEqual(["all/fallback"]);
 });
+test("session start limits restored terminal conversations from settings", async () => {
+  const handlers = new Map<string, Function[]>();
+  const restoreTerminalConversations = vi.fn();
+  const settings = createDefaultSubagentSettings();
+  settings.runtime.maxConversations = 1;
+  settings.runtime.maxRecoveredConversations = 20;
+  subagentExtension({
+    on: vi.fn((event: string, handler: Function) => handlers.set(event, [...(handlers.get(event) ?? []), handler])),
+    registerTool: vi.fn(),
+    registerCommand: vi.fn(),
+  } as any, {
+    runtime: {
+      scheduler: { setChildTool: vi.fn(), setChildSessionEvent: vi.fn() },
+      configure: vi.fn(),
+      onConversationUpdate: () => () => {},
+      listConversations: () => [],
+      restoreTerminalConversations,
+    } as any,
+    agentRegistry: { agents: new Map(), reload: async () => {} } as any,
+    settingsStore: { load: async () => ({ settings }), save: async () => {} },
+  });
+
+  await handlers.get("session_start")?.at(-1)?.({}, {
+    cwd: "/tmp",
+    hasUI: false,
+    ui: {},
+    sessionManager: { getBranch: () => [
+      { type: "custom", customType: "subagent-generation-index", data: { version: 4, subagentId: "older", generation: 1, agent: "worker", kind: "spawn", status: "completed", completedAt: 10 } },
+      { type: "custom", customType: "subagent-generation-index", data: { version: 4, subagentId: "newer", generation: 1, agent: "worker", kind: "spawn", status: "completed", completedAt: 20 } },
+    ] },
+    scopedModels: [],
+    modelRegistry: { getAvailable: () => [] },
+  });
+
+  expect(restoreTerminalConversations).toHaveBeenCalledTimes(1);
+  const [records, cap] = restoreTerminalConversations.mock.calls[0];
+  expect(records).toHaveLength(2);
+  expect(records).toEqual(expect.arrayContaining([
+    expect.objectContaining({ subagentId: "older", completedAt: 10 }),
+    expect.objectContaining({ subagentId: "newer", completedAt: 20 }),
+  ]));
+  expect(cap).toBe(1);
+});

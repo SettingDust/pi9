@@ -42,7 +42,87 @@ const v5 = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 });
 const custom = (data: unknown) => ({ type: "custom", customType: "subagent-generation-index", data });
-const recordsFor = (branch: readonly unknown[], parentSessionFile?: string) => readSubagentGenerationIndexes(branch, parentSessionFile);
+const recordsFor = (branch: readonly unknown[], parentSessionFile?: string) =>
+  readSubagentGenerationIndexes(branch, parentSessionFile);
+
+test("limits recovery to the twenty newest recoverable conversations", () => {
+  const nouns = [
+    "acorn", "alpaca", "antelope", "arachnid", "aster", "aurora", "avocado", "axolotl", "badger", "beaver",
+    "beetle", "bicep", "birch", "bison", "blimp", "blob", "blossom", "bluebird", "bobcat", "bonsai",
+    "bowtie", "branch", "breeze", "brew", "brook",
+  ];
+  const records = recordsFor(nouns.map((noun, index) => custom(v5({ subagentId: `agile-${noun}`, completedAt: index + 1 }))));
+  const runtime = new SubagentRuntime(registry, 30, executor);
+
+  expect(records).toHaveLength(25);
+  expect(runtime.restoreTerminalConversations(records, 20)).toBe(20);
+  expect(runtime.listConversations().map(item => item.conversationId).sort()).toEqual(
+    nouns.slice(5).map(noun => `agile-${noun}`).sort(),
+  );
+});
+
+test("counts a recovered multi-generation conversation once while retaining every generation", () => {
+  const records = recordsFor([
+    custom(v5({ subagentId: "agile-acorn", completedAt: 10 })),
+    custom(v5({ subagentId: "agile-acorn", generation: 2, kind: "resume", createdAt: 11, completedAt: 20 })),
+    custom(v5({ subagentId: "agile-alpaca", completedAt: 15 })),
+  ]);
+  const runtime = new SubagentRuntime(registry, 30, executor);
+
+  expect(runtime.restoreTerminalConversations(records, 1)).toBe(1);
+  expect(runtime.conversation("agile-acorn" as any)).toMatchObject({
+    generations: [{ generation: 1 }, { generation: 2, kind: "resume" }],
+  });
+});
+
+test("keeps an older parent with its newest nested child when the recovery limit fits both", () => {
+  const records = recordsFor([
+    custom(v5({ subagentId: "agile-acorn", completedAt: 10 })),
+    custom(v5({ subagentId: "agile-alpaca", parentConversationId: "agile-acorn", completedAt: 30 })),
+    custom(v5({ subagentId: "agile-antelope", completedAt: 20 })),
+  ]);
+  const runtime = new SubagentRuntime(registry, 30, executor);
+
+  expect(runtime.restoreTerminalConversations(records, 2)).toBe(2);
+  expect(runtime.listConversations().map(item => item.conversationId).sort()).toEqual(["agile-acorn", "agile-alpaca"]);
+});
+
+test("skips an oversized newest child chain and fills the recovery limit with independent history", () => {
+  const records = recordsFor([
+    custom(v5({ subagentId: "agile-acorn", completedAt: 10 })),
+    custom(v5({ subagentId: "agile-alpaca", parentConversationId: "agile-acorn", completedAt: 30 })),
+    custom(v5({ subagentId: "agile-antelope", completedAt: 20 })),
+  ]);
+  const runtime = new SubagentRuntime(registry, 30, executor);
+
+  expect(runtime.restoreTerminalConversations(records, 1)).toBe(1);
+  expect(runtime.listConversations().map(item => item.conversationId)).toEqual(["agile-antelope"]);
+});
+
+test("keeps all folded records when no reader conversation limit is supplied", () => {
+  const branch = [
+    custom(v5({ subagentId: "agile-acorn", completedAt: 10 })),
+    custom(v5({ subagentId: "agile-acorn", generation: 2, kind: "resume", createdAt: 11, completedAt: 20 })),
+    custom(v5({ subagentId: "agile-alpaca", completedAt: 30 })),
+  ];
+
+  expect(recordsFor(branch).map(record => [record.subagentId, record.generation])).toEqual([
+    ["agile-acorn", 1],
+    ["agile-acorn", 2],
+    ["agile-alpaca", 1],
+  ]);
+});
+
+test("fills a recovery cap with an older valid conversation when the newest record is ineligible", () => {
+  const records = recordsFor([
+    custom(v5({ subagentId: "agile-acorn", completedAt: 20 })),
+    custom(v5({ subagentId: "agile-alpaca", agent: "missing", completedAt: 30 })),
+  ]);
+  const runtime = new SubagentRuntime(registry, 30, executor);
+
+  expect(runtime.restoreTerminalConversations(records, 1)).toBe(1);
+  expect(runtime.listConversations().map(item => item.conversationId)).toEqual(["agile-acorn"]);
+});
 
 test("folds only the supplied branch and keeps the newest valid v5 record per generation", () => {
   const absentBranch = [custom(v5({ subagentId: "amber-acorn", label: "other branch", completedAt: 99 }))];

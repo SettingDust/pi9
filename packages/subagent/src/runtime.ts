@@ -117,6 +117,12 @@ interface RecoveryGroup {
   readonly records: readonly TerminalRecoveryRecord[];
 }
 
+interface RecoverableGroup {
+  readonly id: ConversationId;
+  readonly input: RestoredTerminalConversation;
+  readonly completedAt: number;
+}
+
 /** Owns retained conversations. Generations are addressed internally by their object identity. */
 export class SubagentRuntime {
   private readonly conversations = new Map<ConversationId, Conversation>();
@@ -185,7 +191,7 @@ export class SubagentRuntime {
     }, failureMode);
   }
 
-  restoreTerminalConversations(records: readonly TerminalRecoveryRecord[]): number {
+  restoreTerminalConversations(records: readonly TerminalRecoveryRecord[], maxRecoveredConversations?: number): number {
     const groups = new Map<string, TerminalRecoveryRecord[]>();
     for (const record of records) {
       if (!isRecoveryRecord(record)) continue;
@@ -194,7 +200,6 @@ export class SubagentRuntime {
       groups.set(record.subagentId, group);
     }
 
-    let restored = 0;
     const orderedGroups: RecoveryGroup[] = [];
     for (const [rawId, group] of groups) {
       if (!isConversationId(rawId) || this.conversations.has(rawId)) continue;
@@ -204,25 +209,64 @@ export class SubagentRuntime {
     }
     orderedGroups.sort((left, right) => left.id.localeCompare(right.id));
 
-    let pending = orderedGroups;
+    const recoverable = new Map<ConversationId, RecoverableGroup>();
+    for (const group of orderedGroups) {
+      const first = group.records[0];
+      if (!first || first.generation !== 1 || !this.registry.agents.has(first.agent)) continue;
+      if (group.records.some((record, index) => record.generation !== index + 1 || record.kind !== (index === 0 ? "spawn" : "resume") || record.agent !== first.agent)) continue;
+      const definition = this.registry.agents.get(first.agent);
+      if (!definition) continue;
+      const input = this.toRestoredConversation(group.id, definition, group.records);
+      if (!input) continue;
+      try { Conversation.restoreTerminal(input, () => {}); }
+      catch { continue; }
+      recoverable.set(group.id, {
+        id: group.id,
+        input,
+        completedAt: Math.max(...group.records.map(record => record.completedAt)),
+      });
+    }
+
+    let selected: RecoverableGroup[];
+    if (maxRecoveredConversations === undefined) {
+      selected = [...recoverable.values()];
+    } else {
+      const selectedIds = new Set<ConversationId>();
+      const candidates = [...recoverable.values()].sort((left, right) => right.completedAt - left.completedAt || left.id.localeCompare(right.id));
+      for (const candidate of candidates) {
+        const chain: RecoverableGroup[] = [];
+        const seen = new Set<ConversationId>();
+        let current: RecoverableGroup | undefined = candidate;
+        while (current) {
+          if (seen.has(current.id)) { chain.length = 0; break; }
+          seen.add(current.id);
+          chain.push(current);
+          const parentId = current.input.parentConversationId;
+          if (!parentId || this.conversations.has(parentId)) break;
+          current = recoverable.get(parentId);
+          if (!current) { chain.length = 0; break; }
+        }
+        const added = chain.filter(group => !selectedIds.has(group.id));
+        if (!chain.length || selectedIds.size + added.length > maxRecoveredConversations) continue;
+        for (const group of added) selectedIds.add(group.id);
+        if (selectedIds.size === maxRecoveredConversations) break;
+      }
+      selected = [...recoverable.values()].filter(group => selectedIds.has(group.id));
+    }
+
+    let restored = 0;
+    let pending = selected;
     while (pending.length > 0 && this.conversations.size < this.maxConversations) {
-      const deferred: RecoveryGroup[] = [];
+      const deferred: RecoverableGroup[] = [];
       let progressed = false;
       for (const group of pending) {
         if (this.conversations.size >= this.maxConversations) break;
-        const first = group.records[0];
-        if (!first || first.generation !== 1 || !this.registry.agents.has(first.agent)) continue;
-        if (group.records.some((record, index) => record.generation !== index + 1 || record.kind !== (index === 0 ? "spawn" : "resume") || record.agent !== first.agent)) continue;
-        const definition = this.registry.agents.get(first.agent);
-        if (!definition) continue;
-        const input = this.toRestoredConversation(group.id, definition, group.records);
-        if (!input) continue;
-        if (input.parentConversationId && !this.conversations.has(input.parentConversationId)) {
+        if (group.input.parentConversationId && !this.conversations.has(group.input.parentConversationId)) {
           deferred.push(group);
           continue;
         }
         try {
-          const conversation = Conversation.restoreTerminal(input, (changed, kind) => this.updated(changed, kind));
+          const conversation = Conversation.restoreTerminal(group.input, (changed, kind) => this.updated(changed, kind));
           if (!this.conversationIds.claim(group.id)) continue;
           this.conversations.set(group.id, conversation);
           restored++;

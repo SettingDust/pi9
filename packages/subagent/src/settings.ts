@@ -23,6 +23,8 @@ export interface SubagentRuntimeSettings {
   maxConcurrentSubagents: number;
   /** Maximum number of conversations stored by the runtime. */
   maxConversations: number;
+  /** Only limits terminal conversations restored from persisted generation indexes at session_start. */
+  maxRecoveredConversations: number;
   completionNotify: CompletionNotifyMode;
 }
 
@@ -59,6 +61,7 @@ export function createDefaultSubagentSettings(): SubagentSettings {
       maxTasksPerCall: 8,
       maxConcurrentSubagents: 4,
       maxConversations: 100,
+      maxRecoveredConversations: 20,
       completionNotify: "auto",
     },
     agentDiscovery: {
@@ -142,6 +145,7 @@ export function normalizeSettings(value: unknown): SubagentSettingsLoadResult {
     assignPositiveInt(runtime, "maxTasksPerCall", value => { settings.runtime.maxTasksPerCall = value; }, warnings);
     assignPositiveInt(runtime, "maxConcurrentSubagents", value => { settings.runtime.maxConcurrentSubagents = value; }, warnings);
     assignPositiveInt(runtime, "maxConversations", value => { settings.runtime.maxConversations = value; }, warnings);
+    assignPositiveInt(runtime, "maxRecoveredConversations", value => { settings.runtime.maxRecoveredConversations = value; }, warnings);
     assignEnum(runtime, "completionNotify", COMPLETION_NOTIFY_MODES, value => { settings.runtime.completionNotify = value; }, warnings);
   }
 

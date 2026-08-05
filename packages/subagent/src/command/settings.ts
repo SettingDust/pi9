@@ -11,6 +11,7 @@ export type SubagentSettingsChange =
   | { kind: "maxConcurrentSubagents"; value: number }
   | { kind: "maxTasksPerCall"; value: number }
   | { kind: "maxConversations"; value: number }
+  | { kind: "maxRecoveredConversations"; value: number }
   | { kind: "widgetMaxRowsPerSection"; value: number };
 
 export function applySubagentSettingsChange(
@@ -30,6 +31,8 @@ export function applySubagentSettingsChange(
       return { ...settings, runtime: { ...settings.runtime, maxTasksPerCall: change.value } };
     case "maxConversations":
       return { ...settings, runtime: { ...settings.runtime, maxConversations: change.value } };
+    case "maxRecoveredConversations":
+      return { ...settings, runtime: { ...settings.runtime, maxRecoveredConversations: change.value } };
     case "widgetMaxRowsPerSection":
       return { ...settings, display: { ...settings.display, widgetMaxRowsPerSection: change.value } };
   }
@@ -177,6 +180,7 @@ export class SubagentSettingsComponent implements Component, Focusable {
       const value = positiveInt(item.currentValue);
       return [this.success(`${Math.max(0, value - 1)} / ${value} retained`), this.muted("One spawn remains before capacity is reached."), this.success("remove → frees capacity")];
     }
+    if (item.id === "maxRecoveredConversations") return [this.muted("Applies on next session start; persisted history remains on disk.")];
     return this.widgetPreview(item.id, width);
   }
 
@@ -278,6 +282,7 @@ function createSettingDefinitions(settings: SubagentSettings): SettingDefinition
     { id: "maxConcurrentSubagents", section: "Runtime", label: "Max running", currentValue: String(settings.runtime.maxConcurrentSubagents), description: "Maximum concurrently running subagents across the recursive delegation tree." },
     { id: "maxTasksPerCall", section: "Runtime", label: "Max batch size", currentValue: String(settings.runtime.maxTasksPerCall), description: "Maximum items accepted by one subagent spawn, resume, or steer call." },
     { id: "maxConversations", section: "Runtime", label: "Max conversations", currentValue: String(settings.runtime.maxConversations), description: "Maximum number of conversations retained by the runtime." },
+    { id: "maxRecoveredConversations", section: "Runtime", label: "Max recovered", currentValue: String(settings.runtime.maxRecoveredConversations), description: "Only limits terminal conversations recovered from persisted history at session start." },
   ];
 }
 

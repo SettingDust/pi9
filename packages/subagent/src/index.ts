@@ -90,8 +90,12 @@ export default function subagentExtension(pi: ExtensionAPI, dependencies: Subage
   }));
   registerTool();
   pi.on("session_start", async (_event, ctx) => {
-    await prepareInvocation(ctx);
-    runtime.restoreTerminalConversations?.(readSubagentGenerationIndexes(ctx.sessionManager?.getBranch?.() ?? [], ctx.sessionManager?.getSessionFile?.()));
+    const settings = await prepareInvocation(ctx);
+    const cap = Math.min(settings.runtime.maxRecoveredConversations, settings.runtime.maxConversations);
+    runtime.restoreTerminalConversations?.(readSubagentGenerationIndexes(
+      ctx.sessionManager?.getBranch?.() ?? [],
+      ctx.sessionManager?.getSessionFile?.(),
+    ), cap);
     updateSubagentWidget(ctx, runtime.listConversations(), currentSettings);
     registerTool([...agentRegistry.agents.keys()], availableModelIds(ctx));
   });
