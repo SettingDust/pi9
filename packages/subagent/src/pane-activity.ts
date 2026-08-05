@@ -21,6 +21,7 @@ export interface PaneActivityState {
   toolName?: string;
   toolStartedAt?: number;
   toolEndedAt?: number;
+  toolHistory?: GenerationToolUse[];
 }
 
 export function readPaneActivity(file: string, runningChildId: string): PaneActivityState | undefined {
@@ -41,12 +42,12 @@ export function projectPaneActivity(state: PaneActivityState | undefined): Gener
     : state.phase === "active" ? "thinking"
     : state.phase === "waiting" ? "settling"
     : "settling";
-  const tools: GenerationToolUse[] = state.toolName ? [{
+  const tools: GenerationToolUse[] = state.toolHistory?.map(tool => ({ ...tool })) ?? (state.toolName ? [{
     id: state.toolCallId ?? "pane-tool",
     name: state.toolName,
     startedAt: state.toolStartedAt ?? state.updatedAt,
     ...(state.toolEndedAt !== undefined ? { completedAt: state.toolEndedAt } : {}),
-  }] : [];
+  }] : []);
   return {
     phase,
     turns: state.turnIndex !== undefined ? state.turnIndex + 1 : 0,
@@ -71,11 +72,25 @@ export function createPaneActivityRecorder(runningChildId: string | undefined, f
       if (event === "tool_execution_start") {
         state.toolStartedAt = state.updatedAt;
         delete state.toolEndedAt;
+        (state.toolHistory ??= []).push({
+          id: state.toolCallId ?? state.toolName ?? "pane-tool",
+          name: state.toolName ?? "unknown",
+          startedAt: state.updatedAt,
+        });
       }
-      if (event === "tool_execution_end") state.toolEndedAt = state.updatedAt;
+      if (event === "tool_execution_end") {
+        state.toolEndedAt = state.updatedAt;
+        const history = state.toolHistory ?? [];
+        for (let index = history.length - 1; index >= 0; index--) {
+          const tool = history[index];
+          if (tool.completedAt !== undefined || (state.toolCallId ? tool.id !== state.toolCallId : tool.name !== state.toolName)) continue;
+          history[index] = { ...tool, completedAt: state.updatedAt };
+          break;
+        }
+      }
 
       const dir = dirname(file);
-      const temp = join(dir, `${runningChildId}.${process.pid}.${state.sequence}.tmp`);
+      const temp = join(dir, `${encodeURIComponent(runningChildId)}.${process.pid}.${state.sequence}.tmp`);
       for (let attempt = 0; attempt < 2; attempt++) {
         try {
           mkdirSync(dir, { recursive: true });
