@@ -34,10 +34,13 @@ test("tool opts into provider-side constrained JSON-schema sampling", () => {
 test("prompt guidelines discourage polling active subagents", () => {
   const tool: any = defineSubagentTool({ runtime, agentRegistry: registry, prepareInvocation: async () => settings });
   const guidelines = tool.promptGuidelines.join("\n");
-  assert.match(guidelines, /After spawning or resuming active work, continue independent work or end the turn/);
-  assert.match(guidelines, /do not repeatedly inspect, list, or join merely to poll/);
-  assert.match(guidelines, /Inspect only when progress could change your next step/);
+  assert.match(guidelines, /Spawn and resume dispatch work and return immediately; continue independent work or end the turn/);
+  assert.match(guidelines, /never wait for completion/);
+  assert.match(guidelines, /Inspect only once when its snapshot changes your next action/);
+  assert.match(guidelines, /never use inspect or list as a polling or wait loop/);
   assert.match(guidelines, /completion notification starts a new turn; then join that terminal subagent/);
+  assert.match(guidelines, /Never join active subagents to wait/);
+  assert.match(guidelines, /never use steer, cancel, or remove as polling or readiness probes/);
 });
 
 test("published schema accepts every action's wrapped minimal invocation", () => {

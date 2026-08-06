@@ -754,9 +754,10 @@ export function defineSubagentTool(deps: SubagentToolDeps) {
       "Delegate bounded, self-contained work to subagent; skip when delegation costs more than doing, or when verifying the result means redoing the work.",
       "Subagents see only their prompt and the filesystem; include every input, path, and constraint, plus what to report or produce.",
       "Parallelize subagents only when independent and writing disjoint files; otherwise run serially.",
-      "After spawning or resuming active work, continue independent work or end the turn; do not repeatedly inspect, list, or join merely to poll.",
-      "Inspect only when progress could change your next step; steer only to correct or constrain.",
-      "Do not join active subagents just to wait. Each completion notification starts a new turn; then join that terminal subagent for its result if needed, or resume it for follow-up. Steer only while active."
+      "Spawn and resume dispatch work and return immediately; continue independent work or end the turn, never wait for completion.",
+      "Inspect only once when its snapshot changes your next action; never use inspect or list as a polling or wait loop.",
+      "Each completion notification starts a new turn; then join that terminal subagent for its result if needed, or resume it for follow-up. Never join active subagents to wait.",
+      "Use steer only to correct or constrain active work; never use steer, cancel, or remove as polling or readiness probes."
     ],
     parameters: createSubagentParamsSchema({ agentNames, modelIds }),
     constrainedSampling: { type: "json_schema", strict: "prefer" },
