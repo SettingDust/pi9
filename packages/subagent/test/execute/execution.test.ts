@@ -179,28 +179,21 @@ test("Generation terminalizes an invalid requested model before session allocati
   });
 });
 
-test("resolves requested skills and reports discovery and read failures", () => {
+test("resolves requested skills from an already-loaded child catalog and reports read failures", () => {
   const skill = { name: "review", filePath: "/skills/review/SKILL.md", baseDir: "/skills/review" } as any;
   const dependencies = {
-    getAgentDir: () => "/agent",
-    loadSkills: () => ({ skills: [skill] }),
     readSkillFile: () => "---\nname: review\n---\nReview carefully.",
   } as any;
 
-  expect(resolveRequestedSkills("/work", ["review"], dependencies)).toEqual({
+  expect(resolveRequestedSkills(["review"], [skill], dependencies)).toEqual({
     ok: true,
     value: ["<skill name=\"review\" location=\"/skills/review/SKILL.md\">\nReferences are relative to /skills/review.\n\nReview carefully.\n</skill>"],
   });
-  expect(resolveRequestedSkills("/work", ["missing"], dependencies)).toEqual({
+  expect(resolveRequestedSkills(["missing"], [skill], dependencies)).toEqual({
     ok: false,
     error: "Unknown skill: missing",
   });
-  expect(resolveRequestedSkills("/work", ["review"], {
-    ...dependencies,
-    loadSkills: () => { throw new Error("catalog unavailable"); },
-  })).toEqual({ ok: false, error: "Could not discover requested skills: catalog unavailable" });
-  expect(resolveRequestedSkills("/work", ["review"], {
-    ...dependencies,
+  expect(resolveRequestedSkills(["review"], [skill], {
     readSkillFile: () => { throw new Error("permission denied"); },
   })).toEqual({ ok: false, error: "Could not load requested skill: permission denied" });
 });
@@ -218,11 +211,14 @@ test("injects requested skills into the system prompt without splitting the task
     ...DEFAULT_EXECUTE_GENERATION_DEPENDENCIES,
     getAgentDir: () => "/agent",
     loadExtensionPaths: async () => [],
-    loadSkills: () => ({ skills: [{ name: "review", filePath: "/skills/review/SKILL.md", baseDir: "/skills/review" }] }),
     readSkillFile: () => "---\nname: review\n---\nReview carefully.",
     ResourceLoader: class {
-      constructor(options: any) { capturedSystemPrompt = options.systemPromptOverride(); }
-      async reload() {}
+      private readonly options: any;
+      constructor(options: any) { this.options = options; }
+      async reload() {
+        this.options.skillsOverride({ skills: [{ name: "review", filePath: "/skills/review/SKILL.md", baseDir: "/skills/review" }], diagnostics: [] });
+        capturedSystemPrompt = this.options.systemPromptOverride();
+      }
     } as any,
     createAgentSession: async () => ({ session }),
   } as any);

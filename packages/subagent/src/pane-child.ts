@@ -9,35 +9,33 @@ type Completion =
   | { type: "structured_output"; value: unknown }
   | { type: "ping"; name: string; message: string };
 
+const SETUP_ERROR_PING = "__subagent_setup_error__";
+
 function escapeXml(value: string): string {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&apos;");
 }
 
-function requestedSkillPrompt(pi: ExtensionAPI): string | undefined {
+function requestedSkillPrompt(pi: ExtensionAPI): { prompt?: string; error?: string } {
   const raw = process.env.PI_SUBAGENT_SKILLS;
-  if (!raw) return undefined;
+  if (!raw) return {};
   let names: unknown;
-  try { names = JSON.parse(raw); } catch { return fatalSkillPrompt("Invalid PI_SUBAGENT_SKILLS."); }
-  if (!Array.isArray(names) || names.some(name => typeof name !== "string")) return fatalSkillPrompt("Invalid PI_SUBAGENT_SKILLS.");
+  try { names = JSON.parse(raw); } catch { return { error: "Invalid PI_SUBAGENT_SKILLS." }; }
+  if (!Array.isArray(names) || names.some(name => typeof name !== "string")) return { error: "Invalid PI_SUBAGENT_SKILLS." };
   const commands = pi.getCommands();
   const blocks: string[] = [];
   for (const name of names) {
     const command = commands.find(value => value.source === "skill" && (value.name === name || value.name === `skill:${name}`));
-    if (!command) return fatalSkillPrompt(`Requested skill is unavailable: ${name}`);
+    if (!command) return { error: `Requested skill is unavailable: ${name}` };
     try {
       const sourcePath = command.sourceInfo.path;
       const body = stripFrontmatter(readFileSync(sourcePath, "utf8")).trim();
       const baseDir = command.sourceInfo.baseDir ?? sourcePath.replace(/[\\/]?[^\\/]+$/, "");
       blocks.push(`<skill name="${escapeXml(name)}" location="${escapeXml(sourcePath)}">\nReferences are relative to ${escapeXml(baseDir)}.\n\n${body}\n</skill>`);
     } catch (error) {
-      return fatalSkillPrompt(`Requested skill could not be loaded: ${name}: ${error instanceof Error ? error.message : String(error)}`);
+      return { error: `Requested skill could not be loaded: ${name}: ${error instanceof Error ? error.message : String(error)}` };
     }
   }
-  return blocks.length ? blocks.join("\n\n") : undefined;
-}
-
-function fatalSkillPrompt(message: string): string {
-  return `<system-reminder>Fatal subagent setup error: ${escapeXml(message)} Call caller_ping immediately with this exact setup error and do not continue the delegated task.</system-reminder>`;
+  return { prompt: blocks.length ? blocks.join("\n\n") : undefined };
 }
 
 function renderDoneCall(args: { result?: unknown }, _theme: Theme): Component {
@@ -57,17 +55,22 @@ export default function paneChild(pi: ExtensionAPI) {
   const completionFile = process.env.PI_SUBAGENT_COMPLETION_FILE;
   if (!completionFile) return;
   const recorder = createPaneActivityRecorder(process.env.PI_SUBAGENT_RUN_ID, process.env.PI_SUBAGENT_ACTIVITY_FILE);
-  const on = pi.on.bind(pi) as (event: string, handler: (value: any) => any) => void;
+  const on = pi.on.bind(pi) as (event: string, handler: (...args: any[]) => any) => void;
   let skillPrompt: string | undefined;
   let skillsResolved = false;
-  on("before_agent_start", (event: any) => {
-    if (!skillsResolved) {
-      skillPrompt = requestedSkillPrompt(pi);
-      skillsResolved = true;
+  on("session_start", (_event: any, ctx: { shutdown(): void }) => {
+    recorder.record("session_start");
+    const resolved = requestedSkillPrompt(pi);
+    skillsResolved = true;
+    skillPrompt = resolved.prompt;
+    if (resolved.error) {
+      writeFileSync(completionFile, JSON.stringify({ type: "ping", name: SETUP_ERROR_PING, message: resolved.error } satisfies Completion));
+      ctx.shutdown();
     }
-    return skillPrompt ? { systemPrompt: `${event.systemPrompt ?? ""}\n\n${skillPrompt}` } : undefined;
   });
-  on("session_start", () => recorder.record("session_start"));
+  on("before_agent_start", (event: any) => skillsResolved && skillPrompt
+    ? { systemPrompt: `${event.systemPrompt ?? ""}\n\n${skillPrompt}` }
+    : undefined);
   on("agent_start", () => recorder.record("agent_start"));
   on("agent_end", () => recorder.record("agent_end"));
   on("turn_start", event => recorder.record("turn_start", { turnIndex: event.turnIndex }));

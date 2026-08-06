@@ -1,4 +1,4 @@
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { beforeEach, expect, test, vi } from "vitest";
@@ -33,23 +33,28 @@ test("injects requested native skills into every child agent start", async () =>
   const { pi, handlers } = fixture([{ source: "skill", name: "skill:review-correctness", sourceInfo: { path: skillPath, baseDir: dir } }]);
 
   paneChild(pi);
+  handlers.get("session_start")![0]!({}, { shutdown: vi.fn() });
   const before = handlers.get("before_agent_start")![0]!;
   expect(before({ systemPrompt: "Base" }).systemPrompt).toContain("<skill name=\"review-correctness\"");
   expect(before({ systemPrompt: "Base" }).systemPrompt).toContain("Review rules");
 });
 
-test("missing requested skills inject a fatal caller_ping instruction instead of throwing", () => {
-  process.env.PI_SUBAGENT_COMPLETION_FILE = path.join(tmpdir(), "pane-child-missing.json");
+test("missing requested skills terminate setup with an explicit completion error", async () => {
+  const completionFile = path.join(await mkdtemp(path.join(tmpdir(), "pane-child-missing-")), "done.json");
+  process.env.PI_SUBAGENT_COMPLETION_FILE = completionFile;
   process.env.PI_SUBAGENT_SKILLS = JSON.stringify(["missing-skill"]);
   const { pi, handlers } = fixture([]);
+  const shutdown = vi.fn();
 
   paneChild(pi);
-  const before = handlers.get("before_agent_start")![0]!;
-  const result = before({ systemPrompt: "Base" });
+  handlers.get("session_start")![0]!({}, { shutdown });
 
-  expect(result.systemPrompt).toContain("Fatal subagent setup error");
-  expect(result.systemPrompt).toContain("Requested skill is unavailable: missing-skill");
-  expect(result.systemPrompt).toContain("caller_ping");
+  expect(shutdown).toHaveBeenCalledOnce();
+  await expect(readFile(completionFile, "utf8")).resolves.toBe(JSON.stringify({
+    type: "ping",
+    name: "__subagent_setup_error__",
+    message: "Requested skill is unavailable: missing-skill",
+  }));
 });
 test("read-only viewer handles every input without registering execution tools", () => {
   process.env.PI_SUBAGENT_READONLY = "1";

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { beforeEach, expect, test, vi } from "vitest";
-import { launchPaneExecution, createPaneGenerationExecutor, reopenPaneExecution, resetPaneExecutionStateForTests } from "../src/pane-execution.js";
+import { launchPaneExecution, createPaneGenerationExecutor, readPaneCompletionOutput, reopenPaneExecution, resetPaneExecutionStateForTests } from "../src/pane-execution.js";
 import { Conversation } from "../src/conversation.js";
 
 beforeEach(() => {
@@ -205,6 +205,26 @@ test("windows launcher keeps large prompts out of PowerShell native argv", async
 expect(JSON.parse(await readFile(`${sessionFile}.exit`, "utf8"))).toEqual({ type: "failed", exitCode: 0 });
 await expect(readFile(`${sessionFile}.launch.cjs`, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
   expect(fakeMux.sendCommand.mock.calls[0]?.[1]).toContain("powershell.exe");
+});
+
+test("reserved setup-error pings fail live panes and are not recovered as successful output", async () => {
+  const tmp = await mkdtemp(path.join(tmpdir(), "pane-skill-error-"));
+  const fakeMux = mux();
+  (fakeMux.pollForExit as any).mockResolvedValue({
+    reason: "ping",
+    exitCode: 0,
+    ping: { name: "__subagent_setup_error__", message: "Requested skill is unavailable: missing" },
+  });
+  const executor = createPaneGenerationExecutor({ mux: fakeMux as any, sleep: async () => undefined, platform: "linux", loadExtensionPaths: async () => [] });
+  const conversation = new Conversation("skill-error" as any, definition, { kind: "spawn", agent: "worker", prompt: "test", label: "test" }, () => {});
+
+  await expect(executor(ctx(tmp), conversation, conversation.latestGeneration)).resolves.toMatchObject({
+    status: { kind: "done", outcome: "error", error: "Requested skill is unavailable: missing" },
+  });
+
+  const sessionFile = path.join(tmp, "recovered.jsonl");
+  await writeFile(`${sessionFile}.exit`, JSON.stringify({ type: "ping", name: "__subagent_setup_error__", message: "missing" }), "utf8");
+  expect(readPaneCompletionOutput(sessionFile)).toBeUndefined();
 });
 test("reopened panes load the read-only child extension in a separate pane", async () => {
   const fakeMux = mux();

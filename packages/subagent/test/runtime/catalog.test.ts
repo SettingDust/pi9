@@ -637,23 +637,21 @@ test("spawn validation is ordered, isolated, and does not allocate or consume ca
   expect(manager.listConversations()).toHaveLength(2);
 });
 
-test("spawn rejects unknown requested skills before allocating conversations", async () => {
+test("spawn defers requested skill validation to child execution", async () => {
   const skillRegistry = { agents: new Map([
     ["invalid-skill", { ...config, name: "invalid-skill", skills: ["definitely-missing-subagent-test-skill"] }],
   ]) } as any;
   const manager = new SubagentRuntime(skillRegistry, 2, executor);
   const batch = manager.startTasks(ctx, [
-    { kind: "spawn", agent: "invalid-skill", prompt: "invalid", label: "invalid" },
+    { kind: "spawn", agent: "invalid-skill", prompt: "inherited", label: "inherited" },
     { kind: "spawn", agent: "invalid-skill", prompt: "override", label: "override", skills: [] },
   ] as any);
 
-  expect(batch.starts[0]).toEqual({
-    ok: false,
-    inputIndex: 0,
-    error: "Unknown skill: definitely-missing-subagent-test-skill",
-  });
-  expect(batch.starts[1]).toMatchObject({ ok: true, inputIndex: 1 });
-  expect(manager.listConversations()).toHaveLength(1);
+  expect(batch.starts).toEqual([
+    expect.objectContaining({ ok: true, inputIndex: 0 }),
+    expect.objectContaining({ ok: true, inputIndex: 1 }),
+  ]);
+  expect(manager.listConversations()).toHaveLength(2);
   await batch.completion;
 });
 

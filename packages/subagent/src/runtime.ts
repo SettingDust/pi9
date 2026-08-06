@@ -20,7 +20,7 @@ import {
   type RestoredTerminalGeneration,
   type SteerReceipt,
 } from "./conversation.js";
-import { resolveModel, resolveRequestedSkills, resolveTaskCwd } from "./execute.js";
+import { resolveModel, resolveTaskCwd } from "./execute.js";
 import { ConversationIdAllocator, isConversationId, type ConversationId, type SubagentId } from "./identifiers.js";
 import { readPaneCompletionOutput } from "./pane-execution.js";
 import { GenerationScheduler, type GenerationExecutor } from "./scheduler.js";
@@ -353,14 +353,11 @@ export class SubagentRuntime {
     if (!model.ok) return { error: model.error };
     const cwd = resolveTaskCwd(ctx.cwd, requested.cwd);
     if (!cwd.ok) return { error: cwd.error };
-    const skills = resolveRequestedSkills(cwd.value, requested.skills ?? []);
-    if (!skills.ok) return { error: skills.error };
     if (this.conversations.size >= this.maxConversations) return { error: this.capacityError() };
     const conversationId = this.conversationIds.allocate();
     if (!conversationId) return { error: "Conversation ID space exhausted." };
     const conversation = new Conversation(conversationId, definition, task, (changed, kind) => this.updated(changed, kind), {
       ...(caller ? { parentConversationId: caller.conversation.conversationId, startedInParentGeneration: caller.generation.number } : {}),
-      resolvedSkillBlocks: skills.value,
     });
     this.conversations.set(conversationId, conversation);
     return { conversation, generation: conversation.latestGeneration };

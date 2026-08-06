@@ -4,10 +4,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { completedGeneration, errorGeneration, interruptedGeneration, skippedGeneration, type Conversation, type Generation, type GenerationSnapshot } from "./conversation.js";
-import { discoverInheritedExtensionPaths, resolveCurrentPiInvocation, resolveModel, resolveRequestedSkills, resolveTaskCwd } from "./execute.js";
+import { discoverInheritedExtensionPaths, resolveCurrentPiInvocation, resolveModel, resolveTaskCwd } from "./execute.js";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { projectPaneActivity, readPaneActivity } from "./pane-activity.js";
 export const paneChildExtensionPath = fileURLToPath(new URL("./pane-child.ts", import.meta.url));
+const SETUP_ERROR_PING = "__subagent_setup_error__";
 
 interface PollResult {
   reason: "done" | "ping" | "structured_output" | "sentinel";
@@ -88,7 +89,7 @@ export function readPaneCompletionOutput(sessionFile: string): string | undefine
     const value = completion as Record<string, unknown>;
     switch (value.type) {
       case "structured_output": return Object.hasOwn(value, "value") ? formatStructuredOutput(value.value) : undefined;
-      case "ping": return typeof value.name === "string" && typeof value.message === "string" ? value.message : undefined;
+      case "ping": return value.name === SETUP_ERROR_PING ? undefined : typeof value.name === "string" && typeof value.message === "string" ? value.message : undefined;
       case "done": return "";
       case "failed": return typeof value.exitCode === "number" ? undefined : undefined;
       default: return undefined;
@@ -201,8 +202,6 @@ export function createPaneGenerationExecutor(dependencies: PaneExecutionDependen
     if (!cwdResolution.ok) return errorGeneration(conversation, generation, cwdResolution.error);
     const modelResolution = resolveModel(requested.model, ctx.model, ctx.modelRegistry);
     if (!modelResolution.ok) return errorGeneration(conversation, generation, modelResolution.error);
-    const skillResolution = resolveRequestedSkills(cwdResolution.value, requested.skills ?? []);
-    if (!skillResolution.ok) return errorGeneration(conversation, generation, skillResolution.error);
 
     const cwd = cwdResolution.value;
     const agentDir = (dependencies.getAgentDir ?? getAgentDir)();
@@ -272,7 +271,9 @@ export function createPaneGenerationExecutor(dependencies: PaneExecutionDependen
     if (outcome.status === "cancelled") return interruptedGeneration(conversation, generation, "Agent interrupted.");
     switch (outcome.completion.type) {
       case "structured_output": return completedGeneration(conversation, generation, formatStructuredOutput(outcome.completion.value));
-      case "ping": return completedGeneration(conversation, generation, outcome.completion.message);
+      case "ping": return outcome.completion.name === SETUP_ERROR_PING
+        ? errorGeneration(conversation, generation, outcome.completion.message)
+        : completedGeneration(conversation, generation, outcome.completion.message);
       case "failed": return errorGeneration(conversation, generation, `Pane child exited with code ${outcome.completion.exitCode}.`);
       case "done": return completedGeneration(conversation, generation, "");
     }

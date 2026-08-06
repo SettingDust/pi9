@@ -159,7 +159,6 @@ interface GenerationConstructionOptions {
 interface ConversationConstructionOptions {
   readonly parentConversationId?: ConversationId;
   readonly startedInParentGeneration?: number;
-  readonly resolvedSkillBlocks?: readonly string[];
   readonly createdAt?: number;
   readonly requestedConfig?: RequestedExecutionConfig;
   readonly requestedOverrides?: ExecutionOverrides;
@@ -296,7 +295,6 @@ export class Conversation {
   readonly createdAt: number;
   readonly agentName: string;
   readonly parentConversationId?: ConversationId;
-  readonly resolvedSkillBlocks?: readonly string[];
   readonly requestedConfig: RequestedExecutionConfig;
   readonly requestedOverrides?: ExecutionOverrides;
   readonly label: string;
@@ -321,7 +319,6 @@ export class Conversation {
     this.agentName = spawn.agent;
     this.label = spawn.label;
     this.parentConversationId = options.parentConversationId;
-    this.resolvedSkillBlocks = options.resolvedSkillBlocks;
     this.requestedConfig = options.requestedConfig ?? resolveRequestedConfig(definition, spawn);
     if (options.requestedOverrides) this.requestedOverrides = options.requestedOverrides;
     else if (spawn.model !== undefined || spawn.thinking !== undefined) this.requestedOverrides = Object.freeze({

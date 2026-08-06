@@ -9,7 +9,6 @@ import {
   DefaultResourceLoader,
   type ExtensionContext,
   getAgentDir,
-  loadSkills,
   SessionManager,
   SettingsManager,
   stripFrontmatter,
@@ -59,7 +58,6 @@ export interface ExecuteGenerationDependencies {
   createAgentSession: typeof createAgentSession;
   sessionManager: typeof SessionManager.inMemory;
   settingsManager: typeof SettingsManager.create;
-  loadSkills: typeof loadSkills;
   readSkillFile: typeof readFileSync;
   loadExtensionPaths: (cwd: string, agentDir: string) => Promise<string[]>;
   childToolFor?: (agent: Conversation) => ToolDefinition;
@@ -72,7 +70,6 @@ export const DEFAULT_EXECUTE_GENERATION_DEPENDENCIES: ExecuteGenerationDependenc
   createAgentSession,
   sessionManager: SessionManager.inMemory,
   settingsManager: SettingsManager.create,
-  loadSkills,
   readSkillFile: readFileSync,
   loadExtensionPaths: discoverInheritedExtensionPaths,
 };
@@ -115,26 +112,23 @@ export async function executeGeneration(
   const agentDir = dependencies.getAgentDir();
 
   const requestedSkills = requestedConfig.skills ?? [];
-  let skillBlocks = agent.resolvedSkillBlocks;
-  if (skillBlocks === undefined) {
-    const skillResolution = resolveRequestedSkills(cwd, requestedSkills, dependencies);
-    if (!skillResolution.ok) return errorGeneration(agent, generation, skillResolution.error);
-    skillBlocks = skillResolution.value;
-  }
   let systemPrompt = agent.definition.systemPrompt;
-  if (skillBlocks.length > 0) {
-    systemPrompt = `${systemPrompt}\n\n${skillBlocks.join("\n\n")}`;
-  }
 
   const inheritedExtensionPaths = await dependencies.loadExtensionPaths(cwd, agentDir);
   const childTool = dependencies.childToolFor?.(agent);
+  let skillError: string | undefined;
 
   const resourceLoader = new dependencies.ResourceLoader({
     cwd,
     agentDir,
     noExtensions: true,
     additionalExtensionPaths: inheritedExtensionPaths,
-    noSkills: true,
+    skillsOverride: base => {
+      const skillResolution = resolveRequestedSkills(requestedSkills, base.skills, dependencies);
+      if (!skillResolution.ok) skillError = skillResolution.error;
+      else if (skillResolution.value.length > 0) systemPrompt = `${systemPrompt}\n\n${skillResolution.value.join("\n\n")}`;
+      return base;
+    },
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
@@ -144,6 +138,7 @@ export async function executeGeneration(
 
   await timingAsync("generation.resourceLoader.reload", { ...generationData, cwd }, () => resourceLoader.reload());
   if (signal?.aborted) return skippedGeneration(agent, generation);
+  if (skillError) return errorGeneration(agent, generation, skillError);
 
   const requestedThinking = requestedConfig.thinking;
   const sessionManager = dependencies.sessionManager(cwd);
@@ -230,32 +225,20 @@ export type GenerationExecutionResolution<T> =
   | { readonly ok: true; readonly value: T }
   | { readonly ok: false; readonly error: string };
 
-type SkillResolutionDependencies = Pick<
-  ExecuteGenerationDependencies,
-  "getAgentDir" | "loadSkills" | "readSkillFile"
->;
+type SkillResolutionDependencies = Pick<ExecuteGenerationDependencies, "readSkillFile">;
 
 export function resolveRequestedSkills(
-  cwd: string,
   requestedSkills: readonly string[],
+  available: readonly Skill[],
   dependencies: SkillResolutionDependencies = DEFAULT_EXECUTE_GENERATION_DEPENDENCIES,
 ): GenerationExecutionResolution<readonly string[]> {
   if (requestedSkills.length === 0) return { ok: true, value: [] };
-
-  let available: Skill[];
-  try {
-    const agentDir = dependencies.getAgentDir();
-    available = dependencies.loadSkills({ cwd, agentDir, skillPaths: [], includeDefaults: true }).skills;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return { ok: false, error: `Could not discover requested skills: ${message}` };
-  }
 
   const matched: Skill[] = [];
   for (const name of requestedSkills) {
     const found = available.find(skill => skill.name === name);
     if (!found) return { ok: false, error: `Unknown skill: ${name}` };
-    matched.push({ ...found, disableModelInvocation: false });
+    matched.push(found);
   }
 
   try {
