@@ -91,11 +91,17 @@ export default function subagentExtension(pi: ExtensionAPI, dependencies: Subage
   registerTool();
   pi.on("session_start", async (_event, ctx) => {
     const settings = await prepareInvocation(ctx);
+    const branch = ctx.sessionManager?.getBranch?.() ?? [];
+    const parentSessionFile = ctx.sessionManager?.getSessionFile?.();
     const cap = Math.min(settings.runtime.maxRecoveredConversations, settings.runtime.maxConversations);
-    runtime.restoreTerminalConversations?.(readSubagentGenerationIndexes(
-      ctx.sessionManager?.getBranch?.() ?? [],
-      ctx.sessionManager?.getSessionFile?.(),
-    ), cap);
+    const terminalRecords = readSubagentGenerationIndexes(branch, parentSessionFile);
+    const activeRecords = readActivePaneGenerationLeases(branch, parentSessionFile);
+    if (runtime.recoverPersistedConversations) {
+      await runtime.recoverPersistedConversations(terminalRecords, activeRecords, cap);
+    } else {
+      runtime.restoreTerminalConversations?.(terminalRecords, cap);
+      await runtime.restoreActivePaneConversations?.(activeRecords);
+    }
     updateSubagentWidget(ctx, runtime.listConversations(), currentSettings);
     registerTool([...agentRegistry.agents.keys()], availableModelIds(ctx));
   });
@@ -155,18 +161,80 @@ interface MetadataPi { appendEntry?(customType: string, data?: unknown): void }
 interface MetadataSource { onConversationUpdate?(listener: (agent: Conversation, kind: ConversationUpdateKind) => void): () => void }
 export function registerSubagentMetadataPersistence(pi: MetadataPi, source: MetadataSource): () => void {
   if (!pi.appendEntry || !source.onConversationUpdate) return () => {};
+  const MAX_ACTIVE_LEASE_RETRY_ATTEMPTS = 3;
   const persistedJoined = new Map<string, boolean>();
-  return source.onConversationUpdate((agent, kind) => {
+  const persistedActive = new Set<string>();
+  const pendingActive = new Map<string, { timer: ReturnType<typeof setTimeout>; identity: string; agent: Conversation; attempts: number }>();
+  const clearPending = (key: string) => {
+    const pending = pendingActive.get(key);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    pendingActive.delete(key);
+  };
+  const leaseIdentity = (lease: SubagentActivePaneGenerationLeaseV1) => JSON.stringify(lease);
+  const scheduleRetry = (agent: Conversation, key: string, lease: SubagentActivePaneGenerationLeaseV1, attempts = 1) => {
+    if (attempts > MAX_ACTIVE_LEASE_RETRY_ATTEMPTS || persistedActive.has(key) || pendingActive.has(key)) return;
+    const identity = leaseIdentity(lease);
+    const timer = setTimeout(() => {
+      const pending = pendingActive.get(key);
+      if (!pending || pending.identity !== identity) return;
+      pendingActive.delete(key);
+      const snapshot = agent.snapshot();
+      const generation = snapshot.generations.at(-1);
+      const retainedSessionFile = agent.sessionFileForResume?.();
+      const paneSurface = agent.retainedPaneSurface?.();
+      const currentLease = generation?.status.kind === "running" && generationKey({ conversationId: snapshot.conversationId, generation: generation.generation }) === key && retainedSessionFile && paneSurface
+        ? projectActivePaneGenerationLease(snapshot, retainedSessionFile, paneSurface)
+        : undefined;
+      if (!currentLease || leaseIdentity(currentLease) !== identity) return;
+      try {
+        pi.appendEntry!("subagent-active-pane-lease", currentLease);
+        persistedActive.add(key);
+      } catch {
+        scheduleRetry(agent, key, currentLease, pending.attempts + 1);
+      }
+    }, attempts * 1_000);
+    pendingActive.set(key, { timer, identity, agent, attempts });
+  };
+  const unsubscribe = source.onConversationUpdate((agent, kind) => {
     if (kind !== "status" && kind !== "joined") return;
     const snapshot = agent.snapshot();
     const generation = snapshot.generations.at(-1);
     const key = generation ? generationKey({ conversationId: snapshot.conversationId, generation: generation.generation }) : undefined;
-    const joined = generation?.joined === true;
-    if (!generation || generation.status.kind !== "done" || !key || (persistedJoined.has(key) && persistedJoined.get(key) === joined)) return;
+    if (!generation || !key) return;
+    for (const [pendingKey, pending] of pendingActive) if (pending.agent === agent && pendingKey !== key) clearPending(pendingKey);
+    if (generation.status.kind === "running" && !persistedActive.has(key)) {
+      const retainedSessionFile = agent.sessionFileForResume?.();
+      const paneSurface = agent.retainedPaneSurface?.();
+      const lease = retainedSessionFile && paneSurface
+        ? projectActivePaneGenerationLease(snapshot, retainedSessionFile, paneSurface)
+        : undefined;
+      const pending = pendingActive.get(key);
+      if (pending && (!lease || pending.identity !== leaseIdentity(lease))) clearPending(key);
+      if (lease && !persistedActive.has(key)) {
+        clearPending(key);
+        try {
+          pi.appendEntry!("subagent-active-pane-lease", lease);
+          persistedActive.add(key);
+        } catch (error) {
+          scheduleRetry(agent, key, lease);
+          throw error;
+        }
+      }
+    } else {
+      clearPending(key);
+    }
+    const joined = generation.joined === true;
+    if (generation.status.kind !== "done" || (persistedJoined.has(key) && persistedJoined.get(key) === joined)) return;
     persistedJoined.set(key, joined);
     const retainedSessionFile = agent.sessionFileForResume?.();
     pi.appendEntry!("subagent-generation-index", projectSubagentGenerationIndex(snapshot, retainedSessionFile));
   });
+  return () => {
+    for (const pending of pendingActive.values()) clearTimeout(pending.timer);
+    pendingActive.clear();
+    unsubscribe();
+  };
 }
 
 export interface SubagentGenerationIndexV4 {
@@ -202,6 +270,81 @@ export interface SubagentGenerationIndexV5 {
   readonly requestedOverrides?: ConversationSnapshot["requestedOverrides"];
   readonly retainedSessionFile?: string;
   readonly joined: boolean;
+}
+
+export interface SubagentActivePaneGenerationLeaseV1 {
+  readonly version: 1;
+  readonly subagentId: string;
+  readonly generation: number;
+  readonly agent: string;
+  readonly label: string;
+  readonly kind: "spawn" | "resume";
+  readonly conversationCreatedAt: number;
+  readonly createdAt: number;
+  readonly startedAt: number;
+  readonly prompt: string;
+  readonly parentConversationId?: string;
+  readonly startedInParentGeneration?: number;
+  readonly requestedConfig: ConversationSnapshot["requestedConfig"];
+  readonly requestedOverrides?: ConversationSnapshot["requestedOverrides"];
+  readonly retainedSessionFile: string;
+  readonly paneSurface: string;
+  readonly childId: string;
+  readonly generations: readonly SubagentActivePaneGenerationHistoryV1[];
+}
+
+export interface SubagentActivePaneGenerationHistoryV1 {
+  readonly generation: number;
+  readonly kind: "spawn" | "resume";
+  readonly createdAt: number;
+  readonly startedAt?: number;
+  readonly completedAt?: number;
+  readonly status: "running" | "completed" | "error" | "aborted" | "interrupted" | "skipped";
+  readonly prompt: string;
+  readonly startedInParentGeneration?: number;
+  readonly joined: boolean;
+}
+
+/** Projects a running pane generation only after its resumable session and pane identity exist. */
+export function projectActivePaneGenerationLease(
+  snapshot: ReturnType<Conversation["snapshot"]>,
+  retainedSessionFile: string,
+  paneSurface: string,
+): SubagentActivePaneGenerationLeaseV1 | undefined {
+  const generation = snapshot.generations.at(-1);
+  if (!generation || generation.status.kind !== "running" || !retainedSessionFile.trim() || !paneSurface.trim()) return;
+  return {
+    version: 1,
+    subagentId: snapshot.conversationId,
+    generation: generation.generation,
+    agent: snapshot.agent.name,
+    label: snapshot.label,
+    kind: generation.kind,
+    conversationCreatedAt: snapshot.createdAt,
+    createdAt: generation.createdAt,
+    startedAt: generation.status.startedAt,
+    prompt: generation.prompt,
+    ...(snapshot.parentConversationId ? { parentConversationId: snapshot.parentConversationId } : {}),
+    ...(generation.startedInParentGeneration !== undefined ? { startedInParentGeneration: generation.startedInParentGeneration } : {}),
+    requestedConfig: snapshot.requestedConfig,
+    ...(snapshot.requestedOverrides ? { requestedOverrides: snapshot.requestedOverrides } : {}),
+    retainedSessionFile,
+    paneSurface,
+    childId: `${snapshot.conversationId}:${generation.generation}`,
+    generations: snapshot.generations.map(item => ({
+      generation: item.generation,
+      kind: item.kind,
+      createdAt: item.createdAt,
+      ...(item.status.kind === "running" ? { startedAt: item.status.startedAt, status: "running" as const } : item.status.kind === "done" ? {
+        status: item.status.outcome,
+        ...(item.status.startedAt !== undefined ? { startedAt: item.status.startedAt } : {}),
+        completedAt: item.status.completedAt,
+      } : { status: "running" as const }),
+      prompt: item.prompt,
+      ...(item.startedInParentGeneration !== undefined ? { startedInParentGeneration: item.startedInParentGeneration } : {}),
+      joined: item.joined,
+    })),
+  };
 }
 
 export type SubagentGenerationIndex = SubagentGenerationIndexV4 | SubagentGenerationIndexV5;
@@ -266,11 +409,57 @@ export function readSubagentGenerationIndexes(branch: readonly unknown[], parent
   return [...latest.values()].sort((left, right) => left.subagentId.localeCompare(right.subagentId) || left.generation - right.generation);
 }
 
+export function readActivePaneGenerationLeases(branch: readonly unknown[], parentSessionFile?: string): SubagentActivePaneGenerationLeaseV1[] {
+  const active = new Map<string, SubagentActivePaneGenerationLeaseV1>();
+  const terminal = new Set<string>();
+  for (const entry of branch) {
+    if (!isObject(entry) || entry.type !== "custom") continue;
+    if (entry.customType === "subagent-generation-index") {
+      const record = parseSubagentGenerationIndex(entry.data);
+      if (record) {
+        const key = generationKey({ conversationId: record.subagentId as ConversationSnapshot["conversationId"], generation: record.generation });
+        terminal.add(key);
+        active.delete(key);
+      }
+    } else if (entry.customType === "subagent-active-pane-lease") {
+      const record = parseActivePaneGenerationLease(entry.data, parentSessionFile);
+      if (record) {
+        const key = generationKey({ conversationId: record.subagentId as ConversationSnapshot["conversationId"], generation: record.generation });
+        if (!terminal.has(key)) active.set(key, record);
+      }
+    }
+  }
+  return [...active.values()].sort((left, right) => left.subagentId.localeCompare(right.subagentId) || left.generation - right.generation);
+}
+
 function sanitizeRecoveredIndex(record: SubagentGenerationIndex, parentSessionFile: string | undefined): SubagentGenerationIndex | undefined {
   if (record.version !== 5 || record.retainedSessionFile === undefined) return record;
   if (!parentSessionFile) return { ...record, retainedSessionFile: undefined };
   const expected = retainedChildSessionFile(parentSessionFile, record.subagentId, record.generation);
   return record.retainedSessionFile === expected && isOrdinaryFile(expected) ? record : { ...record, retainedSessionFile: undefined };
+}
+
+function parseActivePaneGenerationLease(value: unknown, parentSessionFile: string | undefined): SubagentActivePaneGenerationLeaseV1 | undefined {
+  if (!isObject(value) || value.version !== 1 || typeof value.subagentId !== "string" || !value.subagentId || !Number.isSafeInteger(value.generation) || (value.generation as number) < 1) return;
+  if (typeof value.agent !== "string" || !value.agent || typeof value.label !== "string" || (value.kind !== "spawn" && value.kind !== "resume")) return;
+  if (!isTimestamp(value.conversationCreatedAt) || !isTimestamp(value.createdAt) || !isTimestamp(value.startedAt) || typeof value.prompt !== "string") return;
+  if (!isObject(value.requestedConfig) || (value.requestedOverrides !== undefined && !isObject(value.requestedOverrides))) return;
+  if (typeof value.retainedSessionFile !== "string" || typeof value.paneSurface !== "string" || typeof value.childId !== "string" || !value.retainedSessionFile.trim() || !value.paneSurface.trim() || !value.childId.trim() || value.childId !== `${value.subagentId}:${value.generation}`) return;
+  if (!parentSessionFile) return;
+  const expected = retainedChildSessionFile(parentSessionFile, value.subagentId, value.generation as number);
+  if (value.retainedSessionFile !== expected || !isOrdinaryFile(expected)) return;
+  if (!Array.isArray(value.generations) || !value.generations.length || value.generations.length !== value.generation) return;
+  const generations = value.generations as unknown[];
+  if (generations.some((item, index) => !isActivePaneGenerationHistory(item, index + 1))) return;
+  const latest = generations.at(-1);
+  if (!isObject(latest) || latest.status !== "running") return;
+  return value as unknown as SubagentActivePaneGenerationLeaseV1;
+}
+
+function isActivePaneGenerationHistory(value: unknown, expectedGeneration: number): boolean {
+  if (!isObject(value) || value.generation !== expectedGeneration || (value.kind !== (expectedGeneration === 1 ? "spawn" : "resume")) || !isTimestamp(value.createdAt) || typeof value.prompt !== "string" || typeof value.joined !== "boolean") return false;
+  if (value.status === "running") return isTimestamp(value.startedAt);
+  return isTerminalStatus(value.status) && isTimestamp(value.completedAt) && (value.startedAt === undefined || isTimestamp(value.startedAt));
 }
 
 function isOrdinaryFile(file: string): boolean {

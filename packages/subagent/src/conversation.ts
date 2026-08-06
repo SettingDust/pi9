@@ -138,6 +138,24 @@ export interface RestoredTerminalGeneration {
   readonly joined: boolean;
 }
 
+export type RestoredActiveGeneration = {
+  readonly generation: number;
+  readonly kind: GenerationKind;
+  readonly startedInParentGeneration?: number;
+  readonly prompt: string;
+  readonly createdAt: number;
+  readonly status: { readonly kind: "queued"; readonly queuedAt: number };
+  readonly joined?: false;
+} | {
+  readonly generation: number;
+  readonly kind: GenerationKind;
+  readonly startedInParentGeneration?: number;
+  readonly prompt: string;
+  readonly createdAt: number;
+  readonly status: { readonly kind: "running"; readonly startedAt: number };
+  readonly joined?: false;
+};
+
 export interface RestoredTerminalConversation {
   readonly conversationId: ConversationId;
   readonly definition: AgentDefinition;
@@ -150,9 +168,15 @@ export interface RestoredTerminalConversation {
   readonly generations: readonly RestoredTerminalGeneration[];
 }
 
+export interface RestoredActiveConversation extends Omit<RestoredTerminalConversation, "generations"> {
+  readonly generations: readonly [...RestoredTerminalGeneration[], RestoredActiveGeneration];
+}
+
+type RestoredGeneration = RestoredTerminalGeneration | RestoredActiveGeneration;
+
 interface GenerationConstructionOptions {
   readonly createdAt?: number;
-  readonly status?: DoneGenerationStatus;
+  readonly status?: GenerationViewStatus;
   readonly joined?: boolean;
 }
 
@@ -163,7 +187,8 @@ interface ConversationConstructionOptions {
   readonly requestedConfig?: RequestedExecutionConfig;
   readonly requestedOverrides?: ExecutionOverrides;
   readonly retainedSessionFile?: string;
-  readonly restoredGenerations?: readonly RestoredTerminalGeneration[];
+  readonly restoredGenerations?: readonly RestoredGeneration[];
+  readonly restoreActiveGeneration?: boolean;
 }
 
 /** One append-only execution generation within a conversation. Object identity is its exact internal key. */
@@ -190,7 +215,8 @@ export class Generation {
       throw new Error(`Invalid parent generation number: ${startedInParentGeneration}.`);
     }
     this.activity = new GenerationActivity(onChange, event => this.handleSessionEvent(event));
-    if (options.status) this.state = Object.freeze({ ...options.status });
+    if (options.status?.kind === "running") this.state = Object.freeze({ kind: "running", startedAt: options.status.startedAt });
+    else if (options.status?.kind === "done") this.state = Object.freeze({ ...options.status });
     if (options.joined !== undefined) this.joined = options.joined;
   }
 
@@ -203,8 +229,9 @@ export class Generation {
   }
 
   attachControl(control: GenerationControl): void {
-    if (this.state.kind !== "queued") throw new Error(`Cannot attach a control to a generation that is ${this.state.kind}.`);
-    this.state = { kind: "running", control, startedAt: Date.now() };
+    if (this.state.kind === "queued") this.state = { kind: "running", control, startedAt: Date.now() };
+    else if (this.state.kind === "running" && !this.state.session && !this.state.control) this.state = { ...this.state, control };
+    else throw new Error(`Cannot attach a control to a generation that is ${this.state.kind}.`);
   }
 
   acceptSteer(deliveryText: string): SteerReceipt {
@@ -326,7 +353,7 @@ export class Conversation {
       ...(spawn.thinking !== undefined ? { thinking: spawn.thinking } : {}),
     });
     if (options.retainedSessionFile) this.retainedSessionFile = options.retainedSessionFile;
-    if (options.restoredGenerations) this.generations.push(...this.restoreGenerations(options.restoredGenerations));
+    if (options.restoredGenerations) this.generations.push(...this.restoreGenerations(options.restoredGenerations, options.restoreActiveGeneration ?? false));
     else this.generations.push(this.newGeneration(1, spawn.prompt, options.startedInParentGeneration));
   }
 
@@ -345,6 +372,25 @@ export class Conversation {
       requestedOverrides: input.requestedOverrides,
       retainedSessionFile: input.retainedSessionFile,
       restoredGenerations: input.generations,
+    });
+  }
+
+  static restoreActive(input: RestoredActiveConversation, listener: ConversationUpdateListener): Conversation {
+    const firstGeneration = input.generations[0];
+    if (!firstGeneration) throw new Error(`Cannot restore conversation ${input.conversationId} without generations.`);
+    return new Conversation(input.conversationId, input.definition, {
+      kind: "spawn",
+      agent: input.definition.name,
+      prompt: firstGeneration.prompt,
+      label: input.label,
+    }, listener, {
+      createdAt: input.createdAt,
+      parentConversationId: input.parentConversationId,
+      requestedConfig: input.requestedConfig,
+      requestedOverrides: input.requestedOverrides,
+      retainedSessionFile: input.retainedSessionFile,
+      restoredGenerations: input.generations,
+      restoreActiveGeneration: true,
     });
   }
 
@@ -369,14 +415,21 @@ export class Conversation {
     return new Generation(number, prompt, update => this.listener(this, update), startedInParentGeneration, options);
   }
 
-  private restoreGenerations(restored: readonly RestoredTerminalGeneration[]): Generation[] {
+  private restoreGenerations(restored: readonly RestoredGeneration[], allowActiveFinalGeneration: boolean): Generation[] {
     if (!restored.length) throw new Error(`Cannot restore conversation ${this.conversationId} without generations.`);
     return restored.map((generation, index) => {
       const expectedNumber = index + 1;
       const expectedKind: GenerationKind = expectedNumber === 1 ? "spawn" : "resume";
+      const active = generation.status.kind !== "done";
       if (generation.generation !== expectedNumber) throw new Error(`Restored generation ${generation.generation} is out of order.`);
       if (generation.kind !== expectedKind) throw new Error(`Restored generation ${generation.generation} must be ${expectedKind}.`);
-      if (generation.status.kind !== "done") throw new Error(`Restored generation ${generation.generation} is not terminal.`);
+      if (active !== (allowActiveFinalGeneration && index === restored.length - 1)) {
+        throw new Error(`Restored generation ${generation.generation} is ${active ? "active" : "terminal"} in an invalid position.`);
+      }
+      if (active && generation.joined) throw new Error(`Restored active generation ${generation.generation} cannot be joined.`);
+      if (generation.status.kind === "queued" && generation.status.queuedAt !== generation.createdAt) {
+        throw new Error(`Restored queued generation ${generation.generation} must use its creation time.`);
+      }
       return this.newGeneration(generation.generation, generation.prompt, generation.startedInParentGeneration, {
         createdAt: generation.createdAt,
         status: generation.status,
@@ -408,6 +461,7 @@ export class Conversation {
     this.unsubscribe = generation.activity.subscribe(session);
     this.listener(this, "status");
   }
+  /** Binds a newly created or recovered pane control without starting an execution. */
   bindControl(generation: Generation, control: GenerationControl): void {
     if (generation !== this.requireCurrentGeneration()) throw new Error(`Generation ${generation.number} is no longer current.`);
     generation.attachControl(control);

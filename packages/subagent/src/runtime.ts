@@ -16,13 +16,17 @@ import {
   type GenerationSnapshot,
   type GenerationViewStatus,
   type NestedJoinTargetSnapshot,
+  type RestoredActiveConversation,
   type RestoredTerminalConversation,
   type RestoredTerminalGeneration,
   type SteerReceipt,
+  completedGeneration,
+  errorGeneration,
+  interruptedGeneration,
 } from "./conversation.js";
 import { resolveModel, resolveTaskCwd } from "./execute.js";
 import { ConversationIdAllocator, isConversationId, type ConversationId, type SubagentId } from "./identifiers.js";
-import { readPaneCompletionOutput } from "./pane-execution.js";
+import { readPaneCompletionOutcome, readPaneCompletionOutput, rebindPaneExecution, type PaneCompletionOutcome } from "./pane-execution.js";
 import { GenerationScheduler, type GenerationExecutor } from "./scheduler.js";
 import { projectLiveSubagent, projectSubagentGenerationStatus, projectSubagentStatus, type CanonicalLiveSubagent, type FailureProjectionMode } from "./contract.js";
 import type { SubagentStatus, SpawnRequest, ResumeRequest } from "./schema.js";
@@ -121,6 +125,58 @@ interface RecoverableGroup {
   readonly id: ConversationId;
   readonly input: RestoredTerminalConversation;
   readonly completedAt: number;
+}
+
+export interface ActivePaneRecoveryGeneration {
+  readonly generation: number;
+  readonly kind: GenerationKind;
+  readonly createdAt: number;
+  readonly startedAt?: number;
+  readonly completedAt?: number;
+  readonly status: "running" | "completed" | "error" | "aborted" | "interrupted" | "skipped";
+  readonly prompt: string;
+  readonly startedInParentGeneration?: number;
+  readonly joined: boolean;
+}
+
+/** Structural lease shape; the persistence layer may own its concrete record type. */
+export interface ActivePaneRecoveryRecord {
+  readonly subagentId: string;
+  readonly generation: number;
+  readonly agent: string;
+  readonly label: string;
+  readonly kind: GenerationKind;
+  readonly conversationCreatedAt: number;
+  readonly createdAt: number;
+  readonly startedAt: number;
+  readonly prompt: string;
+  readonly parentConversationId?: string;
+  readonly startedInParentGeneration?: number;
+  readonly requestedConfig: RequestedExecutionConfig;
+  readonly requestedOverrides?: ExecutionOverrides;
+  readonly retainedSessionFile: string;
+  readonly paneSurface: string;
+  readonly childId: string;
+  readonly generations: readonly ActivePaneRecoveryGeneration[];
+}
+
+export type ActivePaneRecoveryResult =
+  | { readonly ok: true; readonly conversationId: ConversationId; readonly generation: number }
+  | { readonly ok: false; readonly conversationId: string; readonly generation?: number; readonly error: string };
+
+export interface ActivePaneRecoveryDependencies {
+  rebindPaneExecution: typeof rebindPaneExecution;
+}
+
+const DEFAULT_ACTIVE_PANE_RECOVERY_DEPENDENCIES: ActivePaneRecoveryDependencies = { rebindPaneExecution };
+
+interface RecoverableActivePane {
+  readonly id: ConversationId;
+  readonly input: RestoredActiveConversation;
+  readonly surface: string;
+  readonly sessionFile: string;
+  readonly childId: string;
+  readonly completion?: PaneCompletionOutcome;
 }
 
 /** Owns retained conversations. Generations are addressed internally by their object identity. */
@@ -279,6 +335,218 @@ export class SubagentRuntime {
       pending = deferred;
     }
     return restored;
+  }
+
+  /**
+   * Restores a mixed persisted graph. Active leases reserve capacity first; their terminal
+   * ancestors are restored to a fixed point before ordinary terminal history fills the remainder.
+   */
+  async recoverPersistedConversations(
+    terminalRecords: readonly TerminalRecoveryRecord[],
+    activeRecords: readonly ActivePaneRecoveryRecord[],
+    maxRecoveredConversations?: number,
+    dependencies: ActivePaneRecoveryDependencies = DEFAULT_ACTIVE_PANE_RECOVERY_DEPENDENCIES,
+  ): Promise<{ readonly active: readonly ActivePaneRecoveryResult[]; readonly terminals: number }> {
+    const active = new Map<ConversationId, ActivePaneRecoveryRecord>();
+    for (const record of activeRecords) {
+      const candidate = this.toRecoverableActivePane(record);
+      if (candidate && !this.conversations.has(candidate.id) && !active.has(candidate.id)) active.set(candidate.id, record);
+    }
+    const activeCandidates = [...active.values()];
+    const maxTerminalRecoveries = maxRecoveredConversations ?? Number.POSITIVE_INFINITY;
+    const priorityTerminalRecords = activeTerminalAncestors(terminalRecords, activeCandidates);
+    let terminals = 0;
+    const pendingActive = new Map(activeCandidates.map(record => [record.subagentId, record]));
+    const activeResults = new Map<string, ActivePaneRecoveryResult>();
+
+    // A terminal parent can depend on an active grandparent, so alternate until no edge resolves.
+    while (pendingActive.size) {
+      let progressed = false;
+      const priorityCapacity = Math.max(0, this.maxConversations - this.conversations.size - pendingActive.size);
+      const priorityBudget = Math.min(maxTerminalRecoveries - terminals, priorityCapacity);
+      if (priorityBudget > 0) {
+        const restored = this.restoreTerminalConversations(priorityTerminalRecords, priorityBudget);
+        terminals += restored;
+        progressed ||= restored > 0;
+      }
+      const ready = [...pendingActive.values()].filter(record => !record.parentConversationId || this.conversations.has(record.parentConversationId as ConversationId));
+      if (!ready.length) {
+        if (!progressed) break;
+        continue;
+      }
+      const results = await this.restoreActivePaneConversations(ready, dependencies);
+      for (let index = 0; index < ready.length; index++) {
+        const record = ready[index];
+        const result = results[index]!;
+        pendingActive.delete(record.subagentId);
+        activeResults.set(record.subagentId, result);
+        if (result.ok) progressed = true;
+      }
+      if (!progressed) break;
+    }
+    for (const record of pendingActive.values()) {
+      activeResults.set(record.subagentId, activeRecoveryFailure(record, `Parent conversation ${record.parentConversationId} is unavailable.`));
+    }
+
+    const remainingTerminalBudget = Math.min(
+      maxTerminalRecoveries - terminals,
+      Math.max(0, this.maxConversations - this.conversations.size),
+    );
+    if (remainingTerminalBudget > 0) {
+      const restored = this.restoreTerminalConversations(terminalRecords, remainingTerminalBudget);
+      terminals += restored;
+    }
+    return {
+      active: activeRecords.map(record => activeResults.get(record.subagentId) ?? activeRecoveryFailure(record, "Invalid active pane recovery record.")),
+      terminals,
+    };
+  }
+
+  /** Restores only positively rebound, already-running panes; it never launches or schedules execution. */
+  async restoreActivePaneConversations(
+    records: readonly ActivePaneRecoveryRecord[],
+    dependencies: ActivePaneRecoveryDependencies = DEFAULT_ACTIVE_PANE_RECOVERY_DEPENDENCIES,
+  ): Promise<readonly ActivePaneRecoveryResult[]> {
+    const results: ActivePaneRecoveryResult[] = new Array(records.length);
+    const candidates = new Map<ConversationId, { index: number; value: RecoverableActivePane }>();
+    for (let index = 0; index < records.length; index++) {
+      const record = records[index];
+      const candidate = this.toRecoverableActivePane(record);
+      if (!candidate) results[index] = activeRecoveryFailure(record, "Invalid active pane recovery record.");
+      else if (this.conversations.has(candidate.id) || candidates.has(candidate.id)) results[index] = activeRecoveryFailure(record, `Conversation ${candidate.id} is already claimed.`);
+      else candidates.set(candidate.id, { index, value: candidate });
+    }
+
+    const pending = new Map(candidates);
+    while (pending.size) {
+      let progressed = false;
+      for (const [id, candidate] of [...pending]) {
+        const parentId = candidate.value.input.parentConversationId;
+        if (parentId && !this.conversations.has(parentId)) {
+          if (pending.has(parentId)) continue;
+          results[candidate.index] = activeRecoveryFailure(records[candidate.index], `Parent conversation ${parentId} is unavailable.`);
+          pending.delete(id);
+          progressed = true;
+          continue;
+        }
+        if (this.conversations.size >= this.maxConversations) {
+          results[candidate.index] = activeRecoveryFailure(records[candidate.index], this.capacityError());
+          pending.delete(id);
+          progressed = true;
+          continue;
+        }
+        try {
+          await this.restoreActivePane(candidate.value, dependencies);
+          results[candidate.index] = { ok: true, conversationId: id, generation: candidate.value.input.generations.at(-1)!.generation };
+        } catch (error) {
+          results[candidate.index] = activeRecoveryFailure(records[candidate.index], error instanceof Error ? error.message : String(error));
+        }
+        pending.delete(id);
+        progressed = true;
+      }
+      if (!progressed) {
+        for (const { index } of pending.values()) results[index] = activeRecoveryFailure(records[index], "Active recovery parent chain is cyclic.");
+        break;
+      }
+    }
+    return results;
+  }
+
+  private toRecoverableActivePane(record: ActivePaneRecoveryRecord): RecoverableActivePane | undefined {
+    if (!isActivePaneRecoveryRecord(record) || !isRetainedSessionFile(record.retainedSessionFile)) return;
+    const definition = this.registry.agents.get(record.agent);
+    if (!definition) return;
+    const latest = record.generations.at(-1);
+    if (!latest || latest.status !== "running" || latest.startedAt === undefined) return;
+    const generations: RestoredActiveConversation["generations"] = [
+      ...record.generations.slice(0, -1).map(toRestoredTerminalGeneration),
+      {
+        generation: latest.generation,
+        kind: latest.kind,
+        ...(latest.startedInParentGeneration !== undefined ? { startedInParentGeneration: latest.startedInParentGeneration } : {}),
+        prompt: latest.prompt,
+        createdAt: latest.createdAt,
+        status: { kind: "running", startedAt: latest.startedAt },
+      },
+    ];
+    const input: RestoredActiveConversation = {
+      conversationId: record.subagentId as ConversationId,
+      definition,
+      label: record.label,
+      createdAt: record.conversationCreatedAt,
+      ...(record.parentConversationId ? { parentConversationId: record.parentConversationId as ConversationId } : {}),
+      requestedConfig: record.requestedConfig,
+      ...(record.requestedOverrides ? { requestedOverrides: record.requestedOverrides } : {}),
+      retainedSessionFile: record.retainedSessionFile,
+      generations,
+    };
+    try { Conversation.restoreActive(input, () => {}); }
+    catch { return; }
+    const completion = readPaneCompletionOutcome(record.retainedSessionFile);
+    return {
+      id: input.conversationId,
+      input,
+      surface: record.paneSurface,
+      sessionFile: record.retainedSessionFile,
+      childId: record.childId,
+      ...(completion ? { completion } : {}),
+    };
+  }
+
+  private async restoreActivePane(candidate: RecoverableActivePane, dependencies: ActivePaneRecoveryDependencies): Promise<void> {
+    // Construct the recovered state before claiming its finite ID.
+    const conversation = Conversation.restoreActive(candidate.input, (changed, kind) => this.updated(changed, kind));
+    const generation = conversation.latestGeneration;
+
+    if (candidate.completion) {
+      if (!this.conversationIds.claim(candidate.id)) throw new Error(`Conversation ${candidate.id} is already claimed.`);
+      this.conversations.set(candidate.id, conversation);
+      this.settleRecoveredPane(conversation, generation, candidate.completion);
+      return;
+    }
+
+    const execution = await dependencies.rebindPaneExecution({
+      surface: candidate.surface,
+      sessionFile: candidate.sessionFile,
+      childId: candidate.childId,
+      onActivity: (snapshot, usage) => { if (snapshot) generation.activity.observe(snapshot, usage as never); },
+    });
+    if (!this.conversationIds.claim(candidate.id)) {
+      execution.close();
+      throw new Error(`Conversation ${candidate.id} is already claimed.`);
+    }
+    this.conversations.set(candidate.id, conversation);
+    // bindControl emits the sole running-status update after the catalog can observe it.
+    conversation.retainPaneSurface(execution.surface, () => execution.close());
+    conversation.bindControl(generation, { steer: async text => execution.send(text), abort: async () => execution.interrupt() });
+    execution.observeActivity();
+
+    let finished = false;
+    const finish = (outcome?: PaneCompletionOutcome, error?: unknown) => {
+      if (finished) return;
+      finished = true;
+      if (error !== undefined) errorGeneration(conversation, generation, error instanceof Error ? error.message : String(error));
+      else if (outcome) this.settleRecoveredPane(conversation, generation, outcome);
+      execution.close();
+      conversation.clearRetainedPaneSurface(execution.surface);
+      conversation.executionSettled(generation);
+    };
+    void execution.waitForCompletion(undefined, () => execution.observeActivity()).then(
+      outcome => finish(outcome),
+      error => finish(undefined, error),
+    );
+  }
+
+  private settleRecoveredPane(conversation: Conversation, generation: Generation, outcome: PaneCompletionOutcome): void {
+    if (outcome.status === "cancelled") { interruptedGeneration(conversation, generation, "Agent interrupted."); return; }
+    switch (outcome.completion.type) {
+      case "structured_output": completedGeneration(conversation, generation, typeof outcome.completion.value === "string" ? outcome.completion.value : JSON.stringify(outcome.completion.value) ?? String(outcome.completion.value)); break;
+      case "ping": outcome.completion.name === "__subagent_setup_error__"
+        ? errorGeneration(conversation, generation, outcome.completion.message)
+        : completedGeneration(conversation, generation, outcome.completion.message); break;
+      case "failed": errorGeneration(conversation, generation, `Pane child exited with code ${outcome.completion.exitCode}.`); break;
+      case "done": completedGeneration(conversation, generation, ""); break;
+    }
   }
 
   private toRestoredConversation(id: ConversationId, definition: AgentDefinition, records: readonly TerminalRecoveryRecord[]): RestoredTerminalConversation | undefined {
@@ -722,6 +990,78 @@ export class SubagentRuntime {
 
 function isRetainedSessionFile(file: string): boolean {
   try { return statSync(file).isFile(); } catch { return false; }
+}
+
+function isActivePaneRecoveryRecord(record: ActivePaneRecoveryRecord): boolean {
+  if (!isConversationId(record.subagentId) || !record.agent || !record.label || record.parentConversationId === record.subagentId || !isTimestamp(record.conversationCreatedAt)
+    || !isTimestamp(record.createdAt) || !isTimestamp(record.startedAt) || typeof record.prompt !== "string"
+    || !isRequestedConfig(record.requestedConfig) || !record.retainedSessionFile.trim() || !record.paneSurface.trim()
+    || record.childId !== `${record.subagentId}:${record.generation}` || !Number.isSafeInteger(record.generation) || record.generation < 1
+    || (record.parentConversationId !== undefined && !isConversationId(record.parentConversationId))
+    || (record.startedInParentGeneration !== undefined && (!Number.isSafeInteger(record.startedInParentGeneration) || record.startedInParentGeneration < 1))
+    || (record.requestedOverrides !== undefined && !isExecutionOverrides(record.requestedOverrides))
+    || !Array.isArray(record.generations) || record.generations.length !== record.generation) return false;
+  return record.generations.every((generation, index) => isActivePaneRecoveryGeneration(generation, index + 1))
+    && record.generations.at(-1)?.status === "running"
+    && record.generations.at(-1)?.startedAt === record.startedAt
+    && record.kind === record.generations.at(-1)?.kind
+    && record.createdAt === record.generations.at(-1)?.createdAt
+    && record.prompt === record.generations.at(-1)?.prompt;
+}
+
+function isActivePaneRecoveryGeneration(generation: ActivePaneRecoveryGeneration, expected: number): boolean {
+  if (generation.generation !== expected || generation.kind !== (expected === 1 ? "spawn" : "resume")
+    || !isTimestamp(generation.createdAt) || typeof generation.prompt !== "string" || typeof generation.joined !== "boolean"
+    || (generation.startedInParentGeneration !== undefined && (!Number.isSafeInteger(generation.startedInParentGeneration) || generation.startedInParentGeneration < 1))) return false;
+  if (generation.status === "running") return generation.joined === false && isTimestamp(generation.startedAt) && generation.completedAt === undefined;
+  return isTerminalRecoveryStatus(generation.status) && isTimestamp(generation.completedAt)
+    && (generation.startedAt === undefined || isTimestamp(generation.startedAt));
+}
+
+function toRestoredTerminalGeneration(record: ActivePaneRecoveryGeneration): RestoredTerminalGeneration {
+  return {
+    generation: record.generation,
+    kind: record.kind,
+    ...(record.startedInParentGeneration !== undefined ? { startedInParentGeneration: record.startedInParentGeneration } : {}),
+    prompt: record.prompt,
+    createdAt: record.createdAt,
+    status: {
+      kind: "done",
+      outcome: record.status as RestoredTerminalGeneration["status"]["outcome"],
+      ...(record.startedAt !== undefined ? { startedAt: record.startedAt } : {}),
+      completedAt: record.completedAt!,
+    },
+    joined: record.joined,
+  };
+}
+
+function activeRecoveryFailure(record: Partial<ActivePaneRecoveryRecord>, error: string): ActivePaneRecoveryResult {
+  return { ok: false, conversationId: typeof record.subagentId === "string" ? record.subagentId : "", ...(typeof record.generation === "number" ? { generation: record.generation } : {}), error };
+}
+
+function activeTerminalAncestors(records: readonly TerminalRecoveryRecord[], active: readonly ActivePaneRecoveryRecord[]): TerminalRecoveryRecord[] {
+  const byId = new Map<ConversationId, TerminalRecoveryRecord[]>();
+  for (const record of records) {
+    if (!isRecoveryRecord(record)) continue;
+    const id = record.subagentId as ConversationId;
+    const group = byId.get(id) ?? [];
+    group.push(record);
+    byId.set(id, group);
+  }
+  const required = new Set<ConversationId>();
+  const visit = (rawParentId: string | undefined, seen: Set<ConversationId>) => {
+    if (!rawParentId || !isConversationId(rawParentId)) return;
+    const parentId = rawParentId as ConversationId;
+    if (seen.has(parentId)) return;
+    seen.add(parentId);
+    const group = byId.get(parentId);
+    if (!group) return;
+    required.add(parentId);
+    const latest = [...group].sort((left, right) => right.generation - left.generation)[0];
+    if (latest?.version === 5) visit(latest.parentConversationId, seen);
+  };
+  for (const record of active) visit(record.parentConversationId, new Set());
+  return records.filter(record => isRecoveryRecord(record) && required.has(record.subagentId as ConversationId));
 }
 
 function isRecoveryRecord(value: unknown): value is TerminalRecoveryRecord {

@@ -1,12 +1,12 @@
-import { test, expect } from "vitest";
+import { test, expect, vi } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { completedGeneration } from "../../src/conversation.js";
-import { readSubagentGenerationIndexes } from "../../src/index.js";
+import { readActivePaneGenerationLeases, readSubagentGenerationIndexes, registerSubagentMetadataPersistence } from "../../src/index.js";
 import { ConversationIdAllocator } from "../../src/identifiers.js";
-import { SubagentRuntime } from "../../src/runtime.js";
+import { SubagentRuntime, type TerminalRecoveryRecord } from "../../src/runtime.js";
 import { retainedChildSessionFile } from "../../src/pane-execution.js";
 
 const worker = {
@@ -210,10 +210,10 @@ test("skips malformed and unknown-agent records and claims restored IDs before a
   await start.completion;
   expect(start.starts[0]).toMatchObject({ ok: true, conversationId: "agile-alpaca" });
 });
-const temporaryRetainedSession = (sidecar?: string) => {
+const temporaryRetainedSession = (sidecar?: string, subagentId = "agile-acorn") => {
   const directory = mkdtempSync(path.join(tmpdir(), "subagent-recovery-"));
   const parentSessionFile = path.join(directory, "parent.jsonl");
-  const sessionFile = retainedChildSessionFile(parentSessionFile, "agile-acorn", 1);
+  const sessionFile = retainedChildSessionFile(parentSessionFile, subagentId, 1);
   mkdirSync(path.dirname(sessionFile), { recursive: true });
   writeFileSync(sessionFile, "");
   if (sidecar !== undefined) writeFileSync(`${sessionFile}.exit`, sidecar);
@@ -344,4 +344,180 @@ test("repeated joins retain an already hydrated restored output", async () => {
   } finally {
     retained.dispose();
   }
+});
+
+test("active lease persistence retries autonomously and drops stale leases", async () => {
+  vi.useFakeTimers();
+  try {
+    let listener: ((agent: any, kind: any) => void) | undefined;
+    let failOnce = true;
+    const entries: Array<{ customType: string; data: any }> = [];
+    registerSubagentMetadataPersistence({ appendEntry: (customType, data) => {
+      if (failOnce) { failOnce = false; throw new Error("temporary append failure"); }
+      entries.push({ customType, data });
+    } }, { onConversationUpdate: next => { listener = next; return () => {}; } });
+    const snapshot = { conversationId: "agile-acorn", label: "recovered", agent: { name: "worker" }, createdAt: 10, requestedConfig: {}, generations: [{ generation: 1, kind: "spawn", createdAt: 11, prompt: "original prompt", joined: false, status: { kind: "running", startedAt: 12 } }] };
+    const agent: any = { snapshot: () => snapshot, sessionFileForResume: () => "/sessions/agile-acorn.jsonl", retainedPaneSurface: () => "pane-1" };
+
+    expect(() => listener?.(agent, "status")).toThrow("temporary append failure");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(entries).toEqual([{ customType: "subagent-active-pane-lease", data: expect.objectContaining({ retainedSessionFile: "/sessions/agile-acorn.jsonl", paneSurface: "pane-1", childId: "agile-acorn:1" }) }]);
+
+    let staleListener: ((agent: any, kind: any) => void) | undefined;
+    const staleEntries: Array<{ customType: string; data: any }> = [];
+    registerSubagentMetadataPersistence({ appendEntry: (customType, data) => { staleEntries.push({ customType, data }); throw new Error("temporary append failure"); } }, { onConversationUpdate: next => { staleListener = next; return () => {}; } });
+    const staleSnapshot: any = { ...snapshot, conversationId: "agile-alpaca", generations: [{ ...snapshot.generations[0], status: { kind: "running", startedAt: 12 } }] };
+    const staleAgent: any = { snapshot: () => staleSnapshot, sessionFileForResume: () => "/sessions/agile-alpaca.jsonl", retainedPaneSurface: () => "pane-2" };
+    expect(() => staleListener?.(staleAgent, "status")).toThrow("temporary append failure");
+    staleSnapshot.generations[0].status = { kind: "done", outcome: "completed", completedAt: 13 };
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(staleEntries).toHaveLength(1);
+
+    let permanentListener: ((agent: any, kind: any) => void) | undefined;
+    const permanentEntries: Array<{ customType: string; data: any }> = [];
+    registerSubagentMetadataPersistence({ appendEntry: (customType, data) => {
+      permanentEntries.push({ customType, data });
+      if (customType === "subagent-active-pane-lease") throw new Error("permanent append failure");
+    } }, { onConversationUpdate: next => { permanentListener = next; return () => {}; } });
+    const permanentSnapshot: any = { ...snapshot, conversationId: "agile-antelope" };
+    const permanentAgent: any = { snapshot: () => permanentSnapshot, sessionFileForResume: () => "/sessions/agile-antelope.jsonl", retainedPaneSurface: () => "pane-3" };
+
+    expect(() => permanentListener?.(permanentAgent, "status")).toThrow("permanent append failure");
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(permanentEntries.filter(entry => entry.customType === "subagent-active-pane-lease")).toHaveLength(4);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(permanentEntries.filter(entry => entry.customType === "subagent-active-pane-lease")).toHaveLength(4);
+
+    permanentSnapshot.generations[0].status = { kind: "done", outcome: "completed", completedAt: 13 };
+    permanentListener?.(permanentAgent, "status");
+    expect(permanentEntries.at(-1)).toMatchObject({ customType: "subagent-generation-index" });
+  } finally { vi.useRealTimers(); }
+});
+
+test("active lease reader rejects spoofed sessions and permanently prefers terminal evidence", () => {
+  const retained = temporaryRetainedSession();
+  try {
+    const active = activeLease(retained);
+    const spoofed = { ...active, retainedSessionFile: path.join(path.dirname(retained.parentSessionFile), "spoofed.jsonl") };
+    expect(readActivePaneGenerationLeases([custom(spoofed)], retained.parentSessionFile)).toEqual([]);
+    expect(readActivePaneGenerationLeases([custom(active), custom(v5({ retainedSessionFile: retained.sessionFile })), custom(active)], retained.parentSessionFile)).toEqual([]);
+  } finally { retained.dispose(); }
+});
+
+test("restores a valid active pane by rebinding its existing controls without scheduling or launching", async () => {
+  const retained = temporaryRetainedSession();
+  try {
+    const recoveredExecutor = vi.fn(executor);
+    const runtime = new SubagentRuntime(registry, 1, recoveredExecutor);
+    let complete!: (value: any) => void;
+    const completion = new Promise(resolve => { complete = resolve; });
+    const execution = { surface: "pane-1", send: vi.fn(), interrupt: vi.fn(() => complete({ status: "cancelled" })), observeActivity: vi.fn(), waitForCompletion: vi.fn(() => completion), close: vi.fn() };
+    const rebindPaneExecution = vi.fn(async () => execution);
+
+    await expect(runtime.restoreActivePaneConversations([activeLease(retained)], { rebindPaneExecution } as any)).resolves.toEqual([{ ok: true, conversationId: "agile-acorn", generation: 1 }]);
+    expect(rebindPaneExecution).toHaveBeenCalledOnce();
+    expect(recoveredExecutor).not.toHaveBeenCalled();
+    expect(runtime.conversation("agile-acorn")).toMatchObject({ generations: [{ status: { kind: "running" } }] });
+    await runtime.steerSubagent("agile-acorn" as any, "continue");
+    expect(execution.send).toHaveBeenCalledWith("continue");
+    await runtime.cancelSubagent("agile-acorn" as any);
+    expect(execution.interrupt).toHaveBeenCalledOnce();
+    expect(runtime.conversation("agile-acorn").generations[0]!.status).toMatchObject({ kind: "done", outcome: "aborted" });
+  } finally { retained.dispose(); }
+});
+
+test("prewritten pane completion settles and hydrates without rebinding an unavailable surface", async () => {
+  const retained = temporaryRetainedSession(JSON.stringify({ type: "structured_output", value: "recovered" }));
+  try {
+    const runtime = new SubagentRuntime(registry, 1, executor);
+    const rebindPaneExecution = vi.fn(async () => { throw new Error("surface unavailable"); });
+    await expect(runtime.restoreActivePaneConversations([activeLease(retained)], { rebindPaneExecution } as any)).resolves.toEqual([{ ok: true, conversationId: "agile-acorn", generation: 1 }]);
+    expect(rebindPaneExecution).not.toHaveBeenCalled();
+    const join = runtime.bindSubagentJoin(["agile-acorn" as any]);
+    await join.completion;
+    expect(join.project()[0]!.status).toMatchObject({ kind: "done", outcome: "completed", output: "recovered" });
+    join.release();
+  } finally { retained.dispose(); }
+});
+
+function activeLease(retained: { sessionFile: string }, subagentId = "agile-acorn", parentConversationId?: string) {
+  return { version: 1 as const, subagentId, generation: 1, agent: "worker", label: "recovered", kind: "spawn" as const, conversationCreatedAt: 10, createdAt: 11, startedAt: 12, prompt: "original prompt", requestedConfig: {}, ...(parentConversationId ? { parentConversationId } : {}), retainedSessionFile: retained.sessionFile, paneSurface: "pane-1", childId: `${subagentId}:1`, generations: [{ generation: 1, kind: "spawn" as const, createdAt: 11, startedAt: 12, status: "running" as const, prompt: "original prompt", joined: false }] };
+}
+
+function terminal(subagentId: string, parentConversationId?: string): TerminalRecoveryRecord {
+  return { version: 5, subagentId, generation: 1, agent: "worker", label: "recovered", kind: "spawn", status: "completed", conversationCreatedAt: 10, createdAt: 11, completedAt: 12, prompt: "original prompt", ...(parentConversationId ? { parentConversationId } : {}), requestedConfig: {}, joined: true };
+}
+
+function reboundPane(surface: string) {
+  return { surface, send: vi.fn(), interrupt: vi.fn(), close: vi.fn(), wait: vi.fn(), observeActivity: vi.fn(), waitForCompletion: vi.fn(() => new Promise<never>(() => {})) };
+}
+
+test("mixed recovery reserves capacity for an active pane before unrelated terminal history", async () => {
+  const retained = temporaryRetainedSession();
+  try {
+    const runtime = new SubagentRuntime(registry, 1, executor, 2);
+    const execution = reboundPane("pane-1");
+    const rebindPaneExecution = vi.fn(async () => execution);
+    const recovered = await runtime.recoverPersistedConversations(
+      [terminal("agile-alpaca"), terminal("agile-antelope")],
+      [activeLease(retained)], 2, { rebindPaneExecution },
+    );
+
+    expect(recovered).toMatchObject({ active: [{ ok: true, conversationId: "agile-acorn" }], terminals: 1 });
+    expect(rebindPaneExecution).toHaveBeenCalledOnce();
+    expect(runtime.conversation("agile-acorn").generations[0]!.status).toMatchObject({ kind: "running" });
+    expect(runtime.listConversations()).toHaveLength(2);
+  } finally { retained.dispose(); }
+});
+
+test("mixed recovery restores a terminal child after its active lease parent", async () => {
+  const retained = temporaryRetainedSession();
+  try {
+    const runtime = new SubagentRuntime(registry, 1, executor, 2);
+    const execution = reboundPane("pane-1");
+    const rebindPaneExecution = vi.fn(async () => execution);
+    const recovered = await runtime.recoverPersistedConversations(
+      [terminal("agile-alpaca", "agile-acorn")],
+      [activeLease(retained)], 2, { rebindPaneExecution },
+    );
+
+    expect(recovered).toMatchObject({ active: [{ ok: true, conversationId: "agile-acorn" }], terminals: 1 });
+    expect(rebindPaneExecution).toHaveBeenCalledOnce();
+    expect(runtime.listConversations().map(item => item.conversationId).sort()).toEqual(["agile-acorn", "agile-alpaca"]);
+  } finally { retained.dispose(); }
+});
+
+test("mixed recovery restores a terminal parent before rebinding its active child", async () => {
+  const retained = temporaryRetainedSession(undefined, "agile-alpaca");
+  try {
+    const runtime = new SubagentRuntime(registry, 1, executor, 2);
+    const execution = reboundPane("pane-1");
+    const rebindPaneExecution = vi.fn(async () => execution);
+    const recovered = await runtime.recoverPersistedConversations(
+      [terminal("agile-acorn")],
+      [activeLease(retained, "agile-alpaca", "agile-acorn")], 2, { rebindPaneExecution },
+    );
+
+    expect(recovered).toMatchObject({ active: [{ ok: true, conversationId: "agile-alpaca" }], terminals: 1 });
+    expect(rebindPaneExecution).toHaveBeenCalledOnce();
+    expect(runtime.listConversations().map(item => item.conversationId).sort()).toEqual(["agile-acorn", "agile-alpaca"]);
+  } finally { retained.dispose(); }
+});
+
+test("failed active recovery releases its reserved capacity to terminal history", async () => {
+  const retained = temporaryRetainedSession();
+  try {
+    const runtime = new SubagentRuntime(registry, 1, executor, 1);
+    const rebindPaneExecution = vi.fn(async () => { throw new Error("rebind failed"); });
+    const recovered = await runtime.recoverPersistedConversations(
+      [terminal("agile-alpaca")],
+      [activeLease(retained)], 1, { rebindPaneExecution },
+    );
+
+    expect(recovered).toMatchObject({ active: [{ ok: false, conversationId: "agile-acorn" }], terminals: 1 });
+    expect(rebindPaneExecution).toHaveBeenCalledOnce();
+    expect(runtime.listConversations().map(item => item.conversationId)).toEqual(["agile-alpaca"]);
+  } finally { retained.dispose(); }
 });

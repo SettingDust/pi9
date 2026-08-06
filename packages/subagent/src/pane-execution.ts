@@ -75,6 +75,20 @@ export interface PaneExecutionHandle {
   wait(signal?: AbortSignal, onTick?: (elapsed: number) => void): Promise<PollResult>;
 }
 
+/** A bound, already-running pane. Binding never creates a surface or launches Pi. */
+export interface ReboundPaneExecution extends PaneExecutionHandle {
+  observeActivity(): void;
+  waitForCompletion(signal?: AbortSignal, onTick?: (elapsed: number) => void): Promise<PaneCompletionOutcome>;
+}
+
+export interface RebindPaneExecutionOptions {
+  surface: string;
+  sessionFile: string;
+  childId: string;
+  onActivity?: (snapshot: ReturnType<typeof projectPaneActivity>, usage?: unknown) => void;
+  dependencies?: PaneExecutionDependencies;
+}
+
 type PaneCompletion =
   | { type: "done" }
   | { type: "structured_output"; value: unknown }
@@ -181,6 +195,7 @@ const args = [...(invocation.args ?? []), "--session", options.sessionFile];
 }
 
 export async function retainedPaneExists(surface: string, dependencies: PaneExecutionDependencies = {}): Promise<boolean | undefined> {
+  if (!surface.trim()) return false;
   const mux = dependencies.mux ?? await loadMux();
   if (mux.getMuxBackend() !== "herdr") return undefined;
   try {
@@ -190,6 +205,55 @@ export async function retainedPaneExists(surface: string, dependencies: PaneExec
     if (isMissingPaneError(error)) return false;
     throw error;
   }
+}
+
+/**
+ * Rebinds only a positively verified Herdr surface after a parent restart.
+ * It deliberately does not create a surface, send a launch command, or start Pi.
+ */
+export async function rebindPaneExecution(options: RebindPaneExecutionOptions): Promise<ReboundPaneExecution> {
+  if (!options.surface.trim()) throw new Error("Cannot rebind a pane without its persisted surface ID.");
+  if (!options.sessionFile.trim() || !options.childId.trim()) throw new Error("Cannot rebind a pane without its retained session and child IDs.");
+  const dependencies = options.dependencies ?? {};
+  const exists = await retainedPaneExists(options.surface, dependencies);
+  if (exists !== true) throw new Error(exists === false
+    ? `Cannot rebind pane; persisted surface is missing: ${options.surface}`
+    : "Cannot rebind pane; the active mux backend cannot verify retained surfaces.");
+
+  const mux = dependencies.mux ?? await loadMux();
+  const activityFile = `${options.sessionFile}.activity.json`;
+  let closed = false;
+  const observeActivity = () => {
+    const state = readPaneActivity(activityFile, options.childId);
+    options.onActivity?.(projectPaneActivity(state), state?.usage);
+  };
+  const handle: ReboundPaneExecution = {
+    surface: options.surface,
+    send: text => mux.sendCommand(options.surface, text),
+    interrupt: () => {
+      try { mux.sendEscape(options.surface); }
+      catch (error) { if (!isMissingPaneError(error)) throw error; }
+      (dependencies.writeFile ?? writeFileSync)(`${options.sessionFile}.exit`, JSON.stringify({ type: "done" }));
+    },
+    close: () => {
+      if (closed) return;
+      closed = true;
+      try { mux.closeSurface(options.surface); }
+      catch (error) { if (!isMissingPaneError(error)) throw error; }
+    },
+    wait: (signal = new AbortController().signal, onTick) => mux.pollForExit(options.surface, signal, { interval: 1000, sessionFile: options.sessionFile, ...(onTick ? { onTick } : {}) }),
+    observeActivity,
+    waitForCompletion: async (signal, onTick) => {
+      observeActivity();
+      const completion = readPaneCompletionOutcome(options.sessionFile);
+      if (completion) return completion;
+      return observePaneCompletion({ handle, signal, onTick: elapsed => {
+        observeActivity();
+        onTick?.(elapsed);
+      } });
+    },
+  };
+  return handle;
 }
 
 export function createPaneGenerationExecutor(dependencies: PaneExecutionDependencies = {}) {
@@ -241,19 +305,19 @@ export function createPaneGenerationExecutor(dependencies: PaneExecutionDependen
       piInvocation,
     });
 
+    activePaneHandles.add(handle);
+    conversation.retainSessionFile(sessionFile);
+    conversation.retainPaneSurface(handle.surface, () => handle.close());
     conversation.bindControl(generation, {
       steer: async text => handle.send(text),
       abort: async () => handle.interrupt(),
     });
-    activePaneHandles.add(handle);
-    conversation.retainPaneSurface(handle.surface, () => handle.close());
 
     const observe = () => {
       const state = readPaneActivity(activityFile, childId);
       const snapshot = projectPaneActivity(state);
       if (snapshot) generation.activity.observe(snapshot, state?.usage);
     };
-    conversation.retainSessionFile(sessionFile);
 
     let outcome: PaneCompletionOutcome;
     try {
@@ -437,14 +501,29 @@ function resolveBootstrapRuntime(): string {
 async function observePaneCompletion(options: { handle: PaneExecutionHandle; signal?: AbortSignal; onTick?: (elapsed: number) => void }): Promise<PaneCompletionOutcome> {
   try {
     const result = await options.handle.wait(options.signal, options.onTick);
-    if (result.reason === "ping" && result.ping) return { status: "completed", completion: { type: "ping", ...result.ping } };
-    if (result.reason === "structured_output") return { status: "completed", completion: { type: "structured_output", value: result.structuredOutput } };
-    if (result.exitCode !== 0) return { status: "completed", completion: { type: "failed", exitCode: result.exitCode } };
-    return { status: "completed", completion: { type: "done" } };
+    return { status: "completed", completion: completionFromPollResult(result) };
   } catch (error) {
     if (options.signal?.aborted) return { status: "cancelled" };
     throw error;
   }
+}
+function completionFromPollResult(result: PollResult): PaneCompletion {
+  if (result.reason === "ping" && result.ping) return { type: "ping", ...result.ping };
+  if (result.reason === "structured_output") return { type: "structured_output", value: result.structuredOutput };
+  if (result.exitCode !== 0) return { type: "failed", exitCode: result.exitCode };
+  return { type: "done" };
+}
+export function readPaneCompletionOutcome(sessionFile: string): PaneCompletionOutcome | undefined {
+  try {
+    const value: unknown = JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8"));
+    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+    const completion = value as Record<string, unknown>;
+    if (completion.type === "done") return { status: "completed", completion: { type: "done" } };
+    if (completion.type === "structured_output" && Object.hasOwn(completion, "value")) return { status: "completed", completion: { type: "structured_output", value: completion.value } };
+    if (completion.type === "ping" && typeof completion.name === "string" && typeof completion.message === "string") return { status: "completed", completion: { type: "ping", name: completion.name, message: completion.message } };
+    if (completion.type === "failed" && typeof completion.exitCode === "number") return { status: "completed", completion: { type: "failed", exitCode: completion.exitCode } };
+  } catch {}
+  return undefined;
 }
 async function waitForPaneShutdown(activityFile: string, childId: string, wait: (milliseconds: number) => Promise<void>): Promise<void> {
   for (let attempt = 0; attempt < 40; attempt++) {
