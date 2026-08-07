@@ -1,6 +1,5 @@
 import { test, expect } from "vitest";
 import { completedGeneration, Conversation } from "../../src/conversation.js";
-import { CONVERSATION_ID_ADJECTIVES } from "../../src/identifier-word-lists.js";
 import { SubagentRuntime, type SubagentCaller } from "../../src/runtime.js";
 import { cancelAction, defineSubagentTool, inspectAction, joinAction, listAction, removeAction, resumeAction, spawnAction, steerAction } from "../../src/tool.js";
 
@@ -28,50 +27,6 @@ const session = (steering: string[] = []) => ({
 const deps = (runtime: SubagentRuntime) => ({ runtime, agentRegistry: registry });
 const response = (result: any) => result.details.response;
 
-function modelFacingInspectFixture(targetIds: readonly string[]) {
-  const conversations = new Map(targetIds.map(target => [target, new Conversation(target as any, config, {
-    kind: "spawn",
-    agent: "worker",
-    label: target,
-    prompt: target,
-  }, () => {})]));
-  const runtime = {
-    inspectSubagents: (subagentIds: readonly string[]) => subagentIds.map(subagentId => {
-      const conversation = conversations.get(subagentId);
-      if (!conversation) throw new Error(`Subagent ${subagentId} was not found.`);
-      return { conversationId: subagentId, snapshot: conversation.generationHistory[0] };
-    }),
-    projectSubagent: (subagentId: string) => ({
-      ok: true,
-      subagentId,
-      agent: "worker",
-      label: subagentId,
-      generation: 1,
-      status: "running",
-      joined: false,
-      actionHints: ["inspect"],
-    }),
-    conversation: (subagentId: string) => {
-      const conversation = conversations.get(subagentId);
-      if (!conversation) throw new Error(`Subagent ${subagentId} was not found.`);
-      return conversation.snapshot();
-    },
-    conversationDepth: () => 0,
-    removeConversations: async (subagentIds: readonly string[]) => subagentIds.map(subagentId => {
-      const conversation = conversations.get(subagentId);
-      if (!conversation) return { ok: false as const, error: `Subagent ${subagentId} was not found.` };
-      conversations.delete(subagentId);
-      return { ok: true as const, label: conversation.label, removedIds: [subagentId] };
-    }),
-  } as any;
-  const tool = defineSubagentTool({
-    runtime,
-    agentRegistry: registry,
-    prepareInvocation: async () => ({ runtime: { maxTasksPerCall: 8 } }) as any,
-  });
-  const execute = (request: any) => tool.execute("model-call", { request }, undefined, undefined, ctx);
-  return { conversations, execute };
-}
 
 function joinLatest(runtime: SubagentRuntime, subagentId: any): void {
   const binding = runtime.bindSubagentJoin([subagentId]);
@@ -194,15 +149,12 @@ test("inspect separates current generation metrics from prior generation history
   );
 });
 
-test("model-facing inspect rejects unchanged polling but permits changed snapshots and other targets", async () => {
-  const releases = new Map<string, () => void>();
-  const gates = new Map<string, Promise<void>>();
-  for (const prompt of ["first", "other"]) {
-    gates.set(prompt, new Promise<void>(done => { releases.set(prompt, done); }));
-  }
-  const runtime = new SubagentRuntime(registry, 2, async (_ctx, conversation, generation) => {
+test("model-facing inspect repeats the snapshot with a no-poll reminder", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(done => { release = done; });
+  const runtime = new SubagentRuntime(registry, 1, async (_ctx, conversation, generation) => {
     conversation.bindSession(generation, session());
-    await gates.get(generation.prompt);
+    await gate;
     return completedGeneration(conversation, generation, generation.prompt);
   });
   const tool = defineSubagentTool({
@@ -210,7 +162,10 @@ test("model-facing inspect rejects unchanged polling but permits changed snapsho
     agentRegistry: registry,
     prepareInvocation: async () => ({ runtime: { maxTasksPerCall: 8 } }) as any,
   });
-  const inspect = (subagentId: string) => tool.execute(
+  const started = runtime.startTasks(ctx, [{ kind: "spawn", agent: "worker", prompt: "work", label: "work" }]);
+  const subagentId = (started.starts[0] as any).conversationId;
+  await new Promise(done => setImmediate(done));
+  const inspect = () => tool.execute(
     "inspect-call",
     { request: { action: "inspect", subagentIds: [subagentId] } },
     undefined,
@@ -218,125 +173,19 @@ test("model-facing inspect rejects unchanged polling but permits changed snapsho
     ctx,
   );
 
-  const firstStart = runtime.startTasks(ctx, [{ kind: "spawn", agent: "worker", prompt: "first", label: "first" }]);
-  const firstId = (firstStart.starts[0] as any).conversationId;
-  await new Promise(done => setImmediate(done));
-  const firstInspection = response(await inspect(firstId));
-  expect(firstInspection.results[0]).toMatchObject({ ok: true, subagentId: firstId, status: "running" });
-
-  const repeatedInspection = response(await inspect(firstId));
-  expect(repeatedInspection.results[0]).toMatchObject({
-    ok: false,
-    subagentId: firstId,
-    error: expect.stringContaining("cannot be used to poll or wait"),
-  });
-
-  const otherStart = runtime.startTasks(ctx, [{ kind: "spawn", agent: "worker", prompt: "other", label: "other" }]);
-  const otherId = (otherStart.starts[0] as any).conversationId;
-  await new Promise(done => setImmediate(done));
-  const otherInspection = response(await inspect(otherId));
-  expect(otherInspection.results[0]).toMatchObject({ ok: true, subagentId: otherId, status: "running" });
-
-  releases.get("first")!();
-  await firstStart.completion;
-  const changedInspection = response(await inspect(firstId));
-  expect(changedInspection.results[0]).toMatchObject({ ok: true, subagentId: firstId, status: "completed" });
-
-  releases.get("other")!();
-  await otherStart.completion;
-});
-
-test("model-facing inspect observations are isolated by caller generation", async () => {
-  const parent = new Conversation("calm-parent" as any, config, {
-    kind: "spawn",
-    agent: "worker",
-    label: "parent",
-    prompt: "first",
-  }, () => {});
-  parent.bindSession(parent.latestGeneration, session());
-  const child = new Conversation("calm-river" as any, config, {
-    kind: "spawn",
-    agent: "worker",
-    label: "child",
-    prompt: "work",
-  }, () => {}, { parentConversationId: parent.conversationId });
-  const runtime = {
-    inspectSubagents: () => [{ conversationId: child.conversationId, snapshot: child.generationHistory[0] }],
-    projectSubagent: () => ({
-      ok: true,
-      subagentId: child.conversationId,
-      agent: "worker",
-      label: "child",
-      generation: 1,
-      status: "running",
-      joined: false,
-      actionHints: ["inspect"],
-    }),
-    conversation: () => child.snapshot(),
-    conversationDepth: () => 1,
-  } as any;
-  const tool = defineSubagentTool({
-    runtime,
-    agentRegistry: registry,
-    parent,
-    prepareInvocation: async () => ({ runtime: { maxTasksPerCall: 8 } }) as any,
-  });
-  const inspect = () => tool.execute(
-    "inspect-call",
-    { request: { action: "inspect", subagentIds: [child.conversationId] } },
-    undefined,
-    undefined,
-    ctx,
-  );
-
-  expect(response(await inspect()).results[0]).toMatchObject({ ok: true, subagentId: child.conversationId });
-  expect(response(await inspect()).results[0]).toMatchObject({
-    ok: false,
-    subagentId: child.conversationId,
-    error: expect.stringContaining("cannot be used to poll or wait"),
-  });
-
-  parent.settle(parent.latestGeneration, "completed", { output: "done" });
-  parent.markJoined(parent.latestGeneration);
-  parent.beginResume("second");
-  expect(response(await inspect()).results[0]).toMatchObject({ ok: true, subagentId: child.conversationId });
-});
-
-test("model-facing root inspect cache evicts oldest targets while guarding recent targets", async () => {
-  const targetIds = CONVERSATION_ID_ADJECTIVES.slice(0, 101).map(adjective => `${adjective}-acorn`);
-  const fixture = modelFacingInspectFixture(targetIds);
-  const inspect = (subagentId: string) => fixture.execute({ action: "inspect", subagentIds: [subagentId] });
-
-  for (const targetId of targetIds) {
-    expect(response(await inspect(targetId)).results[0]).toMatchObject({ ok: true, subagentId: targetId });
+  for (const result of [await inspect(), await inspect()]) {
+    expect(response(result).results[0]).toMatchObject({ ok: true, subagentId, status: "running" });
+    expect(result.content).toHaveLength(2);
+    expect(result.content[0]).toMatchObject({ type: "text" });
+    expect(result.content[1]).toEqual({
+      type: "text",
+      text: "Inspect is a point-in-time snapshot. Do not use it to poll or wait; await completion notifications instead.",
+    });
+    expect(JSON.stringify(result.details.response)).not.toContain("point-in-time snapshot");
   }
 
-  expect(response(await inspect(targetIds[0])).results[0]).toMatchObject({ ok: true, subagentId: targetIds[0] });
-  expect(response(await inspect(targetIds.at(-1)!)).results[0]).toMatchObject({
-    ok: false,
-    subagentId: targetIds.at(-1),
-    error: expect.stringContaining("cannot be used to poll or wait"),
-  });
-});
-
-test("model-facing remove evicts the target's stale inspect observation", async () => {
-  const targetId = "calm-acorn";
-  const fixture = modelFacingInspectFixture([targetId]);
-  const inspect = () => fixture.execute({ action: "inspect", subagentIds: [targetId] });
-
-  expect(response(await inspect()).results[0]).toMatchObject({ ok: true, subagentId: targetId });
-  expect(response(await inspect()).results[0]).toMatchObject({ ok: false, error: expect.stringContaining("cannot be used to poll or wait") });
-
-  const removed = response(await fixture.execute({ action: "remove", subagentIds: [targetId] }));
-  expect(removed.results[0]).toMatchObject({ ok: true, subagentId: targetId, removedIds: [targetId] });
-  fixture.conversations.set(targetId, new Conversation(targetId as any, config, {
-    kind: "spawn",
-    agent: "worker",
-    label: targetId,
-    prompt: targetId,
-  }, () => {}));
-
-  expect(response(await inspect()).results[0]).toMatchObject({ ok: true, subagentId: targetId });
+  release();
+  await started.completion;
 });
 
 test("cancelling a parent does not crash its in-flight nested join update", async () => {
