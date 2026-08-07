@@ -1,5 +1,6 @@
 import { defineTool, type AgentToolUpdateCallback, type ExtensionContext, type ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { effectiveStatus, type Conversation, type ConversationSnapshot, type GenerationRef, type GenerationSnapshot, type GenerationViewStatus, type NestedJoinAttemptSnapshot } from "./conversation.js";
+import { createHash } from "node:crypto";
+import { effectiveStatus, generationKey, type Conversation, type ConversationSnapshot, type GenerationRef, type GenerationSnapshot, type GenerationViewStatus, type NestedJoinAttemptSnapshot } from "./conversation.js";
 import { projectSubagentGenerationStatus, projectSubagentStatus, type CanonicalLiveSubagent, type FailureProjectionMode } from "./contract.js";
 import { listAgentDefinitions, type AgentRegistry } from "./agents.js";
 import type { ConversationId, SubagentId } from "./identifiers.js";
@@ -325,9 +326,25 @@ export async function cancelAction(
   );
 }
 
-export function inspectAction(
+type InspectObservationState = Map<string, string>;
+
+const MAX_INSPECT_OBSERVATIONS = 100;
+const INSPECT_POLLING_ERROR = "Inspect cannot be used to poll or wait for an unchanged subagent snapshot. Await the completion notification instead.";
+
+function generationSnapshotFingerprint(snapshot: GenerationSnapshot): string {
+  return createHash("sha256").update(JSON.stringify(snapshot)).digest("hex");
+}
+
+function rememberInspection(observations: InspectObservationState, target: string, fingerprint: string): void {
+  observations.delete(target);
+  observations.set(target, fingerprint);
+  if (observations.size > MAX_INSPECT_OBSERVATIONS) observations.delete(observations.keys().next().value!);
+}
+
+function inspectActionWithObservations(
   deps: ActionDeps,
   invocation: InvocationFor<"inspect">,
+  observations?: InspectObservationState,
 ): ActionResult {
   const owner = callerOf(deps);
   const outcomes = invocation.subagentIds.map(target => {
@@ -338,15 +355,19 @@ export function inspectAction(
     } catch (error) {
       return { entry: targetFailure(deps, target, error) };
     }
+    const fingerprint = generationSnapshotFingerprint(inspected.snapshot);
+    if (observations?.get(target) === fingerprint) {
+      rememberInspection(observations, target, fingerprint);
+      return { entry: { ok: false as const, subagentId: target, error: INSPECT_POLLING_ERROR } };
+    }
     const observed = inspected.snapshot.status.kind === "done"
       ? { conversationId: inspected.conversationId, generation: inspected.snapshot.generation }
       : undefined;
     try {
       const diagnostics = projectInspection(deps.runtime, inspected.conversationId, inspected.snapshot, owner?.conversation.conversationId);
-      return {
-        entry: { ...canonicalSubagent(deps, inspected.conversationId, { maxLength: 500 }), ...diagnostics },
-        ...(observed ? { observed } : {}),
-      };
+      const entry = { ...canonicalSubagent(deps, inspected.conversationId, { maxLength: 500 }), ...diagnostics };
+      if (observations) rememberInspection(observations, target, fingerprint);
+      return { entry, ...(observed ? { observed } : {}) };
     } catch (error) {
       return { entry: targetFailure(deps, target, error), ...(observed ? { observed } : {}) };
     }
@@ -358,6 +379,13 @@ export function inspectAction(
     true,
     { observedGenerations: outcomes.flatMap(outcome => "observed" in outcome && outcome.observed ? [outcome.observed] : []) },
   );
+}
+
+export function inspectAction(
+  deps: ActionDeps,
+  invocation: InvocationFor<"inspect">,
+): ActionResult {
+  return inspectActionWithObservations(deps, invocation);
 }
 
 export async function joinAction(
@@ -732,6 +760,8 @@ agentNames?: readonly string[];
 export function defineSubagentTool(deps: SubagentToolDeps) {
   const { runtime, agentRegistry, prepareInvocation, parent, agentNames, modelIds } = deps;
   const actionDeps: ActionDeps = { runtime, agentRegistry, ...(parent ? { parent } : {}) };
+  const inspectObservations: InspectObservationState = new Map();
+  let inspectObservationScope: string | undefined;
 
   return defineTool<typeof SubagentParams, SubagentToolDetails>({
     name: "subagent",
@@ -769,9 +799,15 @@ export function defineSubagentTool(deps: SubagentToolDeps) {
     },
 
     async execute(toolCallId, params, signal, onUpdate, ctx) {
-      const invocationDeps: ActionDeps = parent
-        ? { ...actionDeps, caller: { conversation: parent, generation: parent.requireCurrentGeneration() } }
-        : actionDeps;
+      const caller = parent
+        ? { conversation: parent, generation: parent.requireCurrentGeneration() }
+        : undefined;
+      const invocationDeps: ActionDeps = caller ? { ...actionDeps, caller } : actionDeps;
+      const scope = caller
+        ? generationKey({ conversationId: caller.conversation.conversationId, generation: caller.generation.number })
+        : "root";
+      if (parent && inspectObservationScope !== scope) inspectObservations.clear();
+      inspectObservationScope = scope;
       const settings = await prepareInvocation(ctx);
       const invocation = parseSubagentInvocation(normalizeProviderRequest(params.request), { maxTasks: settings.runtime.maxTasksPerCall });
       if ("error" in invocation) return invocationErrorResult(invocationDeps, invocation);
@@ -783,9 +819,16 @@ export function defineSubagentTool(deps: SubagentToolDeps) {
         case "resume": return resumeAction(invocationDeps, invocation, ctx);
         case "steer": return steerAction(invocationDeps, invocation);
         case "cancel": return cancelAction(invocationDeps, invocation);
-        case "inspect": return inspectAction(invocationDeps, invocation);
+        case "inspect": return inspectActionWithObservations(invocationDeps, invocation, inspectObservations);
         case "join": return joinAction(invocationDeps, invocation, signal, onUpdate, toolCallId);
-        case "remove": return removeAction(invocationDeps, invocation);
+        case "remove": {
+          const result = await removeAction(invocationDeps, invocation);
+          const response = result.details.response as SubagentResultsEnvelope<"remove", { readonly ok: boolean; readonly removedIds?: readonly ConversationId[] }>;
+          for (const removed of response.results) {
+            if (removed.ok) for (const removedId of removed.removedIds ?? []) inspectObservations.delete(removedId);
+          }
+          return result;
+        }
       }
     },
   });
